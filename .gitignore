@@ -51,5 +51,28 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-# debug information files
+# Debug information files
 *.dwo
+
+# Build outputs
+build/
+
+# Analysis directory (proprietary firmware - do not commit)
+.analysis/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Radare2 project files
+assembly/.r2*
+
+# NFS temp files
+.nfs*
+
+# Editor temp files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

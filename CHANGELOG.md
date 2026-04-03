@@ -1,0 +1,65 @@
+# Changelog
+
+All notable changes to the RT-950 Pro custom firmware are documented here.
+
+## [0.0.1] - 2026-04-03
+
+Initial public release. Custom bare-metal firmware boots and runs on the
+Radtel RT-950 Pro with LCD output, LED control, and OEM bootloader upload.
+
+### Hardware Confirmed
+- LCD ST7789V init and pixel writes via 8080 parallel bus (PD0-PD15)
+- Embedded 8x8 bitmap font with 1x and 2x text rendering
+- Boot screen with status display on 240x320 IPS panel
+- Red LED (PC13) and Green LED (PC14) GPIO control
+- LCD backlight primary (PC6) and secondary (PB3)
+- Power latch (PB9) and band relay (PC4)
+- Firmware upload via OEM bootloader (custom BTF encryption)
+- Debug UART output for hardware bring-up
+
+### Firmware
+- Complete bare-metal C firmware for AT32F403A (Cortex-M4F @ 120 MHz)
+- 94 source files (~19,600 lines of C) across include/ and src/
+- Linker script with 12 KB bootloader reservation (ORIGIN=0x08003000)
+- SystemInit: 120 MHz PLL (8 MHz HEXT x15), SysTick, IWDG watchdog
+
+### Drivers (Roughly Code-Complete, Mostly Untested)
+- BK4829 dual RF transceiver (bit-bang SPI, PE8/PE10/PE11/PE15)
+- ST7789V LCD (8080 parallel bus, software bit-bang)
+- SI4732 AM/FM/SSB/WB receiver (bit-bang I2C, PB6/PB7)
+- W25Q16 SPI flash with wear-leveling (hardware SPI2, PB12-PB15)
+- UART: Bluetooth (USART1 115200), GPS (USART3 9600), CPS (UART4 115200)
+- ADC2 (PA0 VOX, PA1 battery), DAC1+TIM6+DMA tone generation
+- GPIO with verified pin map (56 pins mapped, binary-verified + hardware-probed)
+
+### Application (Roughly Code-Complete, Untested)
+- Dual VFO (A/B/C), 990 memory channels with zone browsing
+- APRS via BK4829 hardware AFSK (MIC-E encoding)
+- DTMF encode/decode with contacts
+- GPS NMEA parsing, FM/AM broadcast radio
+- NOAA weather radio (7 channels via SI4732 WB)
+- Channel scanner, spectrum analyzer
+- Cross-band repeat (A->B, B->A, duplex), VOX
+- Hierarchical 12-category menu (43 items)
+- CPS wireless programming via Bluetooth
+
+### Tools
+- `firmware_upload.py` - Upload .BTF firmware with auto-restart and flood probe
+- `encrypt_btf.py` - BTF encryption/decryption (keys for V0.15/V0.18/V0.21/V0.27)
+- `cps_flash.py` - Read/write radio configuration via CPS serial protocol
+- 11 hardware test modes (backlight, UART, LCD, BK4829, SI4732, flash, ADC, DAC, keypad, GPS, full diagnostic)
+
+### Reverse Engineering
+- Full V0.27 OEM binary disassembly (216K lines, radare2)
+- OEM bootloader disassembly (4.7K lines, 95 functions)
+- 80+ OEM function addresses mapped to C source equivalents
+- GPIO pin map cross-referenced: binary analysis + hardware probing
+- BTF encryption algorithm fully reversed (XOR cipher with bit-rotation key expansion)
+- CPS, Bluetooth, bootloader, and KDH cloud protocols documented
+
+### Known Limitations
+- Most peripherals untested on hardware (SPI flash, BK4829, SI4732, GPS, keypad, encoder)
+- SI4732 SSB patch binary not extracted from OEM flash
+- SI4732 XOSCEN configuration needs PCB crystal verification
+- Bluetooth audio streaming not implemented (AT commands only)
+- Voice prompt audio samples not implemented (tone patterns only)
