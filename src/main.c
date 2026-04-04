@@ -94,28 +94,24 @@ int main(void)
 #include "app/crossband.h"
 #include "drivers/calibration.h"
 #include "drivers/flash_wearleveling.h"
+#include "kernel/scheduler.h"
+#include "kernel/event.h"
 
 extern void delay_ms(uint32_t ms);
 extern uint32_t get_tick(void);
 
-/* Periodic task intervals (ms) ---------------------------------------- */
+
+/* Periodic task intervals (ms) - used by sched_register in app_init */
 #define TICK_KEYPAD_MS      20      /* 50 Hz keypad scan */
 #define TICK_ENCODER_MS     5       /* 200 Hz encoder poll */
 #define TICK_BATTERY_MS     1000    /* 1 Hz battery check */
 #define TICK_GPS_MS         100     /* 10 Hz GPS parse */
 #define TICK_DISPLAY_MS     33      /* ~30 fps display refresh */
 #define TICK_DUALWATCH_MS   200     /* 5 Hz dual-watch RSSI check */
-
-/* State --------------------------------------------------------------- */
-#ifndef DEBUG_UART
-static uint32_t tick_keypad;
-static uint32_t tick_encoder;
-static uint32_t tick_battery;
-static uint32_t tick_gps;
-static uint32_t tick_display;
-static uint32_t tick_dualwatch;
-static uint8_t  cps_was_active;
-#endif
+#define TICK_POWER_BTN_MS   20      /* 50 Hz power button monitor */
+#define TICK_BUTTONS_MS     20      /* 50 Hz PTT + side button monitor */
+#define TICK_AUDIO_MS       5       /* 200 Hz audio tone management */
+#define TICK_CPS_MS         50      /* 20 Hz CPS programming poll */
 
 /* Feed IWDG early - bootloader enables watchdog before jumping to us */
 #define IWDG_FEED()  (*(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL)
@@ -124,11 +120,178 @@ static uint8_t  cps_was_active;
 calibration_t cal_data;
 
 /* Forward declarations ------------------------------------------------ */
-#ifndef DEBUG_UART
 static void hw_init(void);
 static void app_init(void);
-static void super_loop(void);
-#endif
+
+/* Scheduler task wrappers - adapt module APIs to void(*)(void) ---------- */
+
+/* One-shot diagnostic counters */
+static uint8_t keypad_diag_count = 0;
+static uint8_t encoder_diag_count = 0;
+
+static const char * const key_names[] = {
+    "1","2","3","A/VFO", "4","5","6","B/SCAN",
+    "7","8","9","C/MENU", "*","0","#","D/BAND",
+    "C4R0","C4R1","C4R2","C4R3",
+    "SIDE1","SIDE4"
+};
+
+/* Unique tone per key (freq x10): each key gets a distinct pitch */
+static const uint16_t key_tones[] = {
+    /* 1=700Hz  2=800Hz  3=900Hz  A=1900Hz */
+    7000, 8000, 9000, 19000,
+    /* 4=1000Hz 5=1100Hz 6=1200Hz B=2000Hz */
+    10000, 11000, 12000, 20000,
+    /* 7=1300Hz 8=1400Hz 9=1500Hz C=2100Hz */
+    13000, 14000, 15000, 21000,
+    /* *=600Hz  0=1600Hz #=1700Hz D=2200Hz */
+    6000, 16000, 17000, 22000,
+    /* C4R0=500Hz C4R1=2400Hz C4R2=2600Hz C4R3=2800Hz */
+    5000, 24000, 26000, 28000,
+    /* SIDE1=3000Hz SIDE4=3200Hz */
+    30000, 32000,
+};
+
+static void task_keypad(void)
+{
+    /* Dump raw GPIO state every ~2 seconds for first 10 samples */
+    if (keypad_diag_count < 10) {
+        static uint16_t diag_ticks = 0;
+        diag_ticks++;
+        if (diag_ticks >= 100) {  /* 100 * 20ms = 2s */
+            diag_ticks = 0;
+            keypad_diag_count++;
+            /* Side buttons (PE5/PA12), cols (PC0-3), rows (PD4-7) */
+            volatile uint32_t *gpioc_idr = (volatile uint32_t *)0x40011008UL;
+            volatile uint32_t *gpiod_idr = (volatile uint32_t *)0x40011408UL;
+            volatile uint32_t *gpioe_idr = (volatile uint32_t *)0x40011808UL;
+            volatile uint32_t *gpioa_idr = (volatile uint32_t *)0x40010808UL;
+            uint32_t pc = *gpioc_idr;
+            uint32_t pd = *gpiod_idr;
+            uint32_t pe = *gpioe_idr;
+            uint32_t pa = *gpioa_idr;
+            dbg_puts("[KBD_DIAG] PC=");
+            dbg_reg("", pc);
+            dbg_puts(" PD=");
+            dbg_reg("", pd);
+            uint8_t side1 = (pe >> 5) & 1;  /* PE5 TOP_PROG */
+            uint8_t side4 = (pa >> 12) & 1; /* PA12 BOT_PROG */
+            dbg_puts(" SIDE1=");
+            dbg_reg("", side1);
+            dbg_puts(" SIDE4=");
+            dbg_reg("", side4);
+        }
+    }
+
+    key_event_t evt;
+    if (keypad_get_event(&evt)) {
+        const char *kn = (evt.key < KEY_COUNT) ? key_names[evt.key] : "??";
+        switch (evt.type) {
+        case KEY_EVT_PRESS:
+            dbg_puts("[KEY] press: ");
+            dbg_puts(kn);
+            dbg_puts("\n");
+            if (evt.key < KEY_COUNT)
+                audio_beep_freq(key_tones[evt.key], 60);
+            event_post(EVT_KEY_PRESS, evt.key);
+            power_reset_idle_timer();
+            break;
+        case KEY_EVT_RELEASE:
+            dbg_puts("[KEY] release: ");
+            dbg_puts(kn);
+            dbg_puts("\n");
+            event_post(EVT_KEY_RELEASE, evt.key);
+            break;
+        case KEY_EVT_REPEAT:
+            dbg_puts("[KEY] repeat: ");
+            dbg_puts(kn);
+            dbg_puts("\n");
+            event_post(EVT_KEY_PRESS, evt.key);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void task_encoder(void)
+{
+    /* Dump raw PB4/PB5 state every ~2s for first 10 samples */
+    if (encoder_diag_count < 10) {
+        static uint16_t enc_diag_ticks = 0;
+        enc_diag_ticks++;
+        if (enc_diag_ticks >= 400) {  /* 400 * 5ms = 2s */
+            enc_diag_ticks = 0;
+            encoder_diag_count++;
+            volatile uint32_t *gpiob_idr = (volatile uint32_t *)0x40010C08UL;
+            uint32_t pb = *gpiob_idr;
+            uint8_t enc_a = (pb >> 4) & 1;
+            uint8_t enc_b = (pb >> 5) & 1;
+            dbg_puts("[ENC_DIAG] PB=");
+            dbg_reg("", pb);
+            dbg_puts(" A=");
+            dbg_reg("", enc_a);
+            dbg_puts(" B=");
+            dbg_reg("", enc_b);
+        }
+    }
+
+    int8_t dir = encoder_poll();
+    if (dir > 0) {
+        dbg_puts("[ENC] CW\n");
+        audio_beep_freq(18000, 30);  /* 1800 Hz, 30 ms - rising feel */
+        event_post(EVT_ENCODER_CW, 1);
+        power_reset_idle_timer();
+    } else if (dir < 0) {
+        dbg_puts("[ENC] CCW\n");
+        audio_beep_freq(12000, 30);  /* 1200 Hz, 30 ms - falling feel */
+        event_post(EVT_ENCODER_CCW, 1);
+        power_reset_idle_timer();
+    }
+}
+
+/* PTT and side-port button monitor (Phase 12.3/12.4).
+ * Reads standalone GPIO buttons NOT on the keypad matrix.
+ * OEM references:
+ *   PE3 = PTT primary   (gpio_modes_init @ 0x0801391C, BINARY_VERIFIED)
+ *   PE2 = PTT2 secondary (gpio_modes_init @ 0x0801391C, BINARY_VERIFIED)
+ *   PE6 = EXT_PTT        (spk_mute_on_ptt @ 0x08019254, BINARY_VERIFIED)
+ * Reports state changes via debug UART. Does NOT activate TX relays. */
+static uint8_t prev_ptt   = 1;   /* idle HIGH (active-low) */
+static uint8_t prev_ptt2  = 1;
+static uint8_t prev_extptt = 1;
+
+static void task_buttons(void)
+{
+    uint8_t ptt    = gpio_read_pin(PTT_PORT,     PTT_PIN)     ? 1 : 0;
+    uint8_t ptt2   = gpio_read_pin(PTT2_PORT,    PTT2_PIN)    ? 1 : 0;
+    uint8_t extptt = gpio_read_pin(EXT_PTT_PORT, EXT_PTT_PIN) ? 1 : 0;
+
+    if (ptt != prev_ptt) {
+        prev_ptt = ptt;
+        dbg_puts(ptt ? "[BTN] PTT released\n" : "[BTN] PTT pressed\n");
+        event_post(ptt ? EVT_KEY_RELEASE : EVT_KEY_PRESS, 0xE3);
+        if (!ptt) power_reset_idle_timer();
+    }
+    if (ptt2 != prev_ptt2) {
+        prev_ptt2 = ptt2;
+        dbg_puts(ptt2 ? "[BTN] PTT2 released\n" : "[BTN] PTT2 pressed\n");
+    }
+    if (extptt != prev_extptt) {
+        prev_extptt = extptt;
+        dbg_puts(extptt ? "[BTN] EXT_PTT released\n" : "[BTN] EXT_PTT pressed\n");
+    }
+}
+
+static void task_gps(void)
+{
+    gps_process();
+}
+
+static void task_cps(void)
+{
+    cps_poll();
+}
 
 /* ======================================================================== */
 
@@ -151,107 +314,32 @@ int main(void)
 
     dbg_puts("[DBG] main() entered\n");
 
-    /* ABSOLUTE MINIMUM: PB9 power latch + backlight */
+    /* Hex table self-test: verify .rodata integrity after BTF upload.
+     * If corrupted, you'll see garbled chars instead of 0123456789ABCDEF. */
+    dbg_puts("[DBG] HEX_TEST=");
+    for (uint32_t i = 0; i < 16; i++)
+        dbg_hex8((unsigned char)i);
+    dbg_puts(" (expect 000102...0F)\n");
+
+    /* ABSOLUTE MINIMUM: PB9 power latch must be asserted immediately
+     * or the radio will power off. */
     gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
                     GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
-
-    /* LEDs for visual feedback */
-    gpio_config_pin(LED_RED_PORT, LED_RED_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_config_pin(LED_GREEN_PORT, LED_GREEN_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-
-    /* Red LED on = starting LCD init */
-    gpio_set_pin(LED_RED_PORT, LED_RED_PIN);
-    dbg_puts("[DBG] calling lcd_init...\n");
-
-    IWDG_FEED();
-    lcd_init();
     IWDG_FEED();
 
-    dbg_puts("[DBG] lcd_init done, drawing boot screen\n");
+    /* Initialize event queue */
+    event_init();
 
-    /* Green LED on = LCD init complete */
-    gpio_set_pin(LED_GREEN_PORT, LED_GREEN_PIN);
-    gpio_clear_pin(LED_RED_PORT, LED_RED_PIN);
+    /* Bring up hardware peripherals */
+    hw_init();
 
-    /* Fill entire screen dark navy background */
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x000A);
-    IWDG_FEED();
+    /* Initialize application-layer modules and register scheduler tasks */
+    app_init();
 
-    /* Header bar */
-    lcd_fill_rect(0, 0, LCD_WIDTH, 3, 0x07E0);    /* green accent line */
-    IWDG_FEED();
-
-    /* Title: "RT-950 PRO" centered (2x scale) */
-    lcd_draw_string_2x(30, 20, "RT-950 PRO", 0x07E0, 0x000A);
-    IWDG_FEED();
-
-    /* Subtitle */
-    lcd_draw_string(52, 56, "CUSTOM FIRMWARE", 0xFFFF, 0x000A);
-    IWDG_FEED();
-
-    /* Divider line */
-    lcd_fill_rect(20, 75, 200, 1, 0x4228);
-    IWDG_FEED();
-
-    /* Status lines */
-    lcd_draw_string(8, 90,  "CPU: AT32F403A 120MHz", 0xBDF7, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(8, 106, "LCD: ST7789V 240x320",  0xBDF7, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(8, 122, "RF:  Dual BK4829",      0xBDF7, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(8, 138, "RCV: SI4732 AM/FM/SW",  0xBDF7, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(8, 154, "GPS: NMEA 9600 baud",   0xBDF7, 0x000A);
-    IWDG_FEED();
-
-    /* Divider */
-    lcd_fill_rect(20, 175, 200, 1, 0x4228);
-    IWDG_FEED();
-
-    /* Confirmation block */
-    lcd_draw_string(16, 190, "GPIO Fix:  VERIFIED", 0x07E0, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(16, 206, "Red LED:   PC13 OK",  0xF800, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(16, 222, "Green LED: PC14 OK",  0x07E0, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(16, 238, "Backlight: PC6  OK",  0xFFE0, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(16, 254, "Band Rly:  PC4  OK",  0x07FF, 0x000A);
-    IWDG_FEED();
-    lcd_draw_string(16, 270, "LCD Bus:   8080 OK",  0xF81F, 0x000A);
-    IWDG_FEED();
-
-    /* Footer accent */
-    lcd_fill_rect(0, 297, LCD_WIDTH, 3, 0x07E0);
-    IWDG_FEED();
-
-    /* Version string */
-    lcd_draw_string(56, 306, "v0.0.1-dev", 0x4228, 0x000A);
-    IWDG_FEED();
-
-    dbg_puts("[DBG] boot screen drawn, entering hold\n");
-
-    /* Both LEDs on = done */
-    gpio_set_pin(LED_RED_PORT, LED_RED_PIN);
-    gpio_set_pin(LED_GREEN_PORT, LED_GREEN_PIN);
-
-    /* Hold and print heartbeats */
-    {
-        uint32_t last_hb = get_tick();
-        while (1) {
-            IWDG_FEED();
-            uint32_t now = get_tick();
-            if ((now - last_hb) >= 2000) {
-                last_hb = now;
-                dbg_reg("[DBG] hb t=", now);
-            }
-        }
-    }
+    /* Main loop - never returns */
+    dbg_puts("[DBG] entering scheduler\n");
+    sched_run();
 
     return 0;  /* unreachable */
 }
@@ -260,7 +348,6 @@ int main(void)
  *  hw_init - Bring up all hardware peripherals
  * ======================================================================== */
 
-#ifndef DEBUG_UART
 static void hw_init(void)
 {
     /* POWER LATCH: PB9 must be held HIGH to keep the radio powered.
@@ -282,33 +369,81 @@ static void hw_init(void)
     spi2_init();
     IWDG_FEED();
 
-    /* Verify flash chip: expect W25Q16 (Winbond 0xEF, 16Mbit 0x4015) */
+    /* Verify flash chip: expect W25Q16 (Winbond 0xEF, 16Mbit 0x4015)
+     * OEM: periph_init_flash_adc @ 0x08013820 reads JEDEC after SPI2 init.
+     * Valid IDs: 0xEF4015 (W25Q16BV), 0xEF4016 (W25Q32). */
     {
         uint32_t jedec = spi_flash_read_id();
         dbg_reg("[DBG] SPI JEDEC=0x", jedec);
+        if ((jedec & 0xFFFF00) == 0xEF4000)
+            dbg_puts("[DBG] Flash: Winbond W25Q detected OK\n");
+        else if (jedec == 0x000000 || jedec == 0xFFFFFF)
+            dbg_puts("[ERR] Flash: no response (check SPI2 wiring)\n");
+        else
+            dbg_puts("[WARN] Flash: unexpected JEDEC ID\n");
     }
 
-    /* Calibration + wear-leveling (needs SPI flash) ------------------ */
+    /* Flash read sanity: dump first 16B of channel memory (0x0000)
+     * and calibration validity flag (0xF0E0).
+     * OEM: flash_data_load @ 0x08007358 reads these sectors. */
+    {
+        uint8_t sample[16];
+        uint8_t all_ff = 1;
+        spi_flash_read(0x000000, sample, 16);
+        dbg_puts("[DBG] Flash[0x0000]: ");
+        for (int i = 0; i < 16; i++) {
+            dbg_hex8(sample[i]);
+            dbg_puts(" ");
+            if (sample[i] != 0xFF) all_ff = 0;
+        }
+        dbg_puts("\n");
+        if (all_ff)
+            dbg_puts("[WARN] Flash channel sector appears blank\n");
+
+        uint8_t cal_flag;
+        spi_flash_read(0x00F0E0, &cal_flag, 1);
+        dbg_reg("[DBG] Cal flag @ 0xF0E0 = 0x", cal_flag);
+        if (cal_flag == 0xFF)
+            dbg_puts("[WARN] No calibration data programmed\n");
+        else
+            dbg_puts("[DBG] Calibration data present\n");
+    }
+
+    /* Calibration + wear-leveling (needs SPI flash) ------------------
+     * OEM: hw_init_main calls calibration_load then initializes all 5
+     * WL sectors. Bitmap scan @ 0x0800EF68, SYSCFG write @ 0x0800F918. */
     dbg_puts("[DBG] calibration+wl...\n");
     calibration_load(&cal_data);
+
     wl_init(&WL_SYSCFG);
     wl_init(&WL_VFOCFG);
     wl_init(&WL_EXTCFG);
     wl_init(&WL_VFOSEL);
     wl_init(&WL_CHCFG);
+
+    /* Probe each WL sector: attempt a read to check valid/empty/corrupt.
+     * OEM validates sectors on boot before dispatching main task loop.
+     * Buffer must be large enough for the LARGEST record (EXTCFG = 160B). */
+    {
+        uint8_t probe[160];
+        const char *names[] = {"SYSCFG","VFOCFG","EXTCFG","VFOSEL","CHCFG "};
+        const wl_sector_t *secs[] = {&WL_SYSCFG,&WL_VFOCFG,&WL_EXTCFG,&WL_VFOSEL,&WL_CHCFG};
+        for (int i = 0; i < 5; i++) {
+            int rc = wl_read(secs[i], probe);
+            dbg_puts("[DBG] WL ");
+            dbg_puts(names[i]);
+            dbg_puts(rc == 0 ? ": valid\n" : ": empty/uninitialized\n");
+        }
+    }
     IWDG_FEED();
 
     /* BK4829 dual RF transceivers (GPIOE bit-bang) ------------------- */
-    dbg_puts("[DBG] bk4829_init(0)...\n");
-    bk4829_init(BK4829_CHIP0);
-    IWDG_FEED();
-    dbg_puts("[DBG] bk4829_init(1)...\n");
-    bk4829_init(BK4829_CHIP1);
+    /* RADIO DISABLED - skip RF transceiver init for peripheral testing */
+    dbg_puts("[DBG] bk4829_init SKIPPED (radio disabled)\n");
     IWDG_FEED();
 
     /* SI4732 broadcast receiver (GPIOB bit-bang I2C) ----------------- */
-    dbg_puts("[DBG] si4732_init...\n");
-    si4732_init();
+    dbg_puts("[DBG] si4732_init SKIPPED (radio disabled)\n");
     IWDG_FEED();
 
     /* UARTs ---------------------------------------------------------- */
@@ -329,6 +464,19 @@ static void hw_init(void)
     dac_audio_init();
     IWDG_FEED();
 
+    /* Speaker audio path enable (must be before any tone playback) ---
+     * PE1 = SPK_MUTE: LOW = unmuted. OEM asserts HIGH at power-off.
+     * PC12 = BEEP_SW: HIGH = beep-to-speaker path enabled.
+     *   OEM evidence: gpio_bits_set(GPIOC, 0x1000) @ fw 0x080038EA */
+    dbg_puts("[DBG] spk_unmute+beep_sw...\n");
+    gpio_config_pin(SPK_MUTE_PORT, SPK_MUTE_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(SPK_MUTE_PORT, SPK_MUTE_PIN);   /* unmute speaker */
+    gpio_config_pin(BEEP_SW_PORT, BEEP_SW_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(BEEP_SW_PORT, BEEP_SW_PIN);        /* enable beep path */
+    IWDG_FEED();
+
     /* LCD ------------------------------------------------------------ */
     dbg_puts("[DBG] lcd_init...\n");
     lcd_init();
@@ -339,14 +487,117 @@ static void hw_init(void)
                     GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
 
-    /* PC12 GPIO output (not LCD DMA, LCD uses software bit-bang) */
-    gpio_config_pin(PC12_GPIO_PORT, PC12_GPIO_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-
     /* LCD diagnostic: fill screen blue to confirm 8080 bus works */
     dbg_puts("[DBG] lcd_fill blue...\n");
     lcd_fill_rect(0, 0, 240, 320, 0x001F);  /* RGB565 blue */
     IWDG_FEED();
+
+    /* -- Audio Amplifier Test -----------------------------------------
+     * OEM firmware analysis reveals PB8 is the audio amplifier enable:
+     *   - OEM function at 0x08006574 sets PB8 HIGH before beep
+     *   - Clears PB8 LOW after beep completes
+     *   - Full audio path: DAC -> PE1(unmute) -> PC12(beep_sw) -> PB8(amp)
+     * ------------------------------------------------------------------- */
+    dbg_puts("[AMP] === AUDIO AMP TEST ===\n");
+    {
+        /* Confirm audio path state */
+        dbg_puts("[AMP] PE1(SPK_MUTE)=");
+        dbg_puts((GPIOE->ODR & 0x0002) ? "MUTED!" : "unmuted");
+        dbg_puts(" PC12(BEEP_SW)=");
+        dbg_puts((GPIOC->ODR & 0x1000) ? "on" : "OFF!");
+        dbg_puts(" PB8=");
+        dbg_puts((GPIOB->ODR & 0x0100) ? "HIGH" : "LOW");
+        dbg_puts("\n");
+
+        /* Enable amp for all tests */
+        gpio_config_pin(GPIOB, GPIO_PIN_8, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+        gpio_set_pin(GPIOB, GPIO_PIN_8);
+
+        /* ---- Test A: DIRECT DAC write (no DMA, no TIM6) ----
+         * Write sine values directly to DAC data register in a
+         * software loop.  If this produces sound, PA4→amp→speaker works
+         * and the DMA path has a subtle problem.  If silent, the
+         * analog PCB trace from PA4 doesn't reach the amplifier. */
+        dbg_puts("[AMP] Test A: DIRECT DAC write (no DMA) 3s\n");
+        {
+            /* Stop any DMA/TIM6 that might be running */
+            *(volatile uint32_t *)0x40001000UL &= ~1UL; /* TIM6 CR1: CEN=0 */
+            *(volatile uint32_t *)0x40020430UL = 0;      /* DMA2_CH3 CCR=0 */
+
+            /* Enable DAC CH1 + CH2 (no trigger, no DMA) - software writes */
+            DAC->CR = DAC_CR_EN2 | DAC_CR_EN1 | DAC_CR_BOFF1;
+
+            /* 32-sample sine at ~1kHz: each sample held ~31µs
+             * 3 seconds ≈ 3000 cycles × 32 samples = 96000 writes */
+            static const uint16_t sw_sine[32] = {
+                2048,2448,2831,3185,3496,3750,3939,4056,
+                4095,4056,3939,3750,3496,3185,2831,2448,
+                2048,1648,1265, 911, 600, 346, 157,  40,
+                   1,  40, 157, 346, 600, 911,1265,1648
+            };
+            int cyc;
+            for (cyc = 0; cyc < 3000; cyc++) {
+                int s;
+                for (s = 0; s < 32; s++) {
+                    DAC->DHR12R1 = sw_sine[s];
+                    /* ~31µs busy wait (120MHz × 31µs ≈ 3720 cycles) */
+                    volatile int d;
+                    for (d = 0; d < 620; d++) ;
+                }
+                if ((cyc & 0xFF) == 0) IWDG_FEED();
+            }
+            dbg_reg("[AMP] DAC_DOR1=0x", DAC->DOR1);
+        }
+
+        /* ---- Test B: DMA-based tone (original test) ---- */
+        dbg_puts("[AMP] Test B: DMA tone 3s\n");
+        dac_audio_play_tone(10000);
+
+        /* Diagnostic: dump DAC/TIM6/DMA registers to verify playback */
+        dbg_reg("[AMP] DAC_CR =0x", *(volatile uint32_t *)0x40007400UL);
+        dbg_reg("[AMP] DAC_SR =0x", *(volatile uint32_t *)0x40007434UL);
+        dbg_reg("[AMP] DAC_DOR1=0x", *(volatile uint32_t *)0x4000742CUL);
+        dbg_reg("[AMP] DMA2C3_CCR=0x",
+                *(volatile uint32_t *)0x40020430UL);
+        dbg_reg("[AMP] DMA2C3_CMAR=0x",
+                *(volatile uint32_t *)0x40020438UL);
+        dbg_reg("[AMP] DMA2C3_CPAR=0x",
+                *(volatile uint32_t *)0x4002043CUL);
+
+        { int i; for (i = 0; i < 6; i++) { delay_ms(500); IWDG_FEED(); } }
+
+        /* ---- Test C: Try with BOFF1=0 (output buffer enabled) ---- */
+        dbg_puts("[AMP] Test C: DAC buffer ON + DMA 3s\n");
+        dac_audio_stop();
+        /* Re-enable with output buffer (BOFF1=0) for lower impedance */
+        DAC->CR = DAC_CR_EN2 | DAC_CR_EN1 | DAC_CR_TEN1 | DAC_CR_TSEL1_TIM6;
+        dac_audio_play_tone(10000);
+        /* Now set DMAEN1 */
+        DAC->CR |= DAC_CR_DMAEN1;
+        { int i; for (i = 0; i < 6; i++) { delay_ms(500); IWDG_FEED(); } }
+
+        dac_audio_stop();
+        gpio_clear_pin(GPIOB, GPIO_PIN_8);
+        dbg_puts("[AMP] === TEST COMPLETE ===\n");
+    }
+
+
+    /* Configure PTT and side-button inputs with internal pull-ups.
+     * OEM gpio_modes_init leaves PE0-6 as default (floating input).
+     * We explicitly configure with pull-ups for reliable reads.
+     * OEM @ 0x0801391C: PE2-3 listed as PTT, PE5 as SIDE_KEY. */
+    gpio_config_pin(GPIOE, GPIO_PIN_3, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_3);    /* PE3 pull-UP (PTT1, active LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_2, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_2);    /* PE2 pull-UP (PTT2, active LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_5, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_5);    /* PE5 pull-UP (TopProg, active LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_0);    /* PE0 pull-UP (PWR_DET) */
+    gpio_config_pin(GPIOA, GPIO_PIN_12, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOA, GPIO_PIN_12);   /* PA12 pull-UP (BotProg, active LOW) */
+    dbg_puts("[DBG] PTT+direct inputs configured\n");
+
 
     /* Boot indicator: 3 backlight blinks + beep tone.
      * Uses blocking delays since super_loop isn't running yet.
@@ -367,13 +618,16 @@ static void hw_init(void)
         lcd_backlight_on();  /* leave backlight on */
     }
 }
-#endif /* !DEBUG_UART - hw_init */
 
 /* ========================================================================
- *  app_init - Initialize application-layer modules
+ *  app_init - Initialize application-layer modules and register
+ *  scheduler tasks.
+ *
+ *  Module init functions set up internal state. Scheduler tasks are
+ *  registered for periodic polling. Tasks can be enabled/disabled at
+ *  runtime via sched_enable() as peripherals are brought online.
  * ======================================================================== */
 
-#ifndef DEBUG_UART
 static void app_init(void)
 {
     /* Boot splash (blocks ~1 s while LCD shows image) ---------------- */
@@ -392,7 +646,7 @@ static void app_init(void)
     settings_init();
     IWDG_FEED();
 
-    /* Radio subsystems ----------------------------------------------- */
+    /* Radio subsystems (software init only - RF hardware skipped) ------ */
     dbg_puts("[DBG] vfo+radio_init...\n");
     vfo_init();
     radio_init();
@@ -400,11 +654,11 @@ static void app_init(void)
     dbg_puts("[DBG] vox+scanner+dtmf...\n");
     vox_init();
     scanner_init();
-    dtmf_load_config(); /* Load PTT-ID string + DTMF speed from flash */
+    dtmf_load_config();
     IWDG_FEED();
     dbg_puts("[DBG] audio_init...\n");
     audio_init();
-    audio_power_on();  /* ascending 3-tone chime (non-blocking, needs audio_poll) */
+    audio_power_on();
     IWDG_FEED();
 
     /* Auxiliary modules ---------------------------------------------- */
@@ -442,49 +696,25 @@ static void app_init(void)
 #endif
     IWDG_FEED();
 
-    /* Snapshot initial tick values */
-    uint32_t now = get_tick();
-    tick_keypad    = now;
-    tick_encoder   = now;
-    tick_battery   = now;
-    tick_gps       = now;
-    tick_display   = now;
-    tick_dualwatch = now;
+    /* ================================================================
+     * Register scheduler tasks.
+     * Tasks are dispatched in registration order by sched_run().
+     * Critical high-frequency tasks are registered first.
+     * ================================================================ */
+    dbg_puts("[DBG] registering scheduler tasks...\n");
+
+    sched_register("encoder",   task_encoder,          TICK_ENCODER_MS);
+    sched_register("keypad",    task_keypad,           TICK_KEYPAD_MS);
+    sched_register("buttons",   task_buttons,          TICK_BUTTONS_MS);
+    sched_register("pwr_btn",   power_button_poll,     TICK_POWER_BTN_MS);
+    sched_register("display",   display_update,        TICK_DISPLAY_MS);
+    sched_register("gps",       task_gps,              TICK_GPS_MS);
+    sched_register("dualwatch", radio_dual_watch_poll, TICK_DUALWATCH_MS);
+    sched_register("battery",   power_poll,            TICK_BATTERY_MS);
+    sched_register("audio",     audio_poll,            TICK_AUDIO_MS);
+    sched_register("cps",       task_cps,              TICK_CPS_MS);
+
+    dbg_puts("[DBG] app_init complete\n");
 }
-#endif /* !DEBUG_UART */
-
-/* ========================================================================
- *  super_loop - Main event loop (no RTOS, matching OEM firmware pattern)
- *
- *  Each iteration checks elapsed time for periodic tasks.  The loop
- *  runs at full speed; tasks are gated by their individual intervals.
- * ======================================================================== */
-
-#ifndef DEBUG_UART
-static void super_loop(void)
-{
-    uint32_t last_heartbeat = get_tick();
-
-    dbg_puts("[DBG] super_loop start (minimal)\n");
-
-    while (1) {
-        uint32_t now = get_tick();
-
-        /* Force ALL known output pins every iteration */
-        gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);       /* PC6 backlight */
-        gpio_set_pin(LCD_BL_SEC_PORT, LCD_BL_SEC_PIN); /* PB3 keyboard */
-        gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN); /* power */
-        gpio_set_pin(GPIOC, GPIO_PIN_14);  /* PC14 LCD enable */
-
-        /* Heartbeat every 2 seconds */
-        if ((now - last_heartbeat) >= 2000) {
-            last_heartbeat = now;
-            dbg_reg("[DBG] hb t=", now);
-        }
-
-        /* NOTHING ELSE - no poll functions */
-    }
-}
-#endif /* !DEBUG_UART - super_loop */
 
 #endif /* HW_TEST */

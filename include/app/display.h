@@ -6,10 +6,35 @@
  * (via font.h) for the main screen layout.
  * All coordinates are in pixels; (0,0) = top-left corner.
  *
+ * V0.27 OEM display architecture:
+ *   display_periodic_refresh @ 0x08003B3C (184B, called from main_task_dispatch)
+ *   display_render_engine    @ 0x08019344 (27,380B, TBB jump table on r0)
+ *     - Mode 0: screen_draw_main   (normal VFO view)
+ *     - Mode 1: @ 0x0801FB50       (status/alternate view)
+ *     - Mode 3: @ 0x080174D4       (frequency display mode)
+ *     - Mode 4: @ 0x08017530       (channel info display)
+ *     - Mode 6: @ 0x0800B65C       (special mode, arg=1)
+ *     - Mode 7: @ 0x0801FDA4       (extended display)
+ *   g_display state          @ 0x2000A8D0 (173B render state)
+ *   g_rf_state[3]            @ 0x2000A3B7 (display mode selector)
+ *
+ *   screen_draw_main   @ 0x08017710 (VFO/channel main view)
+ *   screen_draw_freq   @ 0x080173F4 (large frequency digits)
+ *   screen_draw_line_a @ 0x08017084 (VFO A info line)
+ *   screen_draw_line_b @ 0x08017174 (VFO B info line)
+ *   screen_draw_status_line @ 0x08017AC8 (footer/status)
+ *
+ *   display_status_bar @ 0x08020340 (status icons, all procedural)
+ *   display_bar_pixel_set (S-meter bar drawing)
+ *
  * Boot splash (V0.27): RGB565 240x320, stored at SPI 0x090000.
  *   Loaded in 10 blocks x 15360 bytes, big-endian byte-swapped on read.
  *   Splash disabled when calibration validity flag at 0xF0E0 == 0xFF.
  *   OEM LCD_Init @ fw 0x08026954, LCD_BulkTransfer @ fw 0x080266C4.
+ *
+ * OEM uses procedural icon rendering (no pre-rendered bitmap assets).
+ * Status bar icons: text labels + filled rectangles for battery.
+ * S-meter: 12-segment bar graph (S1-S9 + 3 dB-over).
  *
  * See font.h for glyph flash addresses and CJK index formula.
  */
@@ -47,6 +72,24 @@
 #define LAYOUT_SMETER_H     30
 #define LAYOUT_INFO_Y       270
 #define LAYOUT_INFO_H       50
+
+/*
+ * Display modes - OEM has 11 modes via TBB at 0x08019344.
+ * We implement a subset, expanding as features are added.
+ */
+typedef enum {
+    DISPLAY_MODE_MAIN = 0,      /* Normal VFO/channel view */
+    DISPLAY_MODE_MENU,          /* Menu overlay */
+    DISPLAY_MODE_FREQ_ENTRY,    /* Direct frequency input */
+    DISPLAY_MODE_FM_RADIO,      /* FM broadcast receiver */
+    DISPLAY_MODE_AM_RADIO,      /* AM/SW broadcast receiver */
+    DISPLAY_MODE_CHANNEL,       /* Channel/zone browser */
+    DISPLAY_MODE_COUNT,
+} display_mode_t;
+
+/* Get/set current display mode */
+display_mode_t display_get_mode(void);
+void display_set_mode(display_mode_t mode);
 
 /*
  * display_init - Initialize the display subsystem.

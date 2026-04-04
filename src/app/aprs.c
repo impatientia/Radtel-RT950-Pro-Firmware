@@ -20,6 +20,7 @@
  */
 
 #include "app/aprs.h"
+#include "app/radio.h"
 #include "drivers/bk4829.h"
 #include "drivers/spi.h"
 #include "drivers/flash_layout.h"
@@ -201,13 +202,13 @@ static void bk_fsk_stop(void)
 
 /* BK4829 FSK data transmission (from firmware @ 0x0801EEF4) --------- */
 
-static int bk_fsk_send(const uint16_t *data, uint8_t word_count)
-{
-    /* FSK header from ROM (firmware @ 0x0802C260) */
-    static const uint8_t fsk_header[8] = {
-        0xFB, 0x72, 0x40, 0x99, 0xA7, 0x00, 0x00, 0x00
-    };
+/* BK4829 FSK data transmission - multi-load FIFO for frames >14 bytes.
+ * The BK4829 FIFO is 7 words (14 bytes). For AX.25 frames (30-50+ bytes)
+ * we must fill FIFO, trigger partial TX, wait, refill, repeat.
+ * OEM FSK data path @ 0x0801EB8C programs regs then streams via 0x5F. */
 
+static int bk_fsk_send(const uint8_t *data, uint16_t byte_count)
+{
     /* Reset FIFO */
     bk4829_write_reg(0, 0x3F, 0x8000);
 
@@ -215,28 +216,45 @@ static int bk_fsk_send(const uint16_t *data, uint8_t word_count)
     bk4829_write_reg(0, 0x59, 0x8028);
     bk4829_write_reg(0, 0x59, 0x0028);
 
-    /* Load sync word from header */
-    bk4829_write_reg(0, 0x5A,
-        (uint16_t)((uint16_t)fsk_header[0] << 8) | fsk_header[1]);
-    bk4829_write_reg(0, 0x5B,
-        (uint16_t)((uint16_t)fsk_header[2] << 8) | fsk_header[3]);
+    /* Load sync word */
+    bk4829_write_reg(0, 0x5A, BK_FSK_SYNC_LO);
+    bk4829_write_reg(0, 0x5B, BK_FSK_SYNC_HI);
 
     /* Data length config */
-    bk4829_write_reg(0, 0x5C,
-        (uint16_t)((uint16_t)fsk_header[4] << 8) | 0x30);
+    bk4829_write_reg(0, 0x5C, (uint16_t)(0xA700 | (byte_count & 0xFF)));
 
-    /* Load data into FSK FIFO */
-    uint8_t n = word_count;
-    if (n > APRS_FIFO_WORDS) n = APRS_FIFO_WORDS;
-    for (uint8_t i = 0; i < n; i++) {
-        bk4829_write_reg(0, 0x5F, data[i]);
+    /* Stream data through FIFO in 14-byte chunks */
+    uint16_t sent = 0;
+    while (sent < byte_count) {
+        uint8_t chunk = APRS_FIFO_WORDS;
+        if (byte_count - sent < (uint16_t)(APRS_FIFO_WORDS * 2))
+            chunk = (uint8_t)((byte_count - sent + 1) / 2);
+
+        for (uint8_t i = 0; i < chunk; i++) {
+            uint16_t w = 0;
+            if (sent < byte_count)
+                w = (uint16_t)data[sent++] << 8;
+            if (sent < byte_count)
+                w |= data[sent++];
+            bk4829_write_reg(0, 0x5F, w);
+        }
+
+        if (sent == chunk * 2u && sent < byte_count) {
+            /* First chunk: trigger data transmission */
+            delay_ms(APRS_PREAMBLE_MS);
+            bk4829_write_reg(0, 0x59, 0x0828);
+        }
+
+        /* Wait for FIFO space (BK4829 drains at ~1200 baud = ~6.7ms/byte) */
+        if (sent < byte_count)
+            delay_ms(12 * chunk);
     }
 
-    /* Wait for preamble */
-    delay_ms(APRS_PREAMBLE_MS);
-
-    /* Trigger data transmission */
-    bk4829_write_reg(0, 0x59, 0x0828);
+    /* If we only had one chunk, trigger now */
+    if (byte_count <= APRS_FIFO_WORDS * 2) {
+        delay_ms(APRS_PREAMBLE_MS);
+        bk4829_write_reg(0, 0x59, 0x0828);
+    }
 
     /* Poll for completion (reg 0x0C bit 0) */
     for (uint16_t retry = APRS_TX_TIMEOUT_MS / APRS_TX_POLL_MS;
@@ -526,7 +544,7 @@ static void mice_decode_dest(const uint8_t *dest_raw, aprs_packet_t *pkt)
     /* Longitude offset flag from byte 4: >=0x50 = +100 degrees */
     uint8_t lon_100 = (d[4] >= 'P') ? 1 : 0;
 
-    /* W/E from byte 5: >=0x50 = West (note: OEM uses inverted convention) */
+    /* W/E from byte 5: >=0x50 = West */
     uint8_t is_west = (d[5] >= 'P') ? 1 : 0;
 
     /* Convert to signed deg x 100000 */
@@ -536,9 +554,13 @@ static void mice_decode_dest(const uint8_t *dest_raw, aprs_packet_t *pkt)
     if (!is_north) lat = -lat;
     pkt->lat_deg1e5 = lat;
 
-    /* Store lon_100 flag for info field decode */
+    /* Store lon_100 and is_west flags for info field decode.
+     * lon_deg1e5 holds the +100 offset temporarily; is_west applied
+     * after mice_decode_info sets the final longitude value. We encode
+     * is_west in the sign bit: negative = west. */
     pkt->lon_deg1e5 = lon_100 ? 100L * 100000 : 0;
-    (void)is_west;  /* Applied after info field lon decode */
+    if (is_west)
+        pkt->lon_deg1e5 = -(pkt->lon_deg1e5 + 1);  /* negative = west flag */
 }
 
 /* Decode MIC-E information field (longitude, speed, course, symbol) */
@@ -553,8 +575,13 @@ static void mice_decode_info(const uint8_t *info, uint16_t len,
     /* Byte 1: longitude degrees */
     uint8_t d28 = info[p++] - 28;
     int32_t lon_deg = (int32_t)d28;
-    /* Apply +100 offset from dest byte 4 */
-    if (pkt->lon_deg1e5 >= 100L * 100000)
+    /* Extract +100 offset and is_west from dest byte encoding.
+     * mice_decode_dest stored: positive = east, negative = west.
+     * Absolute value >= 100*100000 means +100 offset. */
+    int32_t lon_tmp = pkt->lon_deg1e5;
+    uint8_t is_west = (lon_tmp < 0) ? 1 : 0;
+    if (is_west) lon_tmp = -(lon_tmp + 1);  /* undo encoding */
+    if (lon_tmp >= 100L * 100000)
         lon_deg += 100;
     if (lon_deg >= 180 && lon_deg <= 189)
         lon_deg -= 80;
@@ -571,6 +598,7 @@ static void mice_decode_info(const uint8_t *info, uint16_t len,
     pkt->lon_deg1e5 = lon_deg * 100000 +
                       (int32_t)m28 * 100000 / 60 +
                       (int32_t)h28 * 100000 / 6000;
+    if (is_west) pkt->lon_deg1e5 = -(pkt->lon_deg1e5);
 
     /* Bytes 4-6: speed and course */
     uint16_t sp28 = (uint16_t)(info[p++] - 28);
@@ -747,36 +775,37 @@ int aprs_send_position(const aprs_position_t *pos)
     if (!config.enable) return -1;
     if (config.gps_source && !pos->valid) return -1;
 
-    /* Build AX.25 frame */
+    /* Build AX.25 frame (without FCS) */
     uint8_t frame[APRS_MAX_FRAME];
-    uint16_t frame_len = build_ax25_frame(frame, sizeof(frame), pos);
+    uint16_t frame_len = build_ax25_frame(frame, sizeof(frame) - 2, pos);
     if (frame_len == 0) return -1;
 
-    /* TX delay */
+    /* Append AX.25 FCS (CRC-16, little-endian) */
+    uint16_t fcs = ax25_crc16(frame, frame_len);
+    frame[frame_len++] = (uint8_t)(fcs & 0xFF);
+    frame[frame_len++] = (uint8_t)(fcs >> 8);
+
+    /* TX delay (preamble flags) */
     uint16_t txd_ms = (uint16_t)config.tx_delay * 10;
-    if (txd_ms > 0) {
-        state = APRS_TX_KEYING;
-        delay_ms(txd_ms);
-    }
+    if (txd_ms == 0) txd_ms = 200;  /* minimum 200ms preamble for digipeaters */
+
+    /* Assert PTT - relay sequencing + PA enable.
+     * OEM APRS TX path asserts PTT before FSK programming. */
+    state = APRS_TX_KEYING;
+    radio_ptt_on();
+    delay_ms(txd_ms);
 
     /* Configure BK4829 for AFSK TX */
     state = APRS_TX_SENDING;
     bk_fsk_tx_init();
 
-    /* Pack frame bytes into 16-bit words for BK4829 FIFO */
-    uint16_t fifo_data[APRS_FIFO_WORDS];
-    memset(fifo_data, 0, sizeof(fifo_data));
-    for (uint8_t i = 0; i < APRS_FIFO_WORDS * 2 && i < frame_len; i += 2) {
-        uint16_t w = (uint16_t)((uint16_t)frame[i] << 8);
-        if (i + 1 < frame_len) w |= frame[i + 1];
-        fifo_data[i / 2] = w;
-    }
+    /* Send entire frame through BK4829 FSK FIFO (multi-load) */
+    int result = bk_fsk_send(frame, frame_len);
 
-    /* Send via BK4829 FSK FIFO */
-    int result = bk_fsk_send(fifo_data, APRS_FIFO_WORDS);
-
+    /* Release PTT */
     state = APRS_TX_COMPLETE;
     bk_fsk_stop();
+    radio_ptt_off();
     state = APRS_IDLE;
 
     /* Reset beacon timer after manual TX */
@@ -805,11 +834,13 @@ int aprs_rx_poll_decode(aprs_packet_t *pkt)
     uint16_t status = bk4829_read_reg(0, 0x0C);
     if (!(status & 0x02)) return 0;
 
-    /* Read raw bytes from FSK FIFO (reg 0x5F) */
+    /* Read raw bytes from FSK FIFO (reg 0x5F).
+     * Read until FIFO empty (reg 0x0C bit 1 clears) or buffer full. */
     uint8_t raw[APRS_MAX_FRAME];
     uint16_t pos = 0;
-    for (uint8_t i = 0; i < APRS_FIFO_WORDS && pos + 1 < (uint16_t)sizeof(raw); i++) {
+    while (pos + 1 < (uint16_t)sizeof(raw)) {
         uint16_t word = bk4829_read_reg(0, 0x5F);
+        if (word == 0xFFFF) break;  /* FIFO empty sentinel */
         raw[pos++] = (uint8_t)(word >> 8);
         raw[pos++] = (uint8_t)(word & 0xFF);
     }

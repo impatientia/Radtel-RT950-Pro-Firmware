@@ -10,10 +10,11 @@
 
 #include <stdint.h>
 
-/* Event codes matching original firmware convention */
+/* Event codes matching OEM firmware convention (V0.27 @ 0x08010710).
+ * OEM: CW = 0x14 (20), CCW = 0x16 (22), debounce holdoff = 0xC8 (200). */
 #define ENC_EVT_NONE    0x00
-#define ENC_EVT_CW      0x13    /* clockwise detent */
-#define ENC_EVT_CCW     0x15    /* counter-clockwise detent */
+#define ENC_EVT_CW      0x14    /* clockwise detent (OEM verified) */
+#define ENC_EVT_CCW     0x16    /* counter-clockwise detent (OEM verified) */
 
 /* --- API ---------------------------------------------------------------- */
 

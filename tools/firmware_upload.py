@@ -147,6 +147,53 @@ def parse_response(resp: bytes) -> dict:
     }
 
 
+def serial_monitor(port: str, baud: int = DEFAULT_BAUD, timestamp: bool = True):
+    """Monitor serial port output. Prints incoming data as text.
+    Ctrl+C to exit."""
+    import datetime
+
+    print(f"Monitoring {port} @ {baud} baud (Ctrl+C to stop)")
+    print("-" * 60)
+
+    ser = serial.Serial(
+        port=port,
+        baudrate=baud,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=0.1,
+    )
+    ser.reset_input_buffer()
+
+    line_buf = ""
+    t0 = time.monotonic()
+    try:
+        while True:
+            data = ser.read(256)
+            if not data:
+                continue
+            text = data.decode('ascii', errors='replace')
+            for ch in text:
+                if ch == '\n':
+                    if timestamp:
+                        elapsed = time.monotonic() - t0
+                        prefix = f"[{elapsed:8.3f}] "
+                    else:
+                        prefix = ""
+                    print(f"{prefix}{line_buf}")
+                    line_buf = ""
+                elif ch == '\r':
+                    continue
+                else:
+                    line_buf += ch
+    except KeyboardInterrupt:
+        if line_buf:
+            print(line_buf)
+        print("\n--- monitor stopped ---")
+    finally:
+        ser.close()
+
+
 class FirmwareUploader:
     """Handles the complete firmware upload protocol."""
 
@@ -603,6 +650,12 @@ Examples:
   Upload firmware (direct bootloader - hold side buttons at power-on):
     %(prog)s upload /dev/ttyUSB0 RT-950_V027.BTF --ptt
 
+  Upload and monitor debug output after reboot:
+    %(prog)s upload /dev/ttyUSB0 firmware.BTF --ptt -m
+
+  Monitor debug UART output (radio already running):
+    %(prog)s monitor /dev/ttyUSB0
+
   Validate a BTF file without uploading:
     %(prog)s verify firmware.BTF
 
@@ -626,6 +679,8 @@ Examples:
                           help=f"Baud rate (default: {DEFAULT_BAUD})")
     p_upload.add_argument("-v", "--verbose", action="store_true",
                           help="Verbose output (show raw bytes)")
+    p_upload.add_argument("-m", "--monitor", action="store_true",
+                          help="Monitor debug UART output after upload completes")
 
     # verify
     p_verify = subparsers.add_parser("verify", help="Validate BTF file without uploading")
@@ -641,6 +696,15 @@ Examples:
     p_probe.add_argument("-v", "--verbose", action="store_true",
                           help="Verbose output")
 
+    # monitor
+    p_monitor = subparsers.add_parser("monitor",
+                                       help="Monitor debug UART output from radio")
+    p_monitor.add_argument("port", help="Serial port (e.g., /dev/ttyUSB0)")
+    p_monitor.add_argument("--baud", type=int, default=DEFAULT_BAUD,
+                            help=f"Baud rate (default: {DEFAULT_BAUD})")
+    p_monitor.add_argument("--no-timestamp", action="store_true",
+                            help="Disable elapsed-time timestamps")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -651,6 +715,10 @@ Examples:
         uploader = FirmwareUploader(
             args.port, args.baud, verbose=args.verbose)
         success = uploader.upload(args.btf, ptt_mode=args.ptt)
+        if success and args.monitor:
+            print()
+            time.sleep(0.5)  # brief pause for radio reboot
+            serial_monitor(args.port, args.baud)
         sys.exit(0 if success else 1)
 
     elif args.command == "verify":
@@ -659,6 +727,10 @@ Examples:
     elif args.command == "probe":
         probe_bootloader(args.port, args.baud, verbose=args.verbose,
                          upgrade=args.upgrade)
+
+    elif args.command == "monitor":
+        serial_monitor(args.port, args.baud,
+                       timestamp=not args.no_timestamp)
 
 
 if __name__ == "__main__":

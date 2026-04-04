@@ -22,6 +22,7 @@
 #include "drivers/uart.h"
 #include "drivers/spi.h"
 #include "drivers/bk4829.h"
+#include "drivers/flash_crc.h"
 #include "at32f403a.h"
 
 #include <string.h>
@@ -43,17 +44,7 @@ static uint16_t    rx_pos;
 
 uint16_t cps_crc_ccitt(const uint8_t *data, uint16_t offset, uint16_t length)
 {
-    uint16_t crc = 0;
-    for (uint16_t i = 0; i < length; i++) {
-        crc ^= (uint16_t)data[offset + i] << 8;
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x8000)
-                crc = (crc << 1) ^ 0x1021;
-            else
-                crc <<= 1;
-        }
-    }
-    return crc;
+    return crc16_ccitt(data + offset, length);
 }
 
 /* Frame TX helper ------------------------------------------------- */
@@ -136,10 +127,12 @@ static void cps_handle_command(uint8_t cmd, const uint8_t *payload,
 {
     switch (cmd) {
     case CPS_CMD_READ: {
-        /* payload: [AddrH][AddrL][BlockLen] */
-        if (len < 3) break;
-        uint32_t addr = ((uint32_t)payload[0] << 8) | payload[1];
-        uint8_t  block_len = payload[2];
+        /* payload: [AddrH][AddrM][AddrL][BlockLen] - 3-byte address for 2MB flash.
+         * OEM programming_handler @ 0x08006A68 supports full W25Q16 range. */
+        if (len < 4) break;
+        uint32_t addr = ((uint32_t)payload[0] << 16) |
+                        ((uint32_t)payload[1] << 8) | payload[2];
+        uint8_t  block_len = payload[3];
         if (block_len > CPS_PACKET_SIZE)
             block_len = CPS_PACKET_SIZE;
 
@@ -150,12 +143,13 @@ static void cps_handle_command(uint8_t cmd, const uint8_t *payload,
     }
 
     case CPS_CMD_WRITE: {
-        /* payload: [AddrH][AddrL][Data...] */
-        if (len < 3) break;
-        uint32_t addr = ((uint32_t)payload[0] << 8) | payload[1];
-        uint16_t data_len = len - 2;
+        /* payload: [AddrH][AddrM][AddrL][Data...] - 3-byte address */
+        if (len < 4) break;
+        uint32_t addr = ((uint32_t)payload[0] << 16) |
+                        ((uint32_t)payload[1] << 8) | payload[2];
+        uint16_t data_len = len - 3;
 
-        spi_flash_write_page(addr, &payload[2], data_len);
+        spi_flash_write_page(addr, &payload[3], data_len);
 
         /* ACK: echo command with zero-length payload */
         cps_send_frame(CPS_CMD_WRITE, NULL, 0);
@@ -163,9 +157,10 @@ static void cps_handle_command(uint8_t cmd, const uint8_t *payload,
     }
 
     case CPS_CMD_ERASE: {
-        /* payload: [AddrH][AddrL] */
-        if (len < 2) break;
-        uint32_t addr = ((uint32_t)payload[0] << 8) | payload[1];
+        /* payload: [AddrH][AddrM][AddrL] - 3-byte address */
+        if (len < 3) break;
+        uint32_t addr = ((uint32_t)payload[0] << 16) |
+                        ((uint32_t)payload[1] << 8) | payload[2];
 
         spi_flash_erase_4k(addr);
 
@@ -242,7 +237,9 @@ int cps_poll(void)
     }
 
     case CPS_STATE_DONE:
-        /* Restore normal operation */
+        /* Restore normal operation - unmute RF that was muted at session start.
+         * OEM CPS handler (@ 0x08006A68) restores RF on session end. */
+        bk4829_write_reg(0, 0x51, 0x0000);  /* unmute RF */
         cps_state = CPS_STATE_IDLE;
         rx_pos = 0;
         return 0;

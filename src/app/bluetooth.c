@@ -17,6 +17,7 @@
 #include "app/bluetooth.h"
 #include "app/cps.h"
 #include "drivers/uart.h"
+#include "drivers/gpio.h"
 #include "at32f403a.h"
 #include "debug_uart.h"
 
@@ -26,7 +27,7 @@ extern void delay_ms(uint32_t ms);
 
 /* State ------------------------------------------------------------- */
 static bt_state_t  state;
-static uint8_t     rx_buf[160];
+static uint8_t     rx_buf[512];  /* OEM uses 512B @ 0x2000AF70 */
 static uint16_t    rx_pos;
 
 /* CPS relay state */
@@ -228,6 +229,16 @@ void bt_init(void)
 {
     dbg_puts("[DBG]   bt: uart_bt_init\n");
     uart_bt_init();
+
+    /*
+     * PE9 (SW_TO_BT) - Bluetooth module power/audio switch.
+     * Low confidence pin assignment, but OEM appears to assert this
+     * during BT initialization. Drive high to enable BT module.
+     */
+    gpio_config_pin(GPIOE, 9, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    GPIOE->SCR = (1U << 9);   /* PE9 high = BT module enabled */
+    delay_ms(100);             /* BT module power-up settle */
+
     state = BT_STATE_IDLE;
     rx_pos = 0;
 

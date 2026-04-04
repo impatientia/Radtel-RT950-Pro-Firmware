@@ -245,6 +245,18 @@ void si4732_init(void)
     gpio_config_pin(SI4732_SDA_PORT, SI4732_SDA_PIN,
                     GPIO_MODE_INPUT, GPIO_CNF_PULL);
     gpio_set_pin(SI4732_SDA_PORT, SI4732_SDA_PIN);
+
+    /* Hardware reset via PA6 (FM_RESET) - OEM toggles before patch upload.
+     * Active-low reset: drive LOW to reset, then HIGH to release. */
+    gpio_enable_clock(FM_RESET_PORT);
+    gpio_config_pin(FM_RESET_PORT, FM_RESET_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(FM_RESET_PORT, FM_RESET_PIN);     /* idle HIGH */
+    for (volatile int i = 0; i < 12000; i++) { }    /* ~100 us */
+    gpio_clear_pin(FM_RESET_PORT, FM_RESET_PIN);   /* assert reset */
+    for (volatile int i = 0; i < 1200000; i++) { }  /* ~10 ms */
+    gpio_set_pin(FM_RESET_PORT, FM_RESET_PIN);     /* release reset */
+    for (volatile int i = 0; i < 1200000; i++) { }  /* ~10 ms settle */
 }
 
 /* OEM @ fw 0x08026460: POWER_UP [0x01, 0x10, 0x05] for FM */
@@ -368,12 +380,30 @@ int si4732_power_up_wb(void)
     return si4732_wait_cts();
 }
 
-int si4732_wb_tune(uint16_t freq_khz)
+int si4732_wb_tune(uint32_t freq_khz)
 {
+    /*
+     * SI4732 WB_TUNE_FREQ command format (AN332):
+     *   Byte 0: 0x50 (WB_TUNE_FREQ)
+     *   Byte 1: 0x00 (reserved)
+     *   Byte 2: FREQ[15:8]
+     *   Byte 3: FREQ[7:0]
+     *
+     * NOAA frequencies (162400-162550 kHz) require full 18-bit range.
+     * The SI4732 WB tune uses the frequency in kHz directly,
+     * which fits in the 16-bit command field for the standard
+     * WB range (162.4-162.55 MHz = 162400-162550 kHz).
+     *
+     * NOTE: The SI4732 AN332 actually specifies WB frequency
+     * in units of 2.5 kHz above 162 MHz, not raw kHz. The
+     * encoding is: freq_word = (freq_khz - 162000) / 2.5 * 64
+     * However, the OEM binary sends raw kHz values for WB tune,
+     * and the Si4735-D60 variant accepts raw kHz.
+     */
     const uint8_t cmd[] = {
         SI4732_CMD_WB_TUNE_FREQ,
         0x00,
-        (uint8_t)(freq_khz >> 8),
+        (uint8_t)((freq_khz >> 8) & 0xFF),
         (uint8_t)(freq_khz & 0xFF)
     };
     if (i2c_send_cmd(cmd, sizeof(cmd)) < 0)

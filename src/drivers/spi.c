@@ -3,7 +3,7 @@
  *
  * SPI1: NOT used for BK4829 (BK4829 uses GPIOE bit-bang, see bk4829.c)
  *   SPI1 peripheral (0x40013000) has ZERO references in V0.27 binary.
- *   PA7 is the keypad latch line (verified @ 0x080136B0), NOT SPI1_MOSI.
+ *   PA7 is the BK4829 RF scan latch (SET/CLR @ 0x800DB08), NOT SPI1_MOSI.
  *
  * SPI2: External SPI flash (V0.27 SPI2_Init @ fw 0x08017000)
  *   Base: 0x40003800, CS: PB12 (GPIOB 0x40010C00, mask 0x1000)
@@ -53,7 +53,7 @@ extern void delay_ms(uint32_t ms);
  *
  *  WARNING: PA5/PA6/PA7 PCB connections are UNKNOWN. Do NOT configure
  *  them as AF outputs - risk of shorting to unknown traces.
- *  PA7 is the keypad latch line (BINARY VERIFIED @ 0x080136B0).
+ *  PA7 is the BK4829 RF scan latch (BINARY VERIFIED @ 0x800DB08).
  * ======================================================================== */
 
 void spi1_init(void)

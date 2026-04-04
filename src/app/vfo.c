@@ -8,6 +8,12 @@
  * VFO A default: 146.520 MHz on chip 1 (PE15/SEN2)
  * VFO B default: 446.000 MHz on chip 0 (PE8/SEN1)
  * VFO C default: 144.390 MHz on chip 1 (shared with VFO A, time-muxed)
+ *
+ * OEM V0.27 references:
+ *   VFO/channel storage  : WL sector @ flash 0x9000 (CPS), 98B records
+ *   Frequency set        : bk4829_set_frequency @ 0x0801BD40
+ *   Band detection       : freq_to_submode via cal subbands
+ *   RF relay switch      : relay_select @ 0x0801D268 (dispatches on submode)
  */
 
 #include "app/vfo.h"
@@ -102,6 +108,81 @@ static vfo_state_t vfo_states[VFO_COUNT] = {
 static radio_vfo_t active_vfo = RADIO_VFO_A;
 static uint8_t     vfo_c_enabled = 0;
 
+/* ---- Band limit validation ------------------------------------------- */
+
+/*
+ * RX band limits.  The RT-950 covers 4 bands (+ a 5th disabled band).
+ * OEM submode mapping (relay_select @ 0x0801D268):
+ *   0 = 136–174 MHz (2m VHF)
+ *   1 = 400–520 MHz (70cm UHF)
+ *   2 = 220–260 MHz (1.25m)
+ *   3 = 300–390 MHz (normally disabled)
+ *
+ * We allow any frequency within these ranges for RX.
+ */
+typedef struct { uint32_t low; uint32_t high; } band_range_t;
+
+static const band_range_t rx_bands[] = {
+    { 136000000, 174000000 },   /* 2m VHF */
+    { 220000000, 260000000 },   /* 1.25m */
+    { 300000000, 390000000 },   /* 300 MHz (disabled in cal but allow RX) */
+    { 400000000, 520000000 },   /* 70cm UHF */
+};
+#define NUM_RX_BANDS (sizeof(rx_bands) / sizeof(rx_bands[0]))
+
+static int freq_in_rx_band(uint32_t freq_hz)
+{
+    for (unsigned i = 0; i < NUM_RX_BANDS; i++) {
+        if (freq_hz >= rx_bands[i].low && freq_hz <= rx_bands[i].high)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Clamp a frequency to the nearest valid RX band edge.
+ * Returns the clamped frequency, or the default (146.520 MHz) if
+ * the input is wildly out of range.
+ */
+static uint32_t freq_clamp_to_band(uint32_t freq_hz)
+{
+    if (freq_in_rx_band(freq_hz))
+        return freq_hz;
+
+    /* Find the closest band edge */
+    uint32_t best = 146520000;
+    uint32_t best_dist = 0xFFFFFFFF;
+    for (unsigned i = 0; i < NUM_RX_BANDS; i++) {
+        uint32_t d_low  = (freq_hz > rx_bands[i].low)
+                          ? (freq_hz - rx_bands[i].low) : (rx_bands[i].low - freq_hz);
+        uint32_t d_high = (freq_hz > rx_bands[i].high)
+                          ? (freq_hz - rx_bands[i].high) : (rx_bands[i].high - freq_hz);
+        if (d_low < best_dist)  { best_dist = d_low;  best = rx_bands[i].low; }
+        if (d_high < best_dist) { best_dist = d_high; best = rx_bands[i].high; }
+    }
+    return best;
+}
+
+/* ---- Valid step sizes ------------------------------------------------ */
+
+/*
+ * Standard amateur/commercial step sizes (Hz).
+ * Used to validate step_hz loaded from flash.
+ */
+static const uint32_t valid_steps[] = {
+    2500, 5000, 6250, 10000, 12500, 15000, 20000, 25000, 30000, 50000
+};
+#define NUM_VALID_STEPS (sizeof(valid_steps) / sizeof(valid_steps[0]))
+
+static int is_valid_step(uint32_t step_hz)
+{
+    for (unsigned i = 0; i < NUM_VALID_STEPS; i++) {
+        if (step_hz == valid_steps[i])
+            return 1;
+    }
+    return 0;
+}
+
 /* VFO flash persistence ------------------------------------------------ */
 
 static void vfo_pack(vfo_persist_entry_t *pe, const vfo_state_t *vs)
@@ -179,6 +260,22 @@ static int vfo_load_state(void)
     /* If VFO-C disabled but was selected, fall back to A */
     if (!vfo_c_enabled && active_vfo == RADIO_VFO_C)
         active_vfo = RADIO_VFO_A;
+
+    /*
+     * Post-load validation: clamp frequencies to valid RX bands
+     * and sanitize step sizes.  Corrupted flash data must not
+     * program the BK4829 with nonsense frequencies.
+     */
+    for (int i = 0; i < VFO_COUNT; i++) {
+        if (!freq_in_rx_band(vfo_states[i].freq_hz))
+            vfo_states[i].freq_hz = freq_clamp_to_band(vfo_states[i].freq_hz);
+        if (!is_valid_step(vfo_states[i].step_hz))
+            vfo_states[i].step_hz = 12500;  /* default 12.5 kHz */
+        if (vfo_states[i].squelch_level > 9)
+            vfo_states[i].squelch_level = 3;
+        if (vfo_states[i].tx_power > 2)
+            vfo_states[i].tx_power = 1;
+    }
 
     return 0;
 }
@@ -351,20 +448,42 @@ const vfo_state_t *vfo_get_state(radio_vfo_t vfo)
 void vfo_step(int8_t direction)
 {
     vfo_state_t *s = &vfo_states[active_vfo];
+    uint32_t new_freq = s->freq_hz;
 
     if (direction > 0) {
-        s->freq_hz += s->step_hz;
+        new_freq += s->step_hz;
     } else if (direction < 0) {
-        if (s->freq_hz > s->step_hz)
-            s->freq_hz -= s->step_hz;
+        if (new_freq > s->step_hz)
+            new_freq -= s->step_hz;
+        else
+            new_freq = s->step_hz; /* floor */
     }
 
+    /*
+     * Wrap at band edges: if we step out of the current band,
+     * wrap to the opposite edge of the same band.
+     */
+    for (unsigned i = 0; i < NUM_RX_BANDS; i++) {
+        if (s->freq_hz >= rx_bands[i].low && s->freq_hz <= rx_bands[i].high) {
+            if (new_freq > rx_bands[i].high)
+                new_freq = rx_bands[i].low;
+            else if (new_freq < rx_bands[i].low)
+                new_freq = rx_bands[i].high;
+            break;
+        }
+    }
+
+    s->freq_hz = new_freq;
     bk4829_set_frequency(s->chip, s->freq_hz);
 }
 
 void vfo_set_frequency(radio_vfo_t vfo, uint32_t freq_hz)
 {
     if (vfo > RADIO_VFO_C) return;
+
+    /* Clamp to valid RX band if out-of-range */
+    if (!freq_in_rx_band(freq_hz))
+        freq_hz = freq_clamp_to_band(freq_hz);
 
     vfo_states[vfo].freq_hz = freq_hz;
     bk4829_set_frequency(vfo_states[vfo].chip, freq_hz);
@@ -441,6 +560,8 @@ void vfo_set_power(radio_vfo_t vfo, uint8_t level)
 void vfo_set_step(radio_vfo_t vfo, uint32_t step_hz)
 {
     if (vfo > RADIO_VFO_C) return;
+    if (!is_valid_step(step_hz))
+        step_hz = 12500;  /* default to 12.5 kHz if invalid */
     vfo_states[vfo].step_hz = step_hz;
 }
 

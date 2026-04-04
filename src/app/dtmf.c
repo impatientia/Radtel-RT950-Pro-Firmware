@@ -1,15 +1,22 @@
 /*
  * dtmf.c - DTMF tone encode/decode for the RT-950 Pro
  *
- * Uses BK4829 hardware DTMF generation (reg 0x70) and detection (reg 0x0C/0x68).
- * The chip generates the dual-tone pairs internally - the MCU only selects
- * the tone index and triggers start/stop.
+ * Uses BK4829 hardware DTMF generation and detection.
  *
- * BK4829 DTMF registers:
- *   0x70  [7:4] = tone index (0-15), bit 0 = start
- *   0x71  tone duration / gap timing
- *   0x0C  status flags - bit 15 = DTMF detected
- *   0x68  decoded digit index in [3:0]
+ * OEM DTMF detection (bk4829_check_dtmf_active @ 0x0801B2B0, 34B):
+ *   1. Read REG 0x0D - bit 15 = DTMF detected flag
+ *   2. If bit15 clear → no DTMF, return 0
+ *   3. Extract bits [10:0] from REG 0x0D (tone status)
+ *   4. Read REG 0x0E - extended status / decoded digit
+ *   5. Return (0x0D[10:0] << 16) | 0x0E[15:0]
+ *
+ * DTMF tone generation registers:
+ *   0x70  DTMF/AFSK control - tone generation (also used for APRS AFSK)
+ *         Exact bit layout for DTMF mode not fully verified in OEM.
+ *   0x71  Timing control (may overlap with VOX/CTCSS - use with caution)
+ *
+ * NOTE: Registers 0x70/0x71 for DTMF TX need BK4829 datasheet verification.
+ *       The OEM uses 0x70=0x00AC for APRS AFSK TX (@ 0x0801EB8C).
  */
 
 #include "app/dtmf.h"
@@ -18,10 +25,10 @@
 extern void delay_ms(uint32_t ms);
 
 /* BK4829 DTMF-related registers */
-#define BK4829_REG_DTMF_CTL    0x70
-#define BK4829_REG_DTMF_TIM    0x71
-#define BK4829_REG_STATUS      0x0C
-#define BK4829_REG_DTMF_DEC    0x68
+#define BK4829_REG_DTMF_CTL    0x70  /* Tone generation control (unverified for DTMF) */
+#define BK4829_REG_DTMF_TIM    0x71  /* Timing control (unverified - may be CTCSS) */
+#define BK4829_REG_STATUS      0x0D  /* OEM @ 0x0801B2B4: movs r0,#13 - DTMF status */
+#define BK4829_REG_DTMF_DEC    0x0E  /* OEM @ 0x0801B2CA: movs r0,#14 - decoded digit */
 
 /* Status register bit for DTMF detection */
 #define STATUS_DTMF_DETECTED   (1U << 15)
@@ -107,17 +114,23 @@ void dtmf_decode_stop(uint8_t chip)
 
 char dtmf_decode_poll(uint8_t chip)
 {
+    /*
+     * OEM pattern (bk4829_check_dtmf_active @ 0x0801B2B0):
+     *   REG 0x0D bit15 = DTMF detected (lsls r1,r0,#16; bpl = not set)
+     *   REG 0x0D bits[10:0] = tone status (ubfx r0,r0,#0,#11)
+     *   REG 0x0E = extended data / digit info
+     */
     uint16_t status = bk4829_read_reg(chip, BK4829_REG_STATUS);
 
-    if (!(status & STATUS_DTMF_DETECTED))
+    if (status & STATUS_DTMF_DETECTED) {
+        /* Bit 15 set means NOT detected in OEM (bpl = branch if positive).
+         * OEM returns 0 when bit15 is set. When bit15 clear, tone present. */
         return '\0';
+    }
 
-    /* Read decoded digit index from reg 0x68, bits [3:0] */
+    /* Tone detected - extract digit from REG 0x0E */
     uint16_t dec = bk4829_read_reg(chip, BK4829_REG_DTMF_DEC);
     uint8_t idx = (uint8_t)(dec & 0x0F);
-
-    /* Clear the DTMF detect flag by writing back status with bit cleared */
-    bk4829_write_reg(chip, BK4829_REG_STATUS, status & ~STATUS_DTMF_DETECTED);
 
     return dtmf_index_to_char(idx);
 }

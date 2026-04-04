@@ -149,14 +149,14 @@ static uint8_t freq_to_submode(uint32_t freq_hz)
  */
 static void rf_frontend_enable(void)
 {
-    gpio_set_pin(BAND_SEL0_PORT, BAND_SEL0_PIN);
-    gpio_set_pin(BAND_SEL1_PORT, BAND_SEL1_PIN);
+    gpio_set_pin(RF_FRONTEND_EN0_PORT, RF_FRONTEND_EN0_PIN);
+    gpio_set_pin(RF_FRONTEND_EN1_PORT, RF_FRONTEND_EN1_PIN);
 }
 
 static void rf_frontend_disable(void)
 {
-    gpio_clear_pin(BAND_SEL0_PORT, BAND_SEL0_PIN);
-    gpio_clear_pin(BAND_SEL1_PORT, BAND_SEL1_PIN);
+    gpio_clear_pin(RF_FRONTEND_EN0_PORT, RF_FRONTEND_EN0_PIN);
+    gpio_clear_pin(RF_FRONTEND_EN1_PORT, RF_FRONTEND_EN1_PIN);
 }
 
 /*
@@ -304,9 +304,9 @@ void radio_init(void)
      * PB8 and PE4 are always toggled together as a paired RF
      * frontend enable. Default to disabled (both LOW).
      */
-    gpio_config_pin(BAND_SEL0_PORT, BAND_SEL0_PIN,
+    gpio_config_pin(RF_FRONTEND_EN0_PORT, RF_FRONTEND_EN0_PIN,
                     GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);
-    gpio_config_pin(BAND_SEL1_PORT, BAND_SEL1_PIN,
+    gpio_config_pin(RF_FRONTEND_EN1_PORT, RF_FRONTEND_EN1_PIN,
                     GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);
     rf_frontend_disable();
 
@@ -402,13 +402,15 @@ void radio_ptt_on(void)
      *   1. relay_select(sub_mode, 0) - assert ALL relay GPIOs for TX
      *   2. BK4829 TX setup (REG_37, REG_47, tune, power, REG_30=0xC1FE)
      *   3. relay_select(sub_mode, 2) - configure audio path for band
-     * Key: relays BEFORE RF enable. No explicit delay between them.
+     *   4. rf_frontend_enable() - PA power LAST (after relays settled)
+     * Key: relays BEFORE RF enable. PA enable AFTER RF path is set.
      */
     uint8_t sub = freq_to_submode(tx_freq);
-    rf_frontend_enable();
     relay_select(sub, 0);
+    delay_ms(5);  /* relay mechanical settling (1-5 ms typical) */
     bk4829_set_mode(vs->chip, BK4829_MODE_TX, vs->rf_cal);
     relay_select(sub, 2);
+    rf_frontend_enable();
 
     /* PTT-ID: send DTMF at Beginning Of Transmission */
     {

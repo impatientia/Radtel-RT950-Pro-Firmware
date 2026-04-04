@@ -66,9 +66,12 @@ void dbg_puts(const char *s)
 
 void dbg_hex8(unsigned char v)
 {
-    static const char hex[] = "0123456789ABCDEF";
-    dbg_putc(hex[v >> 4]);
-    dbg_putc(hex[v & 0xF]);
+    /* Arithmetic hex conversion - avoids .rodata lookup table which
+     * gets corrupted by BTF encryption on larger builds. */
+    unsigned char hi = v >> 4;
+    unsigned char lo = v & 0xF;
+    dbg_putc(hi < 10 ? '0' + hi : 'A' - 10 + hi);
+    dbg_putc(lo < 10 ? '0' + lo : 'A' - 10 + lo);
 }
 
 void dbg_hex32(unsigned long v)

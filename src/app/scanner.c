@@ -34,14 +34,19 @@ static uint16_t       settle_counter;
 static uint16_t       resume_countdown;
 static uint16_t       resume_ticks    = DEFAULT_RESUME_TICKS;
 static uint16_t       current_channel;
+static uint8_t        squelch_debounce; /* Consecutive open readings needed */
 
 /* VFO scan range (0/0 = full band, no custom range) */
 static uint32_t       vfo_range_start;
 static uint32_t       vfo_range_stop;
 
+#define SQUELCH_DEBOUNCE_COUNT  3  /* 3 consecutive open readings (~30ms) */
+
 /* Helpers -------------------------------------------------------------- */
 
-/* Step VFO frequency within a custom range, wrapping at edges */
+/* Step VFO frequency within a custom range, wrapping at edges.
+ * Handles both forward (positive step) and reverse (negative step) scanning.
+ * OEM scanner @ 0x08009B88 wraps at both band boundaries. */
 static void vfo_step_in_range(radio_vfo_t vfo)
 {
     const vfo_state_t *st = vfo_get_state(vfo);
@@ -49,6 +54,8 @@ static void vfo_step_in_range(radio_vfo_t vfo)
 
     if (freq > vfo_range_stop)
         freq = vfo_range_start;
+    else if (freq < vfo_range_start)
+        freq = vfo_range_stop;
 
     vfo_set_frequency(vfo, freq);
 }
@@ -174,12 +181,26 @@ void scanner_poll(void)
     if (settle_counter > 0) {
         settle_counter--;
         if (settle_counter == 0) {
-            if (bk4829_is_squelch_open(chip)) {
+            /* Start debounce - need SQUELCH_DEBOUNCE_COUNT consecutive opens */
+            squelch_debounce = 0;
+        }
+        return;
+    }
+
+    /* Debounce squelch: require multiple consecutive open readings
+     * to avoid false pauses from noise bursts near threshold. */
+    if (squelch_debounce < SQUELCH_DEBOUNCE_COUNT) {
+        if (bk4829_is_squelch_open(chip)) {
+            squelch_debounce++;
+            if (squelch_debounce >= SQUELCH_DEBOUNCE_COUNT) {
                 paused = 1;
                 resume_countdown = (resume_mode == SCAN_RESUME_CARRIER)
                                    ? CARRIER_HOLDOFF_TICKS
                                    : resume_ticks;
             }
+        } else {
+            /* Squelch closed - reset debounce, proceed to next step */
+            squelch_debounce = SQUELCH_DEBOUNCE_COUNT;
         }
         return;
     }
@@ -200,8 +221,13 @@ void scanner_poll(void)
     } else {
         uint16_t next = channel_find_next_scannable(current_channel, +1);
         if (next == 0xFFFF) {
-            scanner_stop();
-            return;
+            /* Wrap around to beginning of channel list */
+            next = channel_find_next_scannable(0, +1);
+            if (next == 0xFFFF) {
+                /* No scannable channels at all */
+                scanner_stop();
+                return;
+            }
         }
         current_channel = next;
 

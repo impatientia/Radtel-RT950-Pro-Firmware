@@ -53,7 +53,7 @@
  *
  *  Address Range        Size     Content
  *  ---------------------------------------------------------------
- *  0x000000-0x007FFF    32 KB    Channel Memory (960 channels)
+ *  0x000000-0x007FFF    32 KB    Channel Memory (990 channels)
  *  0x008000-0x008FFF     4 KB    Channel Config (wear-leveled)
  *  0x009000-0x009FFF     4 KB    VFO/Scan Settings (wear-leveled)
  *  0x00A000-0x00AFFF     4 KB    Supplementary Settings + Zone Names
@@ -80,9 +80,11 @@
 
 /* === Channel Memory: 0x000000 - 0x007FFF ===
  *
- * 960 channels, 32 bytes each, stored linearly.
- * 128 channels per 4KB sector (8 sectors total).
+ * 990 channels, 32 bytes each, stored linearly (verified via KDH CPS server).
+ * 128 channels per 4KB sector (8 sectors total, 31680B / 32768B used).
  * Writes use read-modify-write on entire sector.
+ * OEM also maintains a 100-slot circular log (6B entries) for active
+ * channel tracking - see flash_channel_data_read @ 0x0800FC84.
  *
  * Channel record (32 bytes / 0x20):
  *   [0..3]   Frequency in BCD format (4 bytes, MSB first)
@@ -92,7 +94,7 @@
  */
 #define FLASH_CHANNEL_BASE          0x000000
 #define FLASH_CHANNEL_RECORD_SIZE   0x20        /* 32 bytes */
-#define FLASH_CHANNEL_COUNT         960
+#define FLASH_CHANNEL_COUNT         990         /* verified via KDH server + OEM refs */
 #define FLASH_CHANNEL_PER_SECTOR    128
 #define FLASH_CHANNEL_SECTORS       8           /* 0x000000-0x007FFF */
 #define FLASH_CHANNEL_END           0x008000
@@ -112,16 +114,20 @@
 
 /* === VFO/Scan Settings: 0x009000 - 0x009FFF ===
  *
- * Wear-leveled radio settings page.
+ * Wear-leveled radio settings page (Settings Block B).
  * 6-byte bitmap at 0x9000.
- * Up to 42 records, stored with offset indexing.
+ * Up to 41 records of 96 bytes (OEM verified @ lines 11115-11118).
  * Contains VFO frequencies, scan ranges, step sizes.
+ * Stores g_config (32B @ 0x2000A8B0) + g_display (41B @ 0x2000A8D0).
+ * CRC at offset 0x5E in each slot.
+ *
+ * Note: Settings A (0x8000) uses 98B records, Settings B uses 96B.
  */
 #define FLASH_VFOCFG_BASE           0x009000
 #define FLASH_VFOCFG_BITMAP_SIZE    6
 #define FLASH_VFOCFG_RECORD_OFFSET  0x0010      /* 6-byte bitmap padded to 16 */
-#define FLASH_VFOCFG_RECORD_SIZE    0x60        /* 96 bytes */
-#define FLASH_VFOCFG_MAX_SLOTS      42
+#define FLASH_VFOCFG_RECORD_SIZE    0x60        /* 96 bytes (OEM confirmed) */
+#define FLASH_VFOCFG_MAX_SLOTS      41          /* OEM: 41 (fits 4KB sector) */
 
 /* === Supplementary Settings: 0x00A000 - 0x00AFFF ===
  *

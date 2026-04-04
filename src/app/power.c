@@ -8,7 +8,11 @@
  * forced to 0xBB (~9.01V) per RE analysis of calibration loader.
  *
  * Auto power-off: idle counter incremented by power_poll() (~1Hz).
- * Shutdown writes SYSRESETREQ to SCB->AIRCR.
+ *
+ * Hardware power-off: PE0 is the power switch input. A long press
+ * (1.5s) triggers a shutdown sequence that saves state, disables
+ * peripherals, and releases the PB9 power latch. The hardware
+ * regulator then cuts power completely.
  *
  * Backlight: direct GPIO on LCD_BL_PORT / LCD_BL_PIN (PC6).
  */
@@ -16,10 +20,14 @@
 #include "app/power.h"
 #include "app/audio.h"
 #include "app/settings.h"
+#include "kernel/event.h"
 #include "drivers/adc.h"
 #include "drivers/gpio.h"
+#include "drivers/lcd.h"
+#include "drivers/dac_audio.h"
 #include "rt950_pinmap.h"
 #include "cortex_m4.h"
+#include "debug_uart.h"
 #include <stddef.h>
 
 /*
@@ -43,14 +51,34 @@ static uint8_t  low_batt_alert;       /* 1 = in low-battery state */
 #define AUTO_KEYLOCK_SECONDS  60
 static uint32_t keylock_idle_seconds;
 
+/* Power button (PE0) long-press detection.
+ * The power switch is a knob/switch - PE0 reads LOW when pressed.
+ * We debounce at 50 Hz (called from power_button_poll) and require
+ * 75 consecutive LOW reads (~1.5 seconds) for a long press. */
+#define PWR_BTN_LONG_PRESS_COUNT  75  /* 75 x 20ms = 1.5 seconds */
+static uint16_t pwr_btn_held_count;
+static uint8_t  pwr_btn_shutdown_triggered;
+
+extern void delay_ms(uint32_t ms);
+
 /* ========================================================================
  *  power_init - Set up ADC and reset auto-off state.
+ *
+ *  OEM power-on path @ 0x0801E268 configures PE0 as input (power switch)
+ *  and sets PB9 HIGH (power latch hold).
  * ======================================================================== */
 
 void power_init(void)
 {
     auto_off_minutes = 0;
     idle_seconds = 0;
+    pwr_btn_held_count = 0;
+    pwr_btn_shutdown_triggered = 0;
+
+    /* Configure PE0 (power switch) as input with pull-up */
+    gpio_config_pin(PWR_SWITCH_PORT, PWR_SWITCH_PIN,
+                    GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(PWR_SWITCH_PORT, PWR_SWITCH_PIN);  /* enable pull-up */
 
     /* Force highest threshold to 0xBB per RE analysis */
     batt_thresholds[6] = 0xBB;
@@ -59,7 +87,8 @@ void power_init(void)
 /* ========================================================================
  *  power_read_battery_raw - 8-bit battery ADC reading.
  *
- *  adc_read_battery() returns 8-bit directly (matching OEM UBFX).
+ *  OEM ADC_Read_PA0 @ 0x0801385C reads channel 0, returns UBFX(DR,4,8).
+ *  adc_read_battery() matches this: 12-bit >> 4 = bits [11:4].
  * ======================================================================== */
 
 uint8_t power_read_battery_raw(void)
@@ -133,6 +162,27 @@ void power_reset_idle_timer(void)
 
 void power_poll(void)
 {
+    /* Log battery state every call (1Hz) */
+    {
+        uint8_t raw = power_read_battery_raw();
+        uint16_t mv = power_get_battery_mv();
+        battery_level_t level = power_get_battery_level();
+        dbg_puts("[BAT] raw=");
+        dbg_reg("", raw);
+        dbg_puts("  mv=");
+        dbg_reg("", mv);
+        dbg_puts("  level=");
+        dbg_reg("", (uint32_t)level);
+    }
+
+    /* Log audio ADC level (PA1 channel 1) for VOX calibration.
+     * OEM ADC_Read_PA1 @ 0x08013820, UBFX(DR,4,8) → 8-bit. */
+    {
+        uint8_t audio = adc_read_audio_level();
+        dbg_puts("[AUD] raw=");
+        dbg_reg("", audio);
+    }
+
     /* Auto power-off countdown */
     if (auto_off_minutes != 0) {
         idle_seconds++;
@@ -236,13 +286,96 @@ void power_breathing_poll(void)
 }
 
 /* ========================================================================
- *  power_shutdown - System reset via NVIC SYSRESETREQ.
+ *  power_button_poll - Monitor PE0 for power-off via rotary switch.
  *
- *  Writes 0x05FA0004 to SCB->AIRCR.  The DSB ensures the write
- *  completes before the core halts.  WFI loop is a safety net.
+ *  PE0 is LOW when the switch is in the ON position (grounded by switch).
+ *  PE0 goes HIGH (pulled up) when the switch is turned to the OFF position.
+ *  After 1.5 seconds of sustained HIGH, triggers hardware power-off.
  * ======================================================================== */
 
-void power_shutdown(void)
+void power_button_poll(void)
+{
+    if (pwr_btn_shutdown_triggered)
+        return;
+
+    /* PE0 reads LOW when switch is in ON position (grounded).
+     * When turned to OFF, PE0 floats HIGH via pull-up.
+     * Detect HIGH = switch moved to off position. */
+    uint8_t off_pos = (PWR_SWITCH_PORT->IDR & PWR_SWITCH_PIN) ? 1 : 0;
+
+    if (off_pos) {
+        pwr_btn_held_count++;
+        if (pwr_btn_held_count == 1)
+            dbg_puts("[PWR] switch -> OFF detected\n");
+        if (pwr_btn_held_count >= PWR_BTN_LONG_PRESS_COUNT) {
+            dbg_puts("[PWR] sustained OFF - powering down\n");
+            pwr_btn_shutdown_triggered = 1;
+            event_post(EVT_POWER_BUTTON, 1);
+            power_off();
+        }
+    } else {
+        if (pwr_btn_held_count > 0) {
+            dbg_puts("[PWR] switch -> ON (cancelled)\n");
+            event_post(EVT_POWER_BUTTON, 0);
+        }
+        pwr_btn_held_count = 0;
+    }
+}
+
+/* ========================================================================
+ *  power_off - Hardware power-off via PB9 latch release.
+ *
+ *  OEM shutdown @ 0x0801E2A4: disables RF paths, mutes speaker, clears
+ *  backlight, then releases PB9 latch → hardware cuts Vcc.
+ *
+ *  Sequence:
+ *    1. Disable interrupts (prevent further processing)
+ *    2. Turn off RF (clear PA enable, TX relays)
+ *    3. Turn off LCD backlight and display
+ *    4. Turn off LEDs
+ *    5. Brief shutdown tone (if audio was working)
+ *    6. Release PB9 power latch - hardware cuts power
+ *    7. WFI safety loop (in case hardware doesn't cut immediately)
+ * ======================================================================== */
+
+void power_off(void)
+{
+    dbg_puts("[PWR] shutdown sequence\n");
+
+    __disable_irq();
+
+    /* Turn off RF - clear PA enable (PE4) and relay controls */
+    gpio_clear_pin(GPIOE, GPIO_PIN_4);   /* PA_EN off */
+    gpio_clear_pin(GPIOE, GPIO_PIN_7);   /* U3T_EN off */
+    gpio_clear_pin(GPIOE, GPIO_PIN_14);  /* SW3T_EN off */
+    gpio_clear_pin(GPIOB, GPIO_PIN_0);   /* V3R_EN off */
+    gpio_clear_pin(GPIOB, GPIO_PIN_1);   /* V3T_EN off */
+
+    /* Mute speaker */
+    gpio_set_pin(GPIOE, GPIO_PIN_1);     /* SPK_MUTE assert */
+
+    /* Turn off LCD backlight and LEDs */
+    gpio_clear_pin(LCD_BL_PORT, LCD_BL_PIN);
+    gpio_clear_pin(LCD_BL_SEC_PORT, LCD_BL_SEC_PIN);
+    gpio_clear_pin(GPIOC, GPIO_PIN_13);  /* red LED off */
+    gpio_clear_pin(GPIOC, GPIO_PIN_14);  /* green LED off */
+
+    /* Release PB9 power latch - hardware regulator cuts power */
+    gpio_clear_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
+
+    /* Safety: if hardware doesn't cut power, spin with WFI */
+    for (;;)
+        __WFI();
+}
+
+/* ========================================================================
+ *  power_reset - MCU reset via NVIC SYSRESETREQ.
+ *
+ *  Use for error recovery when a full hardware power cycle isn't needed.
+ *  After reset the bootloader runs and re-enters firmware normally.
+ * ======================================================================== */
+
+void power_reset(void)
 {
     __disable_irq();
     __DSB();
@@ -250,4 +383,16 @@ void power_shutdown(void)
     __DSB();
     for (;;)
         __WFI();
+}
+
+/* ========================================================================
+ *  power_shutdown - Backward-compatible shutdown entry point.
+ *
+ *  Now calls power_off() for true hardware power-off instead of
+ *  SYSRESETREQ. Auto power-off timer and menu both call this.
+ * ======================================================================== */
+
+void power_shutdown(void)
+{
+    power_off();
 }

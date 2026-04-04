@@ -33,8 +33,12 @@
 
 static void bb_delay(void)
 {
-    /* ~200 ns at 120 MHz - enough for BK4829 SPI timing */
+    /* ~250 ns at 120 MHz - matches OEM timing @ 0x0800A962.
+     * OEM uses a tight register-load loop giving ~250-300 ns per edge.
+     * 24 NOPs × 8.33 ns = 200 ns + pipeline/branch overhead ≈ 250 ns.
+     * BK4829 minimum SPI clock half-period = 200 ns per datasheet. */
     __asm volatile ("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
+                    "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
                     "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
 }
 
@@ -162,64 +166,63 @@ uint16_t bk4829_read_reg(uint8_t chip, uint8_t reg)
  *  Init register table (V0.27 @ 0x08007144)
  * ======================================================================== */
 
-/* Phase 1: 36 core register writes */
+/* Phase 1: 36 core register writes - OEM bk4829_hal_init @ 0x08007144 */
 static const bk4829_reg_init_t init_phase1[] = {
-    { 0x00, 0x8000 },  /* Chip reset / power control */
-    { 0x00, 0x0000 },  /* Clear reset (release chip) - V0.27 @ 0x08007158 */
-    { 0x37, 0x9D1F },  /* RF config */
-    { 0x13, 0x03DF },  /* LO config */
-    { 0x12, 0x03DB },  /* LO config */
-    { 0x11, 0x033A },  /* LO config */
-    { 0x10, 0x0318 },  /* PLL config */
-    { 0x14, 0x0210 },  /* PLL config */
-    { 0x49, 0x2AB2 },  /* AGC */
-    { 0x7B, 0x73DC },  /* Unknown */
-    { 0x1C, 0x07C0 },  /* IF filter BW */
-    { 0x1D, 0xE555 },  /* IF filter */
-    { 0x1E, 0x4C58 },  /* IF filter */
-    { 0x1F, 0x865A },  /* IF filter */
-    { 0x3E, 0x94C6 },  /* Unknown */
-    { 0x3F, 0x07FE },  /* Unknown */
-    { 0x25, 0xC1BA },  /* Deviation config */
-    { 0x3A, 0x9A7C },  /* Unknown */
-    { 0x19, 0x1041 },  /* Unknown */
-    { 0x28, 0x0B40 },  /* RSSI config */
-    { 0x29, 0xAA00 },  /* RSSI config */
-    { 0x2A, 0x6600 },  /* RSSI config */
-    { 0x2C, 0x0022 },  /* Unknown */
-    { 0x2F, 0x9890 },  /* Unknown */
-    { 0x53, 0x2028 },  /* Unknown */
-    { 0x7E, 0x303E },  /* Unknown */
-    { 0x46, 0x6050 },  /* Unknown */
-    { 0x4A, 0x5430 },  /* Unknown */
-    { 0x48, 0xB3BF },  /* Band config */
-    { 0x49, 0x2AB2 },  /* AGC (re-write) */
-    { 0x4A, 0x5430 },  /* Unknown (re-write) */
-    { 0x4D, 0xA004 },  /* Unknown */
-    { 0x4E, 0x3815 },  /* Unknown */
-    { 0x4F, 0x3F3B },  /* Unknown */
-    { 0x77, 0xCCEF },  /* Unknown */
-    { 0x7E, 0x303E },  /* Unknown (re-write) */
+    { 0x00, 0x8000 },  /* Chip reset */
+    { 0x00, 0x0000 },  /* Release reset */
+    { 0x37, 0x9D1F },  /* CTCSS/CDCSS control */
+    { 0x13, 0x03DF },  /* RX comparator threshold */
+    { 0x12, 0x03DB },  /* Comparator control */
+    { 0x11, 0x033A },  /* AGC table index */
+    { 0x10, 0x0318 },  /* AGC config */
+    { 0x14, 0x0210 },  /* AGC gain */
+    { 0x49, 0x2AB2 },  /* RF gain config */
+    { 0x7B, 0x73DC },  /* Internal calibration */
+    { 0x1C, 0x0F80 },  /* AF gain DAC */
+    { 0x1D, 0xE555 },  /* RSSI compensation */
+    { 0x1E, 0x4C58 },  /* IF filter bandwidth */
+    { 0x1F, 0x865A },  /* IF frequency */
+    { 0x3E, 0x94C6 },  /* Band select / VCO */
+    { 0x3F, 0x07FE },  /* Band control */
+    { 0x25, 0xC1BA },  /* TX audio path */
+    { 0x3A, 0x9A7C },  /* Modulation config */
+    { 0x19, 0x1041 },  /* Deviation setting */
+    { 0x28, 0x0B40 },  /* TX power bias (low) */
+    { 0x29, 0xAA00 },  /* TX power bias (mid) */
+    { 0x2A, 0xCC00 },  /* TX power bias (high) */
+    { 0x2C, 0x0022 },  /* TX control */
+    { 0x2F, 0x9890 },  /* Squelch mode / RX AGC */
+    { 0x53, 0x2028 },  /* Internal config */
+    { 0x7E, 0x303E },  /* Calibration */
+    { 0x46, 0x6050 },  /* Audio filter */
+    { 0x4A, 0x5430 },  /* AGC table */
+    { 0x48, 0xB3BF },  /* AGC config */
+    { 0x49, 0x2AB2 },  /* RF gain (2nd write) */
+    { 0x4A, 0x5430 },  /* AGC table (2nd write) */
+    { 0x4D, 0xA004 },  /* RSSI squelch threshold */
+    { 0x4E, 0x3815 },  /* Noise squelch threshold */
+    { 0x4F, 0x3F3B },  /* Combined squelch threshold */
+    { 0x77, 0xCCEF },  /* Internal */
+    { 0x7E, 0x303E },  /* Calibration (2nd write) */
 };
 
-/* Phase 3: Post read-modify-write */
+/* Phase 3: Post read-modify-write - OEM @ 0x080072B4 */
 static const bk4829_reg_init_t init_phase3[] = {
-    { 0x7D, 0xE912 },
-    { 0x48, 0xB3FF },  /* Modified from phase1 value 0xB3BF */
+    { 0x7D, 0xE912 },  /* Calibration */
+    { 0x48, 0xB3FF },  /* AGC config (updated from 0xB3BF) */
 };
 
 /* Phase 4 calibration (reg 0x09 loop) was present in V0.18 but removed by V0.27.
  * Not emitted in the V0.27 init sequence - confirmed by binary analysis. */
 
-/* Phase 5: Final registers - V0.27 @ 0x080072DE
- *   REG_44/54 share value 0x91C1, REG_45/55 share value 0x303E+2=0x3040 */
+/* Phase 5: Final registers - OEM @ 0x080072DE */
 static const bk4829_reg_init_t init_phase5[] = {
-    { 0x74, 0xDF22 },
-    { 0x44, 0x91C1 },  /* Same value as REG_54 */
-    { 0x45, 0x3040 },  /* REG_7E value (0x303E) + 2 */
-    { 0x75, 0xE61C },
-    { 0x54, 0x91C1 },
-    { 0x55, 0x3040 },
+    { 0x74, 0xDF22 },  /* Internal */
+    { 0x44, 0x91C1 },  /* Dual-tone detector A */
+    { 0x45, 0x3040 },  /* Dual-tone detector B */
+    { 0x75, 0xE61C },  /* Internal */
+    { 0x54, 0x91C1 },  /* Dual-tone detector A2 */
+    { 0x55, 0x3040 },  /* Dual-tone detector B2 */
 };
 
 /* ========================================================================
@@ -377,8 +380,8 @@ void bk4829_set_mode(uint8_t chip, bk4829_mode_t mode, uint8_t cal_value)
     uint8_t lut_idx = (uint8_t)mode & 0x0F;
 
     /* REG_30: two-step mode switch (V0.27 @ 0x080079CC)
-     *   RX/TX: write 0x0200 (VCO cal only) → delay → final value
-     *   AM/SCAN: write 0x0000 (standby) → delay → final value
+     *   RX/TX: write 0x0200 (VCO cal only) -> delay -> final value
+     *   AM/SCAN: write 0x0000 (standby) -> delay -> final value
      *   STANDBY: write 0x0000 directly */
     if (mode == BK4829_MODE_RX || mode == BK4829_MODE_TX) {
         bk4829_write_reg(chip, 0x30, 0x0200);

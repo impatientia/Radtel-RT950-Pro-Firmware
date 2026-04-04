@@ -5,16 +5,27 @@
  * Get/set functions read from and write to real hardware modules.
  *
  * V0.27 OEM menu architecture:
- *   Menu dispatch    @ fw 0x080062EA (CMP chain on r0 for 12 top-level IDs)
- *   Sub-menu dispatch @ fw 0x08011ADE (sub-items, IDs 0x02-0x1C)
- *   ToneMenu_ShowEntry @ fw 0x0800AF68 (push.w {r4-r10, lr})
- *   String table     @ fw 0x0805A440-0x0805BC00 (~7 KB)
- *     Entry format: 02 ID 20 "string" 00 (items), 07 ID 20 "string" 00 (headers)
- *   Top-level: 12 categories (IDs 0x12-0x1D) @ fw 0x0805B34C-0x0805B440
+ *   settings_menu_engine    @ 0x08011AC4 (17,740B, command dispatch on r1)
+ *     CMP chain: r1=0x02(init), 0x03(nav), 0x05(scroll), 0x07(edit),
+ *       0x10(exit), 0x11(focus), 0x12-0x18(ops), 0x1C,0x1F,0x24,0x25
+ *     r1 >= 0xA0: channel/zone select mode
+ *     Refs: g_config @ 0x2000A340, display_state @ 0x20000215
+ *   display_menu_screen     @ 0x08010790 (menu overlay rendering)
+ *   menu_list_renderer      @ 0x080108F4 (sub-item list)
+ *   menu_item_draw          @ 0x08010BC8 (single item render)
+ *   menu_settings_draw      @ 0x08010AD8 (settings value page)
+ *   menu_scroll_handler     @ 0x080102DC (scroll position tracking)
+ *   menu_handler_display    @ 0x0801145C (display settings handler, 296B)
+ *   menu_handler_audio      @ 0x08011598 (audio settings handler, 272B)
+ *   menu_handler_timer      @ 0x080116B8 (timer settings handler, 316B)
+ *   menu_handler_scan       @ 0x08011808 (scan settings handler, 300B)
  *
- * Structural difference: OEM uses 12-category hierarchical menu with
- * state machine driving display + input. Our implementation is a flat
- * list with 28 items. Settings persisted via flash wear-leveling (WL).
+ *   String table  @ 0x0805A440-0x0805BC00 (~7 KB)
+ *     Entry format: 02 ID 20 "string" 00 (items), 07 20 "string" 00 (headers)
+ *   Top-level    @ 0x0805B3D0-0x0805B442 (12 categories, IDs 0x12-0x1D)
+ *
+ * Our implementation: flat C arrays with get/set function pointers.
+ * Settings persisted via flash wear-leveling (WL).
  * See flash_wearleveling.c for WL sector configs.
  */
 
@@ -393,16 +404,20 @@ static const menu_item_t cat_about[] = {
     MENU_ABOUT_VERSION
 };
 
-/* Category table (OEM order). Zone and User Key are placeholders. */
+/*
+ * Category table (OEM order @ 0x0805B3D0).
+ * Zone (0x13) and User Key (0x18) are stub categories in both
+ * OEM V0.27 and our code - minimal implementation.
+ */
 
 static const menu_category_t categories[MENU_CATEGORY_COUNT] = {
     { "VOX",         cat_vox,       3 },
-    { "Zone",        NULL,          0 },
+    { "Zone",        NULL,          0 },   /* OEM ID 0x13 - stub */
     { "VFO & CH",    cat_vfo_ch,    5 },
     { "CTCSS DCS",   cat_ctcss_dcs, 6 },
-    { "Radio Set",   cat_radio_set, 12 },
+    { "Radio Set",   cat_radio_set, 13 },
     { "APRS Set",    cat_aprs,      2 },
-    { "User Key",    NULL,          0 },
+    { "User Key",    NULL,          0 },   /* OEM ID 0x18 - stub */
     { "Bluetooth",   cat_bluetooth, 1 },
     { "Signaling",   cat_signaling, 2 },
     { "Setting",     cat_setting,   9 },

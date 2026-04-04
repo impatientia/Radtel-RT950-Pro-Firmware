@@ -1,12 +1,13 @@
 /*
  * rt950_pinmap.h - Board-level pin assignments for Radtel RT-950 Pro
  *
- * All pins verified via radare2 disassembly of V0.27 binary and
- * cross-referenced against hardware probing data.
+ * All pins verified via radare2 disassembly of V0.27 binary,
+ * cross-referenced against hardware probing data, and validated
+ * via live GPIO scanning on actual hardware (April 2026).
  *
  * VERIFICATION SOURCE BINARIES:
- *   V0.27: .analysis/RT_950Pro_V0.27_260203/RT_950Pro_V0.27_decrypted.bin
- *   V0.27: .analysis/RT_950Pro_V0.27_260203/RT_950Pro_V0.27_decrypted.bin
+ *   V0.27: binary/RT_950Pro_V0.27_260203/RT_950Pro_V0.27_decrypted.bin
+ *   V0.18: binary/RT_950Pro_V0.18_250919/RT_950Pro_V0.18_decrypted.bin
  *   Load base: 0x08000000 (AT32F403A flash origin)
  *
  * GPIO HELPER FUNCTIONS (V0.27 - all xref analysis uses these):
@@ -26,8 +27,14 @@
  *   HW_PROBED       - From hardware pin probing
  *   UNVERIFIED      - Assumed from other sources, needs confirmation
  *
+ * HW GPIO SCAN RESULTS (April 2026, custom firmware GPIO scanner):
+ *   Baseline IDR: A=0xBE00 B=0xF7B8 C=0xD140 D=0x1FFF E=0x8D6C
+ *   GPIOC completely static (0xD140) across all 62 input events.
+ *   All inputs produce clean press/release pairs with no noise.
+ *
  * KEY CORRECTIONS (from binary verification):
- *   - Keypad scan=PC5 NOT PE5, latch=PA7 NOT PA12 (r2 @ 0x080136B0)
+ *   - PC5/PA7 are BK4829 RF scan ctrl, NOT keypad (0x800DB00, 0x080136B0 is data)
+ *   - OEM keypad scan @ 0x08012FF8 reads PE5/PA12 as side buttons directly
  *   - PTT relays are ACTIVE-LOW, not active-high (r2 @ 0x0801D268)
  *   - SPI1 peripheral UNUSED - PA7 is keypad latch, NOT SPI1_MOSI
  *   - LCD reset is PD2 NOT PC14 (V0.27 LCD_Init @ 0x08026954)
@@ -38,6 +45,8 @@
  *   - ADC battery sample time = 239.5 cycles (NOT 28.5)
  *   - DAC BOFF1=1 (output buffer OFF)
  *   - TIM6 DAC trigger: PSC=3/ARR=781 or PSC=119/ARR=125
+ *   - PA12 is Bottom Program button, NOT side key 4 (HW scan confirmed)
+ *   - PE5 is Top Program button (confirmed same pin as SIDE_KEY1)
  *
  * UNUSED PERIPHERALS (zero references in V0.27 binary):
  *   SPI1 (0x40013000), ADC1 (0x40012400), USART2 (0x40004400),
@@ -165,34 +174,69 @@
  * Previously misidentified as "LCD enable". HW confirmed as green LED. */
 
 /* ========================================================================
- *  Keypad - 4x4 matrix + scan enable + latch  [BINARY_VERIFIED]
+ *  Keypad - 5-column × 4-row matrix  [HW_CONFIRMED 2026-04-03]
  *
- *  V0.27: Scan function @ 0x08015FF8.
- *  Columns: PC0-PC3 output via BRR(GPIOC, 0x0F) @ 0x0801601A, table-driven.
- *  Rows: PD4-PD7 input via ubfx r0, r0, 4, 4 @ 0x0801602E.
- *  PC5 = scan enable: SCR @ 0x080136B4, CLR @ 0x080136D4.
- *  PA7 = latch: SCR @ 0x080136BC, CLR @ 0x080136D0.
+ *  ACTIVE SCAN CONFIRMED (April 2026, 3 iterations):
+ *    Columns: PC0-PC3 driven LOW one at a time (push-pull output)
+ *    5th column: keys 1,4,7,star read when all PC0-PC3 HIGH
+ *      (PC4 = BAND_RELAY - DO NOT TOGGLE! See RF section)
+ *    Rows: PD4-PD7 input with pull-ups, active LOW
+ *    All 20 keys in matrix - no direct-wired nav keys.
+ *
+ *  VERIFIED MATRIX LAYOUT (5 cols × 4 rows):
+ *         PC0     PC1    PC2    PC3    col4(allHI)
+ *  PD4:   V/M      #      0     Right     *
+ *  PD5:   Back     9      8     Left      7
+ *  PD6:   ABC      6      5     Down      4
+ *  PD7:   OK       3      2     Up        1
+ *
+ *  Physical layout (standard phone keypad order):
+ *    PD7 = top row     (1  2  3  OK   Up)
+ *    PD6 = 2nd row     (4  5  6  ABC  Down)
+ *    PD5 = 3rd row     (7  8  9  Back Left)
+ *    PD4 = bottom row  (*  0  #  V/M  Right)
+ *
+ *  BINARY_VERIFIED (V0.27):
+ *    Columns: PC0-PC3 output via BRR(GPIOC, 0x0F).
+ *    Rows: PD4-PD7 input via ubfx r0, r0, 4, 4.
+ *    PC5 = scan enable: SCR @ 0x080136B4, CLR @ 0x080136D4.
+ *    PA7 = latch: SCR @ 0x080136BC, CLR @ 0x080136D0.
  * ======================================================================== */
-#define KBD_COL_PORT            GPIOC       /* BINARY_VERIFIED V0.27 Scan@0x08015FF8 */
-#define KBD_COL_MASK            0x000FU     /* bits 0-3, BRR@0x0801601A */
+#define KBD_COL_PORT            GPIOC       /* BINARY_VERIFIED V0.27 */
+#define KBD_COL_MASK            0x000FU     /* bits 0-3 = PC0-PC3 (4 driven cols) */
+#define KBD_NUM_COLS            5           /* 4 scanned + 1 implicit (all-HIGH) */
 
-#define KBD_ROW_PORT            GPIOD       /* BINARY_VERIFIED V0.27 Scan@0x08015FF8 */
-#define KBD_ROW_MASK            0x00F0U     /* bits 4-7, ubfx@0x0801602E */
+#define KBD_ROW_PORT            GPIOD       /* HW_CONFIRMED - active scan April 2026 */
+#define KBD_ROW_MASK            0x00F0U     /* bits 4-7 = PD4-PD7 */
 #define KBD_ROW_SHIFT           4
+#define KBD_NUM_ROWS            4
 
-/*
- * CORRECTED: Binary V0.27 @ 0x080136B0 loads
- * GPIOC(0x40011000) mask 0x20 = PC5 for scan control, and
- * GPIOA(0x40010800) mask 0x80 = PA7 for latch.
- */
-#define KBD_SCAN_EN_PORT        GPIOC       /* BINARY_VERIFIED V0.27 @ 0x080136B0 */
-#define KBD_SCAN_EN_PIN         GPIO_PIN_5  /* GPIOC mask 0x0020 - NOT PE5 */
+/* Matrix scan: 4 columns (PC0-3) + 4 rows (PD4-7) = 16 keys.
+ * Side buttons (PE5=TOP_PROG, PA12=BOT_PROG) are read via direct GPIO
+ * BEFORE the matrix scan, matching OEM gpio_output_control @ 0x08012FF8.
+ *
+ * CORRECTION (Phase 12 audit): PC5 and PA7 were previously labeled as
+ * KBD_SCAN_EN and KBD_LATCH based on misread data at 0x080136B0.
+ * OEM assembly shows PC5/PA7 are always toggled TOGETHER by the RF
+ * subsystem (0x800DB00, 0x80106B4, 0x801ADA0) controlled by a flag
+ * at RAM+0xA93C. These are BK4829 scan control pins, NOT keypad pins.
+ * The actual keypad scan (0x08012FF8) does NOT reference PC5 or PA7. */
 
-#define KBD_LATCH_PORT          GPIOA       /* BINARY_VERIFIED V0.27 @ 0x080136B0 */
-#define KBD_LATCH_PIN           GPIO_PIN_7  /* GPIOA mask 0x0080 - NOT PA12 */
+/* BK4829 RF scan control - NOT keypad related (see correction above) */
+#define BK_SCAN_EN_PORT         GPIOC       /* BINARY_VERIFIED: SET/CLR @ 0x800DB00 */
+#define BK_SCAN_EN_PIN          GPIO_PIN_5  /* GPIOC mask 0x0020 - RF scan enable */
+
+#define BK_SCAN_LATCH_PORT      GPIOA       /* BINARY_VERIFIED: SET/CLR @ 0x800DB08 */
+#define BK_SCAN_LATCH_PIN       GPIO_PIN_7  /* GPIOA mask 0x0080 - RF scan latch */
 
 /* ========================================================================
- *  Rotary encoder - PB4=A, PB5=B  [BINARY_VERIFIED]
+ *  Rotary encoder - PB4=A, PB5=B  [HW_CONFIRMED]
+ *
+ *  GPIO SCAN CONFIRMED (April 2026):
+ *    PB4 (ch A) and PB5 (ch B), idle HIGH, standard quadrature.
+ *    CW rotation:  PB4 leads PB5 (A transitions before B)
+ *    CCW rotation: PB5 leads PB4 (B transitions before A)
+ *    20ms scan resolution captured clean quadrature state transitions.
  *
  *  V0.27: Software quadrature FSM @ 0x08010710, polled at 200Hz.
  *  GPIO_ReadPin(GPIOB, 0x10) @ 0x08010860 = Enc A.
@@ -200,10 +244,10 @@
  *  NOT using TIM3 hardware encoder mode.
  *  CW = event 0x14, CCW = event 0x16, debounce = 0xC8.
  * ======================================================================== */
-#define ENC_A_PORT              GPIOB       /* BINARY_VERIFIED V0.27 ReadPin@0x08010860 */
-#define ENC_A_PIN               GPIO_PIN_4  /* mask 0x0010 */
-#define ENC_B_PORT              GPIOB       /* BINARY_VERIFIED V0.27 ReadPin@0x0801086C */
-#define ENC_B_PIN               GPIO_PIN_5  /* mask 0x0020 */
+#define ENC_A_PORT              GPIOB       /* HW_CONFIRMED - GPIO scan April 2026 */
+#define ENC_A_PIN               GPIO_PIN_4  /* mask 0x0010, CW=A leads B */
+#define ENC_B_PORT              GPIOB       /* HW_CONFIRMED - GPIO scan April 2026 */
+#define ENC_B_PIN               GPIO_PIN_5  /* mask 0x0020, CCW=B leads A */
 
 /* ========================================================================
  *  PTT / TX Relay Control  [BINARY_VERIFIED V0.27 @ 0x0801D268]
@@ -267,9 +311,17 @@
 
 #define ADC_VOX_PORT            GPIOA       /* BINARY_VERIFIED + HW_PROBED "VOX DETECT" */
 #define ADC_VOX_PIN             GPIO_PIN_0  /* mask 0x0001 - ADC2_CH0, 239.5 cycle sample */
+/* NOTE: HW_PROBED label says "VOX DETECT" on PA0, but OEM firmware
+ * ADC_Read_PA0 @ 0x0801385C is used as battery voltage sense (result
+ * compared against 0x86-0xBB thresholds).  This may indicate the
+ * PCB silkscreen label is misleading, or the trace was misidentified
+ * during physical probing.  The adc.c code follows OEM firmware usage:
+ * channel 0 (PA0) = battery, channel 1 (PA1) = audio.  */
 
 #define ADC_BATT_PORT           GPIOA       /* BINARY_VERIFIED + HW_PROBED "BATTERY DETECT" */
 #define ADC_BATT_PIN            GPIO_PIN_1  /* mask 0x0002 - ADC2_CH1, upper 8 bits */
+/* NOTE: Same discrepancy - HW_PROBED says "BATTERY" on PA1, but OEM
+ * ADC_Read_PA1 @ 0x08013820 is used as audio/VOX level input.  */
 
 /* ========================================================================
  *  Newly Discovered Pins - GPIO Cross-Reference Scan  [BINARY_VERIFIED]
@@ -280,23 +332,26 @@
  * ======================================================================== */
 
 /* --- GPIOE Input / Control Pins --- */
-#define PWR_SWITCH_PORT         GPIOE       /* HW_PROBED "POWER SWITCH" */
-#define PWR_SWITCH_PIN          GPIO_PIN_0  /* mask 0x0001 - power button input */
+#define PWR_SWITCH_PORT         GPIOE       /* HW_CONFIRMED - GPIO scan: PE0 toggle on power sw */
+#define PWR_SWITCH_PIN          GPIO_PIN_0  /* mask 0x0001 - HIGH=ON position, LOW=OFF */
 
 #define SPK_MUTE_PORT           GPIOE       /* BINARY_VERIFIED + HW_PROBED "SPEAKER MUTE" */
-#define SPK_MUTE_PIN            GPIO_PIN_1  /* mask 0x0002 - speaker mute control */
+#define SPK_MUTE_PIN            GPIO_PIN_1  /* mask 0x0002 - speaker mute (static during scan) */
 
-#define PTT2_PORT               GPIOE       /* BINARY_VERIFIED + HW_PROBED "PTT 2" */
-#define PTT2_PIN                GPIO_PIN_2  /* mask 0x0004 - secondary PTT input */
+#define PTT2_PORT               GPIOE       /* HW_CONFIRMED - GPIO scan: PE2 toggle on PTT2 press */
+#define PTT2_PIN                GPIO_PIN_2  /* mask 0x0004 - secondary PTT input, active LOW */
 
-#define PTT_PORT                GPIOE       /* BINARY_VERIFIED + HW_PROBED "PTT" */
-#define PTT_PIN                 GPIO_PIN_3  /* mask 0x0008 - primary PTT input (16x reads) */
+#define PTT_PORT                GPIOE       /* HW_CONFIRMED - GPIO scan: PE3 toggle on PTT1 press */
+#define PTT_PIN                 GPIO_PIN_3  /* mask 0x0008 - primary PTT input, active LOW */
 
 #define PA_ENABLE_PORT          GPIOE       /* BINARY_VERIFIED + HW_PROBED "POWER AMP ENABLE" */
 #define PA_ENABLE_PIN           GPIO_PIN_4  /* mask 0x0010 - RF power amplifier enable */
 
-#define SIDE_KEY1_PORT          GPIOE       /* BINARY_VERIFIED + HW_PROBED "SIDE KEY 1" */
-#define SIDE_KEY1_PIN           GPIO_PIN_5  /* mask 0x0020 - side button 1 input */
+#define TOP_PROG_PORT           GPIOE       /* BINARY_VERIFIED: OEM keypad scan @ 0x08012FF8 reads PE5 */
+#define TOP_PROG_PIN            GPIO_PIN_5  /* mask 0x0020 - top programmable side button, active LOW */
+/* Legacy alias */
+#define SIDE_KEY1_PORT          TOP_PROG_PORT
+#define SIDE_KEY1_PIN           TOP_PROG_PIN
 
 #define EXT_PTT_PORT            GPIOE       /* BINARY_VERIFIED + HW_PROBED "EXTERNAL PTT" */
 #define EXT_PTT_PIN             GPIO_PIN_6  /* mask 0x0040 - external PTT (side port) */
@@ -305,9 +360,15 @@
 #define SW_TO_BT_PORT           GPIOE       /* HW_PROBED "SW TO BT" - low confidence */
 #define SW_TO_BT_PIN            GPIO_PIN_9  /* mask 0x0200 - audio switch to bluetooth? */
 
-/* --- RF Frontend Enable (paired, NOT a 2-bit selector) --- */
-#define MIC_ENABLE_PORT         GPIOB       /* BINARY_VERIFIED + HW_PROBED "MICROPHONE ENABLE" */
-#define MIC_ENABLE_PIN          GPIO_PIN_8  /* mask 0x0100 - microphone power/enable */
+/* --- Audio Amplifier Enable --- */
+/* OEM firmware analysis: audio_state_machine @ 0x08006574 SETs PB8 before
+   beep_play and CLRs PB8 after. Originally labeled "MIC_ENABLE" in JKI757
+   but confirmed as audio amplifier enable via binary RE. May be dual-purpose
+   (mic + amp on same enable), but primary function is amp enable for speaker. */
+#define AMP_EN_PORT             GPIOB       /* BINARY_VERIFIED: OEM sets HIGH before audio */
+#define AMP_EN_PIN              GPIO_PIN_8  /* mask 0x0100 - audio amplifier enable */
+#define MIC_ENABLE_PORT         AMP_EN_PORT /* Legacy alias (JKI757 label) */
+#define MIC_ENABLE_PIN          AMP_EN_PIN  /* Legacy alias */
 
 /* --- Power/Enable --- */
 #define GPIO_PB9_PWREN_PORT     GPIOB       /* HW_CONFIRMED + HW_PROBED "LB POWER ENABLE" */
@@ -319,6 +380,12 @@
 
 #define POWER_OFF_PORT          GPIOA       /* HW_PROBED "DEVICE POWER OFF" */
 #define POWER_OFF_PIN           GPIO_PIN_11 /* mask 0x0800 - software power-off trigger */
+
+#define BOT_PROG_PORT           GPIOA       /* BINARY_VERIFIED: OEM keypad scan @ 0x08012FF8 reads PA12 */
+#define BOT_PROG_PIN            GPIO_PIN_12 /* mask 0x1000 - bottom programmable side button, active LOW */
+/* Legacy alias */
+#define SIDE_KEY4_PORT          BOT_PROG_PORT
+#define SIDE_KEY4_PIN           BOT_PROG_PIN
 
 #define REPLAY_PORT             GPIOA       /* HW_PROBED "REPLAY" */
 #define REPLAY_PIN              GPIO_PIN_15 /* mask 0x8000 - audio replay control */
@@ -335,13 +402,10 @@
 #define PTT_DETECT_PORT         GPIOC       /* HW_PROBED "PTT DETECT" */
 #define PTT_DETECT_PIN          GPIO_PIN_7  /* mask 0x0080 - PTT button state input */
 
-#define BEEP_SW_PORT            GPIOC       /* HW_PROBED "BEEP SW" */
-#define BEEP_SW_PIN             GPIO_PIN_12 /* mask 0x1000 - beep/speaker switch */
+#define BEEP_SW_PORT            GPIOC       /* HW_PROBED "BEEP SW" - static during GPIO scan */
+#define BEEP_SW_PIN             GPIO_PIN_12 /* mask 0x1000 - beep/speaker switch (output) */
 
-#define SIDE_KEY4_PORT          GPIOA       /* HW_PROBED "SK 4?" - low confidence */
-#define SIDE_KEY4_PIN           GPIO_PIN_12 /* mask 0x1000 - side key 4 input? */
-
-/* --- Status LEDs --- */
+/* --- Status LEDs (static during GPIO scan = confirmed outputs) --- */
 #define LED_RED_PORT            GPIOC       /* HW_CONFIRMED - OEM toggle func @ 0x08017EDC */
 #define LED_RED_PIN             GPIO_PIN_13 /* mask 0x2000 - state tracked at RAM 0x200001DE+2 */
 
@@ -349,6 +413,11 @@
 #define LED_GREEN_PIN           GPIO_PIN_14 /* mask 0x4000 - state tracked at RAM 0x200001DE+3 */
 
 /* --- RF Band Selection Relay --- */
+/* !! DANGER: PC4 is the VHF/UHF antenna relay. Rapid toggling or
+ *    incorrect state during TX WILL damage the PA / front end.
+ *    HW_CONFIRMED 2026-04-03: toggling PC4 as keypad col5 caused
+ *    audible relay clicking. This is NOT a keypad column.
+ *    Only change state when switching bands, with TX disabled. !! */
 #define BAND_RELAY_PORT         GPIOC       /* HW_CONFIRMED - OEM toggle func @ 0x0801DB8C */
 #define BAND_RELAY_PIN          GPIO_PIN_4  /* mask 0x0010 - VHF/UHF antenna relay */
 
@@ -358,8 +427,10 @@
 #define SIDEPORT_RX_PORT        GPIOC       /* HW_PROBED "SIDEPORT RX DETECT" - low confidence */
 #define SIDEPORT_RX_PIN         GPIO_PIN_8  /* mask 0x0100 */
 
-#define SIDEPORT_SPK_PORT       GPIOC       /* HW_PROBED "SIDEPORT EXT SPEAKER?" - low confidence */
-#define SIDEPORT_SPK_PIN        GPIO_PIN_15 /* mask 0x8000 */
+#define SIDEPORT_SPK_PORT       GPIOC       /* BINARY_VERIFIED "SIDEPORT EXT SPEAKER" @ spk_mute_on_ptt 0x08019254 */
+#define SIDEPORT_SPK_PIN        GPIO_PIN_15 /* mask 0x8000 - LOW = sideport speaker connected */
+/* OEM spk_mute_on_ptt reads PC15 with 50ms debounce.
+ * If LOW: sets PE1 (SPK_MUTE) + PB8 (MIC_EN) to route audio to sideport. */
 
 #define VSW_ENABLE_PORT         GPIOC       /* HW_PROBED "VSW ENABLE" (also keypad scan enable) */
 #define VSW_ENABLE_PIN          GPIO_PIN_5  /* mask 0x0020 - voltage switch / scan enable */
@@ -389,15 +460,43 @@
 #define PTT_ACC0_PIN            RF_V3R_EN_PIN
 #define PTT_ACC1_PORT           RF_V3T_EN_PORT
 #define PTT_ACC1_PIN            RF_V3T_EN_PIN
-#define BAND_SEL0_PORT          MIC_ENABLE_PORT
-#define BAND_SEL0_PIN           MIC_ENABLE_PIN
-#define BAND_SEL1_PORT          PA_ENABLE_PORT
-#define BAND_SEL1_PIN           PA_ENABLE_PIN
+/*
+ * RF frontend enable pair (PB8 + PE4).
+ * OEM V0.27 @ 0x08022E3C: Always SET/CLR together as a ref-counted
+ * RF frontend enable/disable.  NOT band selectors - per-band filter
+ * selection is done via BK4829 registers (REG_30/47/48).
+ *
+ * NOTE: PB8 is dual-purpose - also used as AMP_EN for audio path
+ * (see audio.c).  A proper ref-count mechanism will be needed when
+ * both audio and RF paths are active simultaneously.
+ */
+#define RF_FRONTEND_EN0_PORT    MIC_ENABLE_PORT   /* PB8 */
+#define RF_FRONTEND_EN0_PIN     MIC_ENABLE_PIN
+#define RF_FRONTEND_EN1_PORT    PA_ENABLE_PORT    /* PE4 */
+#define RF_FRONTEND_EN1_PIN     PA_ENABLE_PIN
 #define ADC_AUDIO_PORT          ADC_VOX_PORT
 #define ADC_AUDIO_PIN           ADC_VOX_PIN
 #define PC12_GPIO_PORT          BEEP_SW_PORT
 #define PC12_GPIO_PIN           BEEP_SW_PIN
 #define LCD_ENABLE_PORT         LED_GREEN_PORT
 #define LCD_ENABLE_PIN          LED_GREEN_PIN
+
+/* ========================================================================
+ *  GPIO Baseline Reference (from HW GPIO scan, all inputs idle)
+ *
+ *  These are the IDR values when no buttons are pressed:
+ *    GPIOA IDR = 0xBE00  (PA9=BT_TX, PA10=BT_RX, PA11-15 various)
+ *    GPIOB IDR = 0xF7B8  (PB11 masked=GPS noise; PB3-5,7-15 idle)
+ *    GPIOC IDR = 0xD140  (completely static across all input events)
+ *    GPIOD IDR = 0x1FFF  (PD4-7=rows idle HIGH, PD8-12=LCD data)
+ *    GPIOE IDR = 0x8D6C  (PE0=0 pwr off, PE2-3=1 PTT up, PE5=1 side up)
+ *
+ *  Pins confirmed STATIC during full input scan (output-only or unused):
+ *    GPIOA: PA0-8, PA13-15 (all static)
+ *    GPIOB: PB0-3, PB6-10, PB12-15 (all static)
+ *    GPIOC: ALL pins static (PC0-15 never changed)
+ *    GPIOD: PD0-3, PD8-12 (LCD bus + control, static)
+ *    GPIOE: PE1, PE4, PE6-15 (all static)
+ * ======================================================================== */
 
 #endif /* RT950_PINMAP_H */

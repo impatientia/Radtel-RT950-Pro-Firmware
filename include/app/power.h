@@ -6,8 +6,11 @@
  * Voltage formula: mV = ADC_8bit x 482 / 10  (verified: 0xBB -> 9.01V).
  * Thresholds loaded from flash calibration at 0xF200.
  *
- * Auto power-off: countdown timer, shutdown via NVIC SYSRESETREQ.
- * Backlight: GPIO toggle on PC6 (no PWM).
+ * Power button: PE0 monitored for long-press (1.5s) to trigger
+ * hardware power-off via PB9 latch release.
+ *
+ * Auto power-off: countdown timer triggers same hardware power-off.
+ * Backlight: GPIO toggle on PC6 + PB3 (no PWM).
  *
  * RE references:
  *   - Battery state machine at 0x2000AF70
@@ -31,7 +34,7 @@ typedef enum {
     BATT_FULL,
 } battery_level_t;
 
-/* Initialize power subsystem (ADC, default thresholds) */
+/* Initialize power subsystem (PE0 input, default thresholds) */
 void power_init(void);
 
 /* Read battery voltage (raw 8-bit ADC value, 12-bit >> 4) */
@@ -51,7 +54,18 @@ void power_set_auto_off(uint16_t minutes);  /* 0 = disabled */
 void power_reset_idle_timer(void);          /* Call on any user activity */
 void power_poll(void);                      /* Call from main loop ~1Hz */
 
-/* Backlight control (PC6 GPIO toggle) */
+/* Power button (PE0) long-press monitor. Call at ~50Hz.
+ * After 1.5 seconds of continuous press, triggers power_off(). */
+void power_button_poll(void);
+
+/* Hardware power-off: saves state, disables peripherals, releases
+ * PB9 latch. Hardware regulator cuts power. Does not return. */
+void power_off(void);
+
+/* MCU reset via NVIC SYSRESETREQ. Use for error recovery. */
+void power_reset(void);
+
+/* Backlight control (PC6 + PB3 GPIO toggle) */
 void power_backlight_on(void);
 void power_backlight_off(void);
 void power_backlight_toggle(void);
@@ -70,7 +84,7 @@ void power_breathing_poll(void);
  */
 uint8_t power_is_low_batt_alert(void);
 
-/* System shutdown (NVIC SYSRESETREQ) */
+/* Backward-compatible shutdown (calls power_off internally) */
 void power_shutdown(void);
 
 #endif /* APP_POWER_H */

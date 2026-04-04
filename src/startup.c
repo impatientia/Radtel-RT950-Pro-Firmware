@@ -334,9 +334,27 @@ void Default_Handler(void)
 
 /* ========================================================================
  *  HardFault_Handler - Captures fault context for debugging.
+ *
+ *  Uses a naked assembly trampoline to determine which stack was active
+ *  (MSP or PSP) and pass the exception stack frame to the C handler.
+ *  The frame layout is: R0, R1, R2, R3, R12, LR, PC, xPSR.
  * ======================================================================== */
 
+void HardFault_Handler_C(const uint32_t *frame);
+
+__attribute__((naked))
 void HardFault_Handler(void)
+{
+    __asm volatile (
+        "tst lr, #4          \n"  /* Test bit 2 of EXC_RETURN */
+        "ite eq               \n"
+        "mrseq r0, msp        \n"  /* Main stack was active */
+        "mrsne r0, psp        \n"  /* Process stack was active */
+        "b HardFault_Handler_C\n"
+    );
+}
+
+void HardFault_Handler_C(const uint32_t *frame)
 {
     /* Feed IWDG so we stay alive long enough to print diagnostics */
     *(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL;
@@ -363,10 +381,14 @@ void HardFault_Handler(void)
         dbg_reg("[FAULT] MMFAR=0x", mmfar);
     }
 
-    /* Read stacked PC from exception frame (R14/LR tells us stack) */
-    uint32_t lr;
-    __asm volatile ("mov %0, lr" : "=r" (lr));
-    dbg_reg("[FAULT] EXC_LR=0x", lr);
+    /* Exception stack frame: [R0, R1, R2, R3, R12, LR, PC, xPSR] */
+    if (frame) {
+        dbg_reg("[FAULT] R0 =0x", frame[0]);
+        dbg_reg("[FAULT] R12=0x", frame[4]);
+        dbg_reg("[FAULT] LR =0x", frame[5]);
+        dbg_reg("[FAULT] PC =0x", frame[6]);
+        dbg_reg("[FAULT] xPSR=0x", frame[7]);
+    }
 
     while (1) {
         *(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL;

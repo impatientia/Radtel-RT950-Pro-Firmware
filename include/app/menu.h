@@ -4,17 +4,32 @@
  * 12-category menu matching OEM structure, with category -> item -> edit
  * navigation. Integrates with keypad, encoder, and display subsystems.
  *
- * V0.27 OEM menu structure (string table at fw 0x0805A440-0x0805BC00):
- *   12 top-level categories, each with sub-items.
- *   Format: 02 ID 20 "string" 00  (type=0x02 item, type=0x07 header)
- *   Menu dispatch at fw 0x080062EA (CMP chain on menu ID byte).
- *   ToneMenu_ShowEntry at fw 0x0800AF68.
+ * V0.27 OEM menu architecture:
+ *   settings_menu_engine   @ 0x08011AC4 (17,740 bytes)
+ *     - Command-dispatch state machine (CMP chain on r1, 17+ commands)
+ *     - Commands: 0x02=init, 0x03=nav, 0x05=scroll, 0x07=edit,
+ *       0x10=exit, 0x11=focus, 0x12-0x18=menu ops, 0x1C/0x1F/0x24/0x25
+ *     - r1 >= 0xA0 → channel/zone select mode
+ *     - Called by main_task_dispatch
+ *   display_menu_screen    @ 0x08010790 (menu overlay renderer)
+ *   menu_list_renderer     @ 0x080108F4 (item list rendering)
+ *   menu_item_draw         @ 0x08010BC8 (single item render)
+ *   menu_settings_draw     @ 0x08010AD8 (settings page render)
+ *   menu_scroll_handler    @ 0x080102DC (scroll logic)
  *
- * OEM top-level menu IDs (from string table at fw 0x0805B34C-0x0805B440):
+ * String table @ 0x0805A440-0x0805BC00 (~7 KB):
+ *   Entry format: 02 ID 20 "string" 00 (items), 07 20 "string" 00 (headers)
+ *   Top-level categories @ 0x0805B3D0-0x0805B442 (12 entries)
+ *   ASCII + GB2312 (Chinese) encoding, CJK index: (b1-0xA1)*94+(b2-0xA1)
+ *
+ * Top-level menu IDs (from string table at fw 0x0805B3D0-0x0805B442):
  *   0x12 = VOX          0x13 = Zone          0x14 = VFO & CH
  *   0x15 = CTCSS DCS    0x16 = Radio Set     0x17 = APRS Set
  *   0x18 = User Key     0x19 = Bluetooth     0x1A = Signaling
  *   0x1B = Setting      0x1C = Reset         0x1D = About
+ *
+ * Our implementation: 4-state enum (CLOSED/CATEGORY/LIST/EDIT)
+ * vs OEM command dispatch. Functionally equivalent.
  */
 
 #ifndef APP_MENU_H

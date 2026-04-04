@@ -57,6 +57,8 @@ SRCS = \
 	$(SRC_DIR)/app/am_radio.c \
 	$(SRC_DIR)/drivers/flash_layout.c \
 	$(SRC_DIR)/drivers/flash_wearleveling.c \
+	$(SRC_DIR)/drivers/flash_xor.c \
+	$(SRC_DIR)/drivers/flash_crc.c \
 	$(SRC_DIR)/drivers/calibration.c \
 	$(SRC_DIR)/app/vox.c \
 	$(SRC_DIR)/app/fm_radio.c \
@@ -65,6 +67,8 @@ SRCS = \
 	$(SRC_DIR)/app/spectrum.c \
 	$(SRC_DIR)/app/cps.c \
 	$(SRC_DIR)/app/settings.c \
+	$(SRC_DIR)/kernel/scheduler.c \
+	$(SRC_DIR)/kernel/event.c \
 	$(SRC_DIR)/tests/hw_test.c \
 	$(SRC_DIR)/debug_uart.c
 

@@ -27,6 +27,8 @@
 #include "app/freq_entry.h"
 #include "app/aprs.h"
 #include "app/bluetooth.h"
+#include "app/gps.h"
+#include "app/vox.h"
 #include "drivers/lcd.h"
 #include "drivers/bk4829.h"
 #include <stdarg.h>
@@ -323,19 +325,67 @@ void display_printf(uint16_t x, uint16_t y, uint16_t fg, uint16_t bg,
 }
 
 /* ========================================================================
+ *  Display mode management
+ *
+ *  OEM: display_render_engine @ 0x08019344 uses TBB jump table on
+ *  g_rf_state[3] (11 modes). We use an enum + switch for clarity.
+ * ======================================================================== */
+
+static display_mode_t cur_display_mode = DISPLAY_MODE_MAIN;
+
+display_mode_t display_get_mode(void) { return cur_display_mode; }
+
+void display_set_mode(display_mode_t mode)
+{
+    if (mode < DISPLAY_MODE_COUNT)
+        cur_display_mode = mode;
+}
+
+/* ========================================================================
  *  display_update - Main display refresh, called at ~30 fps.
  *
- *  Routes rendering to menu, or main screen layout depending on state.
+ *  OEM equivalent: display_render_engine @ 0x08019344 (TBB dispatch,
+ *  27,380B). Both use direct pixel push (no RAM framebuffer).
+ *  OEM called from display_periodic_refresh @ 0x08003B3C.
  * ======================================================================== */
 
 void display_update(void)
 {
+    /* Menu overlay takes priority regardless of display mode */
     if (menu_get_state() != MENU_STATE_CLOSED) {
         menu_draw();
         return;
     }
 
-    display_draw_main_screen();
+    /* Frequency entry overlay */
+    if (freq_entry_is_active()) {
+        display_draw_status_bar();
+        display_draw_vfo_a();   /* vfo_a handles freq entry rendering */
+        return;
+    }
+
+    switch (cur_display_mode) {
+    case DISPLAY_MODE_MAIN:
+    default:
+        display_draw_main_screen();
+        break;
+    case DISPLAY_MODE_FM_RADIO:
+    case DISPLAY_MODE_AM_RADIO:
+        /* TODO: dedicated FM/AM radio screen (Phase 22) */
+        display_draw_main_screen();
+        break;
+    case DISPLAY_MODE_CHANNEL:
+        /* TODO: channel/zone browser screen (Phase 22) */
+        display_draw_main_screen();
+        break;
+    case DISPLAY_MODE_MENU:
+        menu_draw();
+        break;
+    case DISPLAY_MODE_FREQ_ENTRY:
+        display_draw_status_bar();
+        display_draw_vfo_a();
+        break;
+    }
 }
 
 /* ========================================================================
@@ -430,7 +480,15 @@ static void format_tone_info(const vfo_state_t *vfo, char *buf, uint8_t size)
 }
 
 /* ========================================================================
- *  display_draw_status_bar - Battery, TX/RX indicator, icons (y=0..19)
+ *  display_draw_status_bar - Battery, TX/RX, mode icons (y=0..19)
+ *
+ *  OEM: display_status_bar @ 0x08020340 renders 5 fields:
+ *    1. Signal strength (RSSI bars)
+ *    2. Battery level
+ *    3. TX/RX indicator (red/green text)
+ *    4. Lock/encryption status
+ *    5. RF mode flags
+ *  All OEM icons are procedurally drawn (text + rectangles, no bitmaps).
  * ======================================================================== */
 
 void display_draw_status_bar(void)
@@ -452,6 +510,42 @@ void display_draw_status_bar(void)
         font_draw_string(FONT_SMALL, 2, 4, "RX", COLOR_GREEN, COLOR_BLACK);
     }
 
+    /* Status icons region: x=20..86 - GPS, VOX, lock, encryption */
+    {
+        uint16_t ix = 20;
+        const settings_t *s = settings_get();
+
+        /* GPS fix indicator */
+        const gps_data_t *gps = gps_get_data();
+        if (gps && gps->fix_quality > 0) {
+            font_draw_string(FONT_SMALL, ix, 4, "GP", COLOR_GREEN, COLOR_BLACK);
+        } else if (s->aprs_enable) {
+            /* GPS enabled but no fix - show dim */
+            font_draw_string(FONT_SMALL, ix, 4, "GP", COLOR_DARK_GRAY, COLOR_BLACK);
+        }
+        ix += 18;
+
+        /* VOX indicator */
+        if (s->vox_switch && vox_is_triggered())
+            font_draw_string(FONT_SMALL, ix, 4, "VX", COLOR_YELLOW, COLOR_BLACK);
+        else if (s->vox_switch)
+            font_draw_string(FONT_SMALL, ix, 4, "VX", COLOR_DARK_GRAY, COLOR_BLACK);
+        ix += 18;
+
+        /* Key lock indicator */
+        if (s->keypad_lock)
+            font_draw_string(FONT_SMALL, ix, 4, "LK", COLOR_ORANGE, COLOR_BLACK);
+        ix += 18;
+
+        /* Encryption/scrambler indicator */
+        {
+            radio_vfo_t act = vfo_get_active();
+            const vfo_state_t *vs = vfo_get_state(act);
+            if (vs->scrambler)
+                font_draw_string(FONT_SMALL, ix, 4, "EN", COLOR_CYAN, COLOR_BLACK);
+        }
+    }
+
     /* Center: active VFO label + dual-watch indicator */
     {
         radio_vfo_t active = vfo_get_active();
@@ -469,7 +563,10 @@ void display_draw_status_bar(void)
             font_draw_string(FONT_SMALL, 90, 4, "DW", COLOR_CYAN, COLOR_BLACK);
     }
 
-    /* Right: battery icon - 4 bars based on level */
+    /* Right: battery icon - 4 bars based on level
+     * OEM: 28x12 procedural rectangle at right edge.
+     * 4 inner bars: 5px wide x 8px tall, 1px gap. Terminal nub: 3x6.
+     * Green when >1 bar, red when 1 bar, dark gray when empty. */
     {
         battery_level_t level = power_get_battery_level();
         uint8_t bars = 0;

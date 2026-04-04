@@ -123,6 +123,9 @@ void lcd_panel_reset(void)
 
 /* ========================================================================
  *  lcd_backlight_on / lcd_backlight_off
+ *
+ *  OEM toggles both PC6 and PB3 together @ 0x08017C40.
+ *  PC6 = primary backlight enable, PB3 = secondary driver enable.
  * ======================================================================== */
 
 void lcd_backlight_on(void)
@@ -351,6 +354,9 @@ void lcd_init(void)
     gpio_config_pin(LCD_DC_PORT,  LCD_DC_PIN,  GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);
     gpio_config_pin(LCD_RST_PORT, LCD_RST_PIN, GPIO_MODE_OUT_2MHZ,  GPIO_CNF_PP);
     gpio_config_pin(LCD_BL_PORT,  LCD_BL_PIN,  GPIO_MODE_OUT_2MHZ,  GPIO_CNF_PP);
+    /* PB3 secondary backlight driver - OEM toggles both @ 0x08017C40 */
+    gpio_enable_clock(LCD_BL_SEC_PORT);
+    gpio_config_pin(LCD_BL_SEC_PORT, LCD_BL_SEC_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
 
     /* Configure data pins PD8-PD15 as push-pull outputs */
     for (uint8_t i = 8; i <= 15; i++) {

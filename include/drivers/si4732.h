@@ -142,7 +142,7 @@
  * Frequency units: FM = 10 kHz (8750 = 87.5 MHz), AM = 1 kHz
  */
 struct si4732_tune_status {
-    uint16_t freq;
+    uint16_t freq;    /* FM: 10kHz units, AM: kHz, WB: kHz (may wrap) */
     uint8_t  rssi;
     uint8_t  snr;
     uint8_t  valid;
@@ -189,8 +189,10 @@ uint8_t si4732_get_status(void);
 /* Power up in weather band receive mode */
 int si4732_power_up_wb(void);
 
-/* Tune WB frequency. freq_khz in kHz (e.g. 162400 = 162.400 MHz) */
-int si4732_wb_tune(uint16_t freq_khz);
+/* Tune WB frequency. freq_khz in kHz (e.g. 162400 = 162.400 MHz)
+ * NOTE: NOAA frequencies (162400-162550) exceed uint16_t range.
+ * SI4732 WB_TUNE_FREQ command uses the lower 16 bits only. */
+int si4732_wb_tune(uint32_t freq_khz);
 
 /* Read WB tune status. Returns 0 on success, -1 on error. */
 int si4732_wb_tune_status(struct si4732_tune_status *st);

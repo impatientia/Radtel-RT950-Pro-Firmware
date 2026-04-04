@@ -2,6 +2,41 @@
 
 All notable changes to the RT-950 Pro custom firmware are documented here.
 
+## [0.0.2] - 2026-04-04
+
+Hardware validation release. All keypad/encoder/PTT inputs confirmed working
+on real hardware. Partial menu rendering tested. Audio playback under active
+debugging.
+
+### Hardware Confirmed
+- All keypad buttons mapped and tested (4x5 matrix, PC0-3 cols, PD0-7 rows)
+- Rotary encoder (PB4/PB5) confirmed working
+- PTT1 (PE3), PTT2 (PE2), EXT_PTT (PE5), Side Key (PA12) all functional
+- Power button (PE0) input confirmed
+- DAC1 (PA4) outputting valid sine waves via TIM6+DMA2 (registers verified)
+- SPI flash detected: Macronix MX25L1606E (JEDEC 0x00C22016)
+- Wear-leveling probe reads calibration data from flash
+
+### Bug Fixes
+- Fixed HardFault during boot: WL probe buffer overflow (4 → 160 bytes)
+- Fixed HardFault handler: naked ASM trampoline preserves stacked registers
+- Fixed hex debug output corruption: arithmetic conversion immune to BTF .rodata issues
+- Fixed PTT1/side buttons: PE0/2/3/5 and PA12 configured as inputs with pull-ups
+- Fixed DAC DMA underrun: deferred EN1+DMAEN1 until DMA armed, clear DMAUDR1
+
+### Display
+- Partial menu rendering test (renders but not yet functional, visual glitches present)
+- Boot splash screen with status text
+
+### Repository
+- V0.27 annotated disassembly moved to `assembly/` directory
+
+### Known Limitations
+- Audio amplifier not yet producing sound (DAC registers verified correct, analog path debugging in progress)
+- Battery ADC reads zero after first sample
+- SI4732 SSB patch binary not extracted from OEM flash
+- Bluetooth audio streaming not implemented (AT commands only)
+
 ## [0.0.1] - 2026-04-03
 
 Initial public release. Custom bare-metal firmware boots and runs on the

@@ -38,7 +38,22 @@ void audio_alert(void);
 /* Scan hit: quick rising chirp (600 -> 1000 Hz) */
 void audio_scan_hit(void);
 
+/*
+ * Beep at a specific frequency and duration (for per-key unique tones).
+ * @param freq_x10    Frequency in tenths of Hz (e.g., 10000 = 1000.0 Hz)
+ * @param duration_ms Duration in milliseconds
+ */
+void audio_beep_freq(uint16_t freq_x10, uint16_t duration_ms);
+
 /* Call from super_loop at >=100 Hz to manage tone duration and sequences */
 void audio_poll(void);
+
+/*
+ * Speaker mute/unmute for TX path control.
+ * OEM spk_mute_on_ptt @ 0x08019254, spk_unmute @ 0x0801929C.
+ * PE1 polarity: HIGH = muted (TX), LOW = unmuted (RX).
+ */
+void audio_speaker_mute(void);
+void audio_speaker_unmute(void);
 
 #endif /* APP_AUDIO_H */

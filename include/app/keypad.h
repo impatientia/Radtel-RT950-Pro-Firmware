@@ -1,10 +1,13 @@
 /*
  * keypad.h - Keypad scanner for the RT-950 Pro
  *
- * 4x4+1 matrix: columns PC0-PC3, rows PD4-PD7.
- * Scan enable on PC5, latch on PA7 (BINARY VERIFIED @ 0x080136B0 V0.27).
+ * 4x4 matrix: columns PC0-PC3, rows PD4-PD7.
+ * Side buttons PE5 (TOP_PROG) and PA12 (BOT_PROG) read directly
+ * before matrix scan, matching OEM gpio_output_control @ 0x08012FF8.
  *
- * Scan algorithm reverse-engineered from V0.27 binary @ fw 0x08012FF8.
+ * CORRECTION (Phase 12): PC5/PA7 were incorrectly used as keypad
+ * scan-enable/latch. OEM keypad scan does not reference these pins.
+ * PC5/PA7 are BK4829 RF scan control (SET/CLR @ 0x800DB00/0x800DB08).
  */
 
 #ifndef APP_KEYPAD_H
@@ -12,7 +15,7 @@
 
 #include <stdint.h>
 
-/* --- Key codes (column * 4 + row) --------------------------------------- */
+/* --- Key codes (column * 4 + row for matrix, fixed codes for GPIO) ------ */
 #define KEY_1           0       /* C0 R0 */
 #define KEY_2           1       /* C0 R1 */
 #define KEY_3           2       /* C0 R2 */
@@ -29,11 +32,22 @@
 #define KEY_0           13      /* C3 R1 */
 #define KEY_HASH        14      /* C3 R2 */
 #define KEY_D_BAND      15      /* C3 R3 */
-#define KEY_PTT         16      /* C4 R0 - side button */
-#define KEY_SIDE1       17      /* C4 R1 */
-#define KEY_SIDE2       18      /* C4 R2 */
-#define KEY_SIDE3       19      /* C4 R3 */
+#define KEY_C4R0        16      /* C4 R0 - matrix col 4 (if wired) */
+#define KEY_C4R1        17      /* C4 R1 */
+#define KEY_C4R2        18      /* C4 R2 */
+#define KEY_C4R3        19      /* C4 R3 */
+/* Direct-GPIO side buttons (OEM returns 0/1 for these; we use 20/21) */
+#define KEY_SIDE1       20      /* PE5  TOP_PROG - direct GPIO read */
+#define KEY_SIDE4       21      /* PA12 BOT_PROG - direct GPIO read */
+#define KEY_COUNT       22
 #define KEY_NONE        0xFF
+
+/* Legacy aliases: PTT is NOT on the keypad matrix - it's a standalone
+ * GPIO (PE3) monitored by task_buttons(). These defines allow app code
+ * to reference side button functions by their original names. */
+#define KEY_PTT         0xE3    /* PE3 PTT - standalone GPIO, not matrix */
+#define KEY_SIDE2       KEY_C4R2  /* legacy alias for matrix col4 row2 */
+#define KEY_SIDE3       KEY_C4R3  /* legacy alias for matrix col4 row3 */
 
 /* --- Key event types ---------------------------------------------------- */
 typedef enum {
@@ -55,19 +69,19 @@ typedef struct {
 
 /* --- API ---------------------------------------------------------------- */
 
-/* Configure GPIO for keypad matrix. Call once at startup. */
+/* Configure GPIO for keypad matrix + side button inputs. Call once. */
 void keypad_init(void);
 
 /*
- * Perform a single matrix scan.
- * Returns KEY_* code (0-19) or KEY_NONE (0xFF) if no key pressed.
- * Checks scan-enable (PC5) and latch (PA7) before scanning.
+ * Perform a single scan: side button direct reads + matrix scan.
+ * Returns KEY_* code (0-21) or KEY_NONE (0xFF) if no key pressed.
+ * OEM reference: gpio_output_control @ 0x08012FF8.
  */
 uint8_t keypad_scan(void);
 
 /*
  * Debounced key event detector.
- * Call periodically (e.g. every 5-10 ms from a timer tick).
+ * Call periodically (e.g. every 20 ms).
  * Fills *evt with press / repeat / release events.
  * Returns 1 if an event is available, 0 otherwise.
  */

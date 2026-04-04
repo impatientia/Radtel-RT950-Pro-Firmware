@@ -3,14 +3,26 @@
  *
  * DAC output fed by DMA2 channel 3, triggered by TIM6 TRGO.
  *
- * V0.27 binary evidence:
- *   - DMA2_CH3 ISR active at fw 0x0800D1D5 (vector table entry)
- *   - DAC SDK init function at fw 0x0800A548 (config struct pattern)
- *   - DAC CR bit-set/clear functions at fw 0x0800A508
- *   - TIM6 base literal pool ref at fw 0x0800697C (CRM clock enable area)
- *   - TIM6 ref at fw 0x0801BF70 (audio/radio control area)
- *   - No TIM6 ISR used: vector entry points to default handler at fw 0x080032BB
- *   - OEM may use DAC channel 2 (bit 16 = EN2 in DAC_CR) - needs further analysis
+ * OEM V0.27 function addresses:
+ *   dac_init               @ 0x0800A4F6 (18B)  - DAC peripheral init
+ *   dac_enable              @ 0x0800A508 (26B)  - DAC CR enable bits
+ *   dac_dma_enable          @ 0x0800A528 (26B)  - Enable DMA trigger on DAC
+ *   dac_dma_timer_config    @ 0x0800A548 (36B)  - Configure trigger/DMA bits in CR
+ *   tim6_dac_dma_init       @ 0x08018EC0 (174B) - Complete TIM6+DMA2_CH3+DAC setup
+ *   beep_play               @ 0x08003808 (360B) - Single-tone via TIM6+DMA+DAC
+ *
+ * OEM TIM6 configurations (verified):
+ *   Beep:  PSC=3, ARR=781  → sample rate ~38.4 kHz (~1200 Hz with 32 samples)
+ *   Init:  PSC=119, ARR=125 → sample rate ~7.9 kHz (~248 Hz with 32 samples)
+ *   CR2 MMS = 0x20 (update event triggers TRGO → DMA2_CH3 → DAC_DHR12R1)
+ *
+ * OEM hardware registers:
+ *   DAC base = 0x40007400, DHR12R1 = 0x40007408
+ *   TIM6 base = 0x40001000
+ *   DMA2_CH3 target = 0x40007408 (DAC data reg)
+ *   Waveform buffer = 0x2000E87C (16 halfwords in RAM)
+ *
+ * DAC config: BOFF1=1 (buffer OFF), TSEL1=0 (TIM6 TRGO trigger), DMA enabled.
  *
  * TIM6 clock = 120 MHz (APB1 bus = 60 MHz, timer clock doubled because
  * APB1 prescaler > 1).
@@ -90,10 +102,13 @@ static void dma2_ch3_setup(const uint16_t *src, uint16_t count, int circular)
 
 /* ========================================================================
  *  dac_audio_init - Enable DAC/TIM6/DMA2 clocks, configure DAC1 for
- *                   TIM6-triggered DMA output.
+ *                   TIM6-triggered DMA output on PA4.
  *
- *  PA4 does not need explicit GPIO configuration - the DAC automatically
- *  overrides the pin when DAC channel 1 is enabled.
+ *  PA4 must be set to analog mode (MODE=00, CNF=00) before enabling DAC.
+ *  Per AT32/STM32 reference manual, this disables the digital input
+ *  circuitry (Schmitt trigger + input buffer) to avoid parasitic loading
+ *  on the DAC analog output.  OEM gpio_modes_init @ 0x0801391C
+ *  configures PA4 as analog before DAC init.
  * ======================================================================== */
 
 void dac_audio_init(void)
@@ -102,14 +117,26 @@ void dac_audio_init(void)
     CRM->APB1EN |= CRM_APB1EN_DACEN | CRM_APB1EN_TIM6EN;
     CRM->AHBEN  |= CRM_AHBEN_DMA2EN;
 
-    /* Configure DAC channel 1:
-     *   - Trigger select = TIM6 TRGO (TSEL1 = 000)
-     *   - Trigger enable
-     *   - DMA enable
-     *   - Output buffer enabled (BOFF1 = 0)
-     *   - Channel enabled
-     */
-    DAC->CR = DAC_CR_EN1 | DAC_CR_TEN1 | DAC_CR_TSEL1_TIM6 | DAC_CR_DMAEN1;
+    /* PA4 + PA5 = analog mode (disable digital input circuitry).
+     * Required for clean DAC output per reference manual.
+     * PA4 = DAC CH1 (audio signal), PA5 = DAC CH2 (amp bias/reference).
+     * GPIOA clock already enabled by SystemInit. */
+    {
+        volatile uint32_t *crl = &((GPIO_TypeDef *)GPIOA_BASE)->CRL;
+        uint32_t v = *crl;
+        v &= ~(0xFFUL << 16);  /* PA4+PA5: bits [23:16] = MODE=00 CNF=00 */
+        *crl = v;               /* analog mode for both DAC channels */
+    }
+
+    /* Configure DAC: EN1 deferred to play_tone(), but EN2 enabled NOW.
+     * OEM dac_init @ 0x0800A4F6 enables EN2 at init (never disables it).
+     * OEM does NOT set BOFF2, so CH2 output buffer stays ON (low-Z ~1Ω).
+     * PA5 (CH2) likely provides DC bias/reference for the audio amplifier.
+     * Without CH2 enabled, the amp may not function. */
+    DAC->CR = DAC_CR_EN2 | DAC_CR_BOFF1 | DAC_CR_TEN1 | DAC_CR_TSEL1_TIM6;
+
+    /* Set CH2 output to mid-scale (1.65V) as amp bias reference */
+    DAC->DHR12R2 = 2048;
 
     /* TIM6 will be configured per-tone in dac_audio_play_tone() */
     TIM6->CR1 = 0;
@@ -139,6 +166,11 @@ void dac_audio_play_tone(uint16_t freq_hz_x10)
     TIM6->CR1 &= ~TIM_CR1_CEN;
     DMA2_CH(3)->CCR = 0;
 
+    /* Clear DMA underrun flag (DAC_SR offset 0x34, bit 13 = DMAUDR1).
+     * This flag latches if a TRGO arrived while DMA was not ready and
+     * permanently blocks further DMA requests until cleared. */
+    *(volatile uint32_t *)(DAC_BASE + 0x34U) = (1UL << 13);
+
     /* Calculate TIM6 auto-reload value */
     uint32_t divisor = (uint32_t)freq_hz_x10 * SINE_TABLE_SAMPLES;
     uint32_t arr = (TIM6_CLOCK_HZ * 10UL + divisor / 2) / divisor - 1;
@@ -146,10 +178,20 @@ void dac_audio_play_tone(uint16_t freq_hz_x10)
     /* Configure TIM6 timing */
     TIM6->PSC = 0;
     TIM6->ARR = arr;
-    TIM6->EGR = TIM_EGR_UG;            /* Force update to load PSC/ARR */
 
-    /* Start circular DMA from sine table to DAC */
+    /* Start circular DMA from sine table to DAC.
+     * MUST be before EGR=UG, because UG generates a TRGO via MMS=Update
+     * which triggers a DMA request - DMA must be ready to service it. */
     dma2_ch3_setup(sine_table, SINE_TABLE_SAMPLES, 1);
+
+    /* Enable DAC channel 1 + DMA - preserve EN2 for amp bias.
+     * Matches OEM beep_play sequence: DMA config → dac_enable → dac_dma_enable.
+     * OEM beep_play @ 0x08003808. */
+    DAC->CR = DAC_CR_EN2 | DAC_CR_EN1 | DAC_CR_BOFF1 | DAC_CR_TEN1
+            | DAC_CR_TSEL1_TIM6 | DAC_CR_DMAEN1;
+
+    /* Force update to load PSC/ARR shadow registers */
+    TIM6->EGR = TIM_EGR_UG;
 
     /* Start TIM6 */
     TIM6->CR1 = TIM_CR1_CEN;
@@ -169,6 +211,12 @@ void dac_audio_stop(void)
 
     /* Clear DMA flags */
     DMA2->IFCR = DMA2_IFCR_CGIF3;
+
+    /* Clear DMAUDR1 in case it got set */
+    *(volatile uint32_t *)(DAC_BASE + 0x34U) = (1UL << 13);
+
+    /* Disable DAC CH1 DMA and channel - keep EN2 for amp bias */
+    DAC->CR = DAC_CR_EN2 | DAC_CR_BOFF1 | DAC_CR_TEN1 | DAC_CR_TSEL1_TIM6;
 
     /* Set DAC output to mid-scale (silence) */
     DAC->DHR12R1 = 2048;

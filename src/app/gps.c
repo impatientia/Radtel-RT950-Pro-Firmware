@@ -2,14 +2,23 @@
  * gps.c - GPS NMEA parser for the RT-950 Pro
  *
  * GPS module connected via USART3 at 9600 baud (PB10 TX, PB11 RX).
- * Parses $GPGGA and $GPRMC sentences for position, altitude, time, speed.
+ * Parses $GPGGA and $GPRMC sentences for position, altitude, time, HDOP.
  *
- * GPS_Parse_NMEA verified at V0.27 @ fw 0x08009FB4.
- * USART3 init verified at V0.27 @ fw 0x08013B20.
+ * GPS module power controlled by PA8 (GPS_ENABLE), active HIGH.
+ * OEM V0.27: PA8 SET @ 0x080095A6, CLR @ 0x08013FE0.
+ * OEM shares USART3 between GPS and serial audio - modes are exclusive.
+ *
+ * OEM V0.27 references:
+ *   USART3 init           @ 0x08013B20 (BRR=6250 for 9600 baud)
+ *   usart3_audio_init     @ 0x08013FCC (CLRs PA8 when audio mode active)
+ *   gpio_modes_init       @ 0x0801391C (PA8 configured as GPIO output)
+ *   GPS_Parse_NMEA        @ 0x08009FB4 (OEM NMEA handling - minimal)
  */
 
 #include "app/gps.h"
 #include "drivers/uart.h"
+#include "drivers/gpio.h"
+#include "rt950_pinmap.h"
 #include "at32f403a.h"
 #include <string.h>
 
@@ -136,6 +145,11 @@ static void parse_gga(const char *sentence)
     field = nmea_field(sentence, 9);
     if (*field >= '0' || *field == '-')
         gps_data.altitude = parse_float(field);
+
+    /* Field 8: HDOP (horizontal dilution of precision) */
+    field = nmea_field(sentence, 8);
+    if (*field >= '0')
+        gps_data.hdop = parse_float(field);
 }
 
 /* $GPRMC,hhmmss.ss,A,ddmm.mmmm,N,dddmm.mmmm,E,spd,cog,ddmmyy,mv,mvE*cs */
@@ -191,6 +205,22 @@ static void process_nmea(const char *sentence)
 
 /* Public API ----------------------------------------------------------- */
 
+/*
+ * GPS module power control via PA8 (GPS_ENABLE).
+ * OEM V0.27: SET @ 0x080095A6 (via gpio_bits_set GPIOA 0x100)
+ *            CLR @ 0x08013FE0 (via gpio_bits_reset GPIOA 0x100)
+ * PA8 is configured as GPIO output by gpio_modes_init @ 0x0801391C.
+ */
+void gps_enable(void)
+{
+    gpio_set_pin(GPS_ENABLE_PORT, GPS_ENABLE_PIN);   /* PA8 HIGH = GPS on */
+}
+
+void gps_disable(void)
+{
+    gpio_clear_pin(GPS_ENABLE_PORT, GPS_ENABLE_PIN); /* PA8 LOW = GPS off */
+}
+
 void gps_init(void)
 {
     memset((void *)&gps_data, 0, sizeof(gps_data));
@@ -198,6 +228,16 @@ void gps_init(void)
     rx_tail = 0;
     nmea_idx = 0;
     nmea_receiving = 0;
+
+    /*
+     * Configure PA8 as GPIO output for GPS power control.
+     * OEM: gpio_modes_init @ 0x0801391C configures PA8 as output.
+     * Enable GPIOA clock (may already be on from system init).
+     */
+    CRM->APB2EN |= CRM_APB2EN_IOPAEN;
+    gpio_config_pin(GPS_ENABLE_PORT, GPS_ENABLE_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gps_enable();   /* Power on GPS module */
 
     uart_gps_init();  /* USART3 @ 9600 baud */
 }

@@ -132,6 +132,12 @@ void vox_poll(void)
     if (speaker_active)
         return;
 
+    /* Don't initiate or manage VOX TX while manual PTT is active.
+     * This prevents the conflict where releasing manual PTT would
+     * kill a VOX-initiated TX or vice versa. */
+    if (radio_is_transmitting() && !vox_tx_active)
+        return;
+
     uint32_t now = get_tick();
     uint16_t status = bk4829_read_reg(VOX_CHIP, REG_STATUS);
     uint8_t audio_present = (status & STATUS_VOX_BIT) ? 1 : 0;

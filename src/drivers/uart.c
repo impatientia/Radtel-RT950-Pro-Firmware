@@ -71,8 +71,18 @@ void UART4_IRQHandler(void)
 }
 
 /* uart_gps_init - USART3 at 9600 baud on PB10 (TX) / PB11 (RX)
- * V0.27 fw 0x08013B62: OEM GPS USART3 init
- * ISR handler is USART3_IRQHandler in gps.c */
+ *
+ * OEM V0.27 references:
+ *   usart3_init      @ 0x08013B20 (130 bytes)
+ *   BRR = 6250       @ 0x08013B86 (9600 baud from 60 MHz APB1)
+ *   PB10 AF_PP       @ 0x08013B44 (gpio_af_config)
+ *   PB11 IPU         @ 0x08013B44 (gpio_af_config)
+ *   USART3 base      : 0x40004800
+ *
+ * ISR handler is USART3_IRQHandler in gps.c.
+ * NOTE: OEM uses polled I/O (ISR vectors alias into CRC-16 code).
+ * Our interrupt-driven approach is an upgrade.
+ */
 
 void uart_gps_init(void)
 {
