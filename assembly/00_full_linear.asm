@@ -54,57 +54,148 @@
 ;       -> lib_float_convert, math_float_string_cmp  [library init]
 ;       -> oem_main (0x08025D88) [firmware entry]
 ;
-; OEM_MAIN INIT SEQUENCE:
-;   1. hw_init_main (0x08007324)      - Hardware peripheral init:
-;      a. rcc_clock_init              - System clock 120MHz
-;      b. rcc_periph_enable           - Enable all peripheral clocks
+; OEM_MAIN BOOT SEQUENCE (verified from code at 0x08026188):
+;   1. nvic_vtor_set(0x08000000, 0x3000)  - Relocate vectors to 0x08003000 (12KB bootloader)
+;   2. hw_init_main (0x08007324)          - Hardware peripheral init:
+;      a. systick_config              - SysTick 1ms tick (NOT RCC - see 0x080215E4)
+;      b. rcc_periph_enable           - NVIC priority group + 5 IRQ enables
 ;      c. gpio_modes_init             - Configure all GPIO pins
-;      d. gpio_uart4_adc_init         - Debug UART + ADC pins
-;      e. adc2_convert_read           - Initial ADC reading (battery?)
-;      f. usart1_hw_init              - USART1 for CPS/BT
-;      g. spi2_flash_init             - W25Q16 SPI flash
-;      h. tim6_dac_dma_init           - Timer6+DAC+DMA for audio
-;      i. dac_init                    - DAC output enable
-;      j. peripheral_init             - DMA+ADC+timer final config
-;      k. eeprom_block_copy + memcpy  - Load settings from flash->RAM
-;   2. subsystem_init_a (0x0800D85C)  - Subsystem init A
-;   3. subsystem_init_c (0x08012FE0)  - Subsystem init C
+;      d. gpio_uart4_adc_init         - GPIOC + UART4 @ 115200 + ADC2 pins
+;      e. adc2_convert_read           - ADC2 reset/config/calibrate + first conversion
+;      f. usart1_hw_init              - USART1 PA9/PA10 @ 115200 for BT module
+;      g. spi2_flash_init             - SPI2 master for W25Q16 flash (PB12-15)
+;      h. tim6_dac_dma_init           - TIM6 8kHz + DMA2_CH3 + DAC trigger
+;      i. dac_init                    - DAC CH2 (PA5) enable
+;      j. peripheral_init             - TIM2 9600Hz + DMA1_CH1 + ADC1 scan
+;      k. periph_init_flash_adc       - ADC2 ch1 conversion (tail call)
+;   3. subsystem_init_a (0x0800D85C)  - Read encoder state (PB4/PB5)
 ;   4. display_init_engine (0x08014C3C) - LCD init + splash screen
-;   5. flag_set_init (0x0801886C)     - Runtime flag initialization
-;   6. rf_display_flag_reset          - Clear RF display flags
-;   7. uart_comm_handler (0x08021748) - UART protocol init
-;   8. main_task_dispatch (0x08016B64) - Enter main polling loop
+;   5. CPSIE I                        - Enable interrupts globally
+;   6. uart_comm_handler (0x08021748) - UART protocol + BT init
+;   7. main_task_dispatch (0x08016B64) - INFINITE polling loop (never returns)
 ;
-; MAIN POLLING LOOP (main_task_dispatch):
-;   State variable: g_rf[0]=active_flag, g_rf[1]=mode (at 0x2000A3B4)
+; NOTE: subsystem_init_c and rf_display_flag_reset are NOT in the direct
+;       boot path. They are called from other contexts during runtime.
+;
+; MAIN POLLING LOOP (main_task_dispatch @ 0x08016B64):
+;   State variables: g_rf_state[0]=active_flag, g_rf_state[1]=mode (at 0x2000A3B4)
+;   Loop back target: 0x8016b96 (dac_dma_audio_engine)
 ;
 ;   Each frame:
-;   ┌- state_query()                  - Check system state
-;   ├- dac_dma_audio_engine()         - [ALWAYS] Feed audio DMA
-;   ├- bk4829_quick_check(sp)        - [ALWAYS] Poll BK4829 IRQ/status
+;   ┌- state_query()                  - Check system state flags
+;   ├- dac_dma_audio_engine()         - [ALWAYS] Feed audio DMA buffer
+;   ├- bk4829_quick_check(sp)        - [ALWAYS] Poll BK4829 RF chip (polled, no IRQ)
 ;   ├- null_stub()                    - [ALWAYS] Placeholder
 ;   │
-;   ├- MODE DISPATCH (g_rf[1]):
-;   │  mode  1: bk4829_rf_control -> subsystem_poll -> audio_state_machine
-;   │  mode  6: rf_calibration_engine
-;   │  mode  7: radio_main_handler
-;   │  mode 11: rf_status_query
-;   │  mode 13: rf_config_apply (special)
-;   │  mode 17: bk4829_init_check
-;   │  mode 20: audio_ui_update
-;   │  mode 21: bt_flash_comms
-;   │  default: rf_calibration_engine (mode 6-like)
+;   ├- MODE DISPATCH (g_rf_state[1] via tbb + comparisons):
+;   │  mode  0: rf_calibration_engine(sp)   - RF calibration (tbb default)
+;   │  mode  1: bk4829_rf_control(sp) → subsystem_poll → audio_state_machine
+;   │  mode  2: settings_menu_engine(sp)    - Settings menu UI
+;   │  mode  3: radio_rx_engine(sp)         - Receive engine
+;   │  mode  4: system_settings_handler(sp) - System configuration
+;   │  mode  5: rx_flag_check(sp)           - RX flag polling
+;   │  mode  6: rf_calibration_engine(sp)   - RF calibration (explicit)
+;   │  mode  7: radio_main_handler(sp)      - Primary radio handler
+;   │  mode 11: rf_status_query(sp)         - Query RF status
+;   │  mode 13: rf_config_apply()           - Apply RF config (post-display)
+;   │  mode 17: bk4829_init_check(sp)       - BK4829 init verify
+;   │  mode 20: audio_ui_update(sp)         - Audio UI state machine
+;   │  mode 21: bt_flash_comms(sp)          - Bluetooth/flash comms
 ;   │
-;   ├- multi_init_dispatch()          - [ALWAYS] Flash/LCD/DAC/status
-;   │  └- flash_multi_init, lcd_parallel_write, dac_enable,
-;   │     display_tx_status, state_check
-;   ├- keypad_audio_handler()         - [ALWAYS] Keypad scan + beep
+;   ├- multi_init_dispatch()          - [ALWAYS] Flash/LCD/DAC/status init
+;   ├- keypad_audio_handler()         - [CONDITIONAL] if RAM[0x2000AF72] != 0
+;   ├- rf_config_apply()              - [CONDITIONAL] if mode == 13
 ;   └- display_periodic_refresh()     - [ALWAYS] LCD frame update
-;       └- lcd_dc_ctrl, bk4829_reg_write_quick, rf_rssi_read
 ;
 ; SECONDARY DISPATCH (0x08016C8C) - Simplified loop for restricted modes:
-;   status_periodic_check -> thin_dispatcher -> dac_dma_audio_engine
-;   -> bk4829_quick_check -> multi_init_dispatch -> loop
+;   status_periodic_check → thin_dispatcher → dac_dma_audio_engine
+;   → bk4829_quick_check → multi_init_dispatch → loop
+;
+; ═══════════════════════════════════════════════════════════════════════════════
+; AUDIO SUBSYSTEM - COMPLETE SIGNAL PATH AND SEQUENCE MAP
+; ═══════════════════════════════════════════════════════════════════════════════
+;
+; HARDWARE SIGNAL PATH (beep playback):
+;
+;   ┌----------┐    ┌-----------┐    ┌----------┐    ┌----------┐    ┌-----┐
+;   │ TIM6     │--->│ DMA2_CH3  │--->│ DAC CH1  │--->│ Analog   │--->│ SPK │
+;   │ 7936 Hz  │    │ 2048 samp │    │ PA4      │    │ Amp (PB8)│    │     │
+;   │ trigger  │    │ circular  │    │ 12-bit   │    │ +SW(PC12)│    │     │
+;   └----------┘    └-----------┘    └----------┘    └----------┘    └-----┘
+;
+;   DAC CH2 (PA5): Enabled at boot, never fed data (0V DC bias for amp?)
+;   PE1 (SPK_MUTE): LOW = unmuted, HIGH = muted
+;   PE9 (SW_TO_BT): LOW = speaker, HIGH = bluetooth audio
+;
+; GPIO CONTROL PINS:
+;   PB8  = AMP_EN:  Audio amplifier enable (HIGH=on, LOW=off)
+;   PC12 = BEEP_SW: Audio mux (analog switch). OEM SETs HIGH before beep,
+;                  CLRs LOW after. Custom FW V12 test: CLR=LOW produces audio
+;                  from DAC. POLARITY DISCREPANCY - see notes in beep_play.
+;   PE1  = SPK_MUTE: Speaker mute (HIGH=muted, LOW=unmuted)
+;   PE9  = SW_TO_BT: Audio route (LOW=speaker, HIGH=bluetooth)
+;
+; BEEP PLAYBACK SEQUENCE (complete OEM flow):
+;
+;   1. spk_unmute (phase 0→1):
+;      ├- rf_relay_switch(band, 0)         → All RF relays IDLE
+;      ├- bk4829_reg30_set_mode(0)         → R30=0x0000 (STANDBY)
+;      └- bk4829_audio_mode_switch(1)      → BOTH chips: R30=0, R37=0x1D00
+;
+;   2. audio_state_machine (state 2 = SETUP):
+;      ├- audio_route_setup(freq_idx)       → Build tone pattern in RAM
+;      └- GPIOB->BSRR = (1<<8)             → SET PB8 (AMP ON)
+;
+;   3. audio_state_machine (state 3 = PLAY):
+;      └- beep_play():
+;         ├- TIM6: PSC=3, ARR=781          → 38.3kHz (fast generation)
+;         ├- Fill buf1[2048] from sine LUT  → 0x2000E87C
+;         ├- Fill buf2[2048] from sine LUT  → 0x2000F87C
+;         ├- gpio_bits_set(GPIOC, PC12)     → SET PC12 HIGH  @ 0x080038EA
+;         ├- DMA2_CH3: buf1→DAC_DHR12R1, circular, TCIE
+;         ├- DAC: EN1 + DMAEN1             → Enable output + DMA requests
+;         ├- Double-buffer refill loop      → ISR swaps buf1/buf2
+;         ├- TIM6: PSC=119, ARR=125        → 7936Hz (playback rate)
+;         └- gpio_bits_reset(GPIOC, PC12)   → CLR PC12 LOW   @ 0x08003978
+;
+;   NOTE: OEM sets PC12 HIGH during beep. Custom FW V12 audio diagnostic
+;   found DAC audio only when PC12=LOW (gpio_clear_pin). This discrepancy
+;   may indicate: (a) the OEM analog switch has additional gating logic,
+;   (b) the OEM's BK4829 AF path setup creates different conditions, or
+;   (c) a hardware revision difference. The V12 test zeroed BK4829 R47/R48
+;   and power-cycled the amp - conditions not present in OEM beep_play.
+;
+;   CRITICAL (V12 discovery): BK4829 AF output impedance loads the analog
+;   bus even in standby (R30=0x0000). R47 and R48 must be zeroed on both
+;   chips to fully disconnect AF output, otherwise DAC signal is attenuated.
+;
+;   4. audio_state_machine (state 0 = IDLE):
+;      └- GPIOB->BRR = (1<<8)              → CLR PB8 (AMP OFF)
+;
+;   5. spk_unmute (phase 1→0):
+;      ├- rf_relay_switch(band, 1)         → Relays back to RX
+;      ├- bk4829_audio_mode_switch(0)      → BOTH chips: R37=0x9D1F
+;      └- bk4829_reg30_set_mode(1)         → R30=0xBFF1 (RX mode)
+;
+; BOOT AUDIO INIT (tim6_dac_dma_init @ 0x08018EC0):
+;   TIM6: PSC=119, ARR=125 → 7936 Hz. DMA2_CH3 configured but DAC OFF.
+;   dac_init: enables DAC CH2 only (PA5). CH1 left off until beep_play.
+;
+; KEY REGISTERS:
+;   TIM6_BASE    = 0x40001000   DAC_BASE     = 0x40007400
+;   DMA2_CH3_CCR = 0x40020430   DAC_DHR12R1  = 0x40007408
+;   GPIOB_BASE   = 0x40010C00   GPIOC_BASE   = 0x40011000
+;   GPIOE_BASE   = 0x40011800
+;
+; DMA BUFFER MAP (RAM):
+;   0x2000E864: DMA control struct (24-byte header: flags, counters)
+;   0x2000E87C: Audio buffer 1 (2048 × 16-bit = 4096 bytes)
+;   0x2000F87C: Audio buffer 2 (2048 × 16-bit = 4096 bytes)
+;   0x20000234: Phase accumulator for sine wave generation
+;
+; FLASH DATA:
+;   0x0802FC84: Sine LUT (256 × 16-bit unsigned, centered ~0x0800)
+;   0x0802FE90: Beep config table (frequency/duration parameters)
 ;
 ; ═══════════════════════════════════════════════════════════════════════════════
 ;; ╔══════════════════════════════════════════════════════════════════════╗
@@ -946,7 +1037,7 @@
 ;;   0x0801A592  bus_write_bit                            [SPI_BITBANG]
 ;;   0x0801B260  spi_bitbang_byte                         [SPI_BITBANG]
 ;;   0x0801B9CC  peripheral_bus_select                    [SPI_BITBANG]
-;;   0x0801BC2C  spi_bitbang_timing                       [SPI_BITBANG]
+;;   0x0801BC2C  bk4829_af_path_config                    [BK4829/AUDIO]
 ;;
 ;; --- SPI_FLASH (36) ---
 ;;   0x08006E7A  flash_block_read_cs                      [SPI_FLASH]
@@ -1009,13 +1100,13 @@
 ;;   0x08017D10  thin_dispatcher                          [SYSTEM]
 ;;   0x08018750  rcc_periph_enable                        [SYSTEM/RCC]
 ;;   0x080187DC  rcc_periph_enable_impl                   [SYSTEM]
-;;   0x0801886C  flag_set_init                            [SYSTEM]
+;;   0x0801886C  nvic_vtor_set                            [SYSTEM]
 ;;   0x0801A4F8  tmr_lcd_config_read                      [SYSTEM]
 ;;   0x0801ECBC  system_rf_config                         [SYSTEM/RF]
 ;;   0x0801EF54  system_settings_handler                  [SYSTEM]
 ;;   0x0801F0A6  isr_svcall                               [SYSTEM/IRQ]
 ;;   0x0801F85C  timer_display_state_init                         [TIMER]
-;;   0x080215E4  rcc_clock_init                           [SYSTEM/RCC]
+;;   0x080215E4  systick_config                           [SYSTEM/TICK]
 ;;   0x08021938  reg_halfword_bit_modify                     [SYSTEM]
 ;;   0x0802196C  peripheral_init_extra                    [SYSTEM]
 ;;   0x08022602  nvic_irq_config                          [SYSTEM]
@@ -1313,7 +1404,7 @@
 ;   0x0801A592  bus_write_bit                            [SPI_BITBANG     ] line 36723
 ;   0x0801B260  spi_bitbang_byte                         [SPI_BITBANG     ] line 37695
 ;   0x0801B9CC  peripheral_bus_select                    [SPI_BITBANG     ] line 38311
-;   0x0801BC2C  spi_bitbang_timing                       [SPI_BITBANG     ] line 38569
+;   0x0801BC2C  bk4829_af_path_config                    [BK4829/AUDIO ] line 38569
 ;   0x0800B928  flash_init_sequence                      [SPI_FLASH       ] line 16566
 ;   0x0800BF58  debug_format_info                        [UTIL       ] line 17175
 ;   0x08013820  periph_init_flash_adc                           [SPI_FLASH       ] line 28147
@@ -1339,7 +1430,7 @@
 ;   0x0800DCD0  rf_display_flag_reset                         [SYSTEM          ] line 19942
 ;   0x08012FE0  subsystem_init_c                         [SYSTEM          ] line 27617
 ;   0x08017D10  thin_dispatcher                          [SYSTEM          ] line 33154
-;   0x0801886C  flag_set_init                            [SYSTEM          ] line 34080
+;   0x0801886C  nvic_vtor_set                            [SYSTEM          ] line 34080
 ;   0x0801EF54  system_settings_handler                  [SYSTEM          ] line 40897
 ;   0x08022602  nvic_irq_config                          [SYSTEM          ] line 45868
 ;   0x08022D10  multi_init_dispatch                      [SYSTEM          ] line 46596
@@ -1358,7 +1449,7 @@
 ;   0x08024EC2  isr_usart3                               [SYSTEM/IRQ      ] line 49399
 ;   0x080252D4  isr_usagefault                           [SYSTEM/IRQ      ] line 49823
 ;   0x08018750  rcc_periph_enable                        [SYSTEM/RCC      ] line 33953
-;   0x080215E4  rcc_clock_init                           [SYSTEM/RCC      ] line 44523
+;   0x080215E4  systick_config                           [SYSTEM/TICK     ] line 44523
 ;   0x0802261C  peripheral_clock_enable                  [SYSTEM/RCC      ] line 45891
 ;   0x08003970  tmr6_handler                             [TIMER           ] line 6197
 ;   0x08021B48  tmr1_pwm_init                            [TIMER           ] line 45072
@@ -1917,7 +2008,7 @@
 ;   0x08018750  rcc_periph_enable                        line 33561
 ;   0x080187DC  rcc_periph_flag_read                             line 33615
 ;   0x08018858  rcc_periph_flag_read                             line 33672
-;   0x0801886C  flag_set_init                            line 33687
+;   0x0801886C  nvic_vtor_set                            line 33687
 ;   0x08018880  flash_keypad_config_read                             line 33703
 ;   0x080188A4  channel_data_field_read                             line 33724
 ;   0x080188C8  display_refresh_trigger                             line 33745
@@ -2018,7 +2109,7 @@
 ;   0x0801B9CC  peripheral_bus_select                             line 37892
 ;   0x0801BA4C  bk4829_spi_data_table                             line 37954
 ;   0x0801BC08  timer_periph_select                             line 38128
-;   0x0801BC2C  spi_bitbang_timing                             line 38149
+;   0x0801BC2C  bk4829_af_path_config                          line 38149
 ;   0x0801BC98  rf_config_state_block                             line 38196
 ;   0x0801BD40  display_status_icons                             line 38255
 ;   0x0801BD98  bk4829_spi_raw_xfer                             line 38282
@@ -2120,7 +2211,7 @@
 ;   0x080213B8  display_full_redraw_tail                             line 43945
 ;   0x080213D0  channel_freq_calc                             line 43963
 ;   0x08021598  rf_display_state_manager                             line 44040
-;   0x080215E4  rcc_clock_init                           line 44074
+;   0x080215E4  systick_config                           line 44074
 ;   0x08021624  audio_info_draw                             line 44114
 ;   0x080216A4  lcd_clock_config                             line 44169
 ;   0x08021748  uart_comm_handler                        line 44197
@@ -2398,7 +2489,7 @@
 ;   0x0800DCD0  rf_display_flag_reset                     line 19470  Small init (22B). Called from oem_main before dispatch loop.
 ;   0x08012FE0  subsystem_init_c                     line 27109  Small init (18B). Called from oem_main before dispatch loop.
 ;   0x08017D10  thin_dispatcher                      line 32622  Thin forwarding dispatcher (30B, 11 callers, 9 subcalls). Ro
-;   0x0801886C  flag_set_init                        line 33548  Tiny flag set (12B). Called from oem_main.
+;   0x0801886C  nvic_vtor_set                        line 33548  Tiny flag set (12B). Called from oem_main.
 ;   0x0801EF54  system_settings_handler              line 40329  System settings handler (large). Refs CRM (clock mgmt), g_co
 ;   0x08022D10  multi_init_dispatch                  line 45994  Multi-init dispatcher (120B, 4 callers, 14 subcalls). Initia
 ;   0x08025D88  oem_main                             line 50332  OEM main function. Calls hw_init_main, initializes subsystem
@@ -2416,7 +2507,7 @@
 ;
 ;   [SYSTEM/RCC]
 ;   0x08018750  rcc_periph_enable                    line 33421
-;   0x080215E4  rcc_clock_init                       line 43934
+;   0x080215E4  systick_config                       line 43934
 ;
 ;   [TIMER_HAL]
 ;   0x0802194E  tim_enable                           line 44257
@@ -2915,6 +3006,22 @@
 ; ║  Calls: bk4829_spi_protocol                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_spi_bit_read  [BK4829] - BK4829 SPI bit read - 112B, ←bk4829_spi_read_raw
+; -- __aeabi_ldivmod (MISNAMED as bk4829_spi_bit_read) ------------------
+; DISCOVERY: This is NOT BK4829 SPI code! This is the ARM EABI signed
+; 64-bit division/modulo function from the C runtime library.
+;
+; Prototype: {quotient, remainder} = __aeabi_ldivmod(int64_t num, int64_t den)
+;   r0:r1 = numerator (64-bit signed)
+;   r2:r3 = denominator (64-bit signed)
+;   Returns: r0:r1 = quotient, r2:r3 = remainder
+;
+; Algorithm:
+;   1. Check signs of numerator (r1 bit 31) and denominator (r3 bit 31)
+;   2. Negate inputs to unsigned if negative
+;   3. Call __aeabi_uldivmod for unsigned division
+;   4. Fix result signs based on original operand signs
+;      (bit 30 of r4 = negate quotient, bit 31 = negate remainder)
+; ------------------------------------------------------------------------
  80007ee:	b931      	cbnz	r1, 0x80007fe
  80007f0:	3eee      	subs	r6, #238	@ 0xee
  80007f2:	506a      	str	r2, [r5, r1]
@@ -2972,6 +3079,23 @@
 ; ║  Called by: config_data_handler, programming_handler, channel_memory_handler, audio_dma_dispatch, display_draw_text (+32 more)  ║
 ; ║  Calls: rf_freq_printf_call, printf_output_tail                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
+; -- printf_handler ------------------------------------------------------
+; Printf-style formatted output (38B, 53 callers). Varargs entry point
+; that formats a string using the standard C printf format and writes
+; the result to a buffer. Used for debug text and display strings.
+;
+; Calling convention: printf_handler(format, ...)
+;   r0 = format string pointer (saved on stack)
+;   r1..r3, stack = varargs (pushed as {r0-r3} on entry)
+;
+; Implementation:
+;   1. Push r0-r3 to stack (varargs frame)
+;   2. Load format handler address (PC-relative, 0x0E71 offset → 0x80016CC)
+;   3. Build va_list: sp points to varargs, r2 = &args[1]
+;   4. Call lib_format_core(format, va_list, handler) → returns char count
+;   5. Call lib_format_flush(0, va_list) → flush output buffer
+;   6. Return char count in r0
+; ------------------------------------------------------------------------
 ; * printf_handler [UTIL] - Formatted output handler (38B, 53 callers). Printf-style entry point for debug/display text.
  8000850:	b40f      	push	{r0, r1, r2, r3}
  8000852:	b51c      	push	{r2, r3, r4, lr}
@@ -3881,6 +4005,20 @@
 ; ║  Called by: bk4829_spi_read_raw                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_spi_protocol  [BK4829] - BK4829 SPI protocol - 238B, ←bk4829_spi_bit_read
+; -- __aeabi_uldivmod (MISNAMED as bk4829_spi_protocol) ------------------
+; DISCOVERY: This is NOT BK4829 SPI code! This is the ARM EABI unsigned
+; 64-bit division/modulo function from the C runtime library.
+;
+; Prototype: {quotient, remainder} = __aeabi_uldivmod(uint64_t num, uint64_t den)
+;   r0:r1 = numerator (64-bit unsigned)
+;   r2:r3 = denominator (64-bit unsigned)
+;   Returns: r0:r1 = quotient, r2:r3 = remainder
+;
+; Algorithm: Shift-subtract restoring division with CLZ normalization.
+; Handles special case: denominator == 0 → returns 0 (no trap).
+;
+; Called by __aeabi_ldivmod (was bk4829_spi_bit_read) and other math ops.
+; ------------------------------------------------------------------------
  80010cc:	ea53 0c02 	orrs.w	ip, r3, r2
  80010d0:	f000 8069 	beq.w	0x80011a6
  80010d4:	e92d 4bf0 	stmdb	sp!, {r4, r5, r6, r7, r8, r9, fp, lr}
@@ -5216,7 +5354,7 @@
 ; ║  0x0800230C  size=128                                           ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * usart1_irq_data_handler  [COMMS] - USART1 IRQ data handler - 128B, ←usart1_irq_handler
- 800230c:	f04f 3c01 	mov.w	ip, #16843009	@ 0x1010101
+ 800230c:	f04f 3c01 	mov.w	ip, #16843009	@ 0x1010101 ;; NOTE: This is actually libc strcmp (0x01010101 null-terminator detection) - NOT a UART handler
  8002310:	f850 2b04 	ldr.w	r2, [r0], #4
  8002314:	f851 3b04 	ldr.w	r3, [r1], #4
  8002318:	429a      	cmp	r2, r3
@@ -6728,105 +6866,111 @@
 ;; or audio sample rate related (120MHz / 12500 = 9600 Hz?)
 ;; ═══════════════════════════════════════════════════════════════════
  80033d8:	b570      	push	{r4, r5, r6, lr}
- 80033da:	b09a      	sub	sp, #104	@ 0x68
- 80033dc:	2101      	movs	r1, #1
- 80033de:	4608      	mov	r0, r1
- 80033e0:	f016 fd7c 	bl	0x8019edc
- 80033e4:	f243 00d4 	movw	r0, #12500	@ 0x30d4
- 80033e8:	9008      	str	r0, [sp, #32]
+ 80033da:	b09a      	sub	sp, #104	@ 0x68 ;; alloc timer + DMA + ADC structs
+;; --- Step 1: Enable TIM2 clock + configure ARR=12500 (9600Hz) ---
+ 80033dc:	2101      	movs	r1, #1 ;; enable = 1
+ 80033de:	4608      	mov	r0, r1 ;; periph_id = 1 = TIM2
+ 80033e0:	f016 fd7c 	bl	0x8019edc ;; rcc_apb1_periph_enable(TIM2, 1)
+ 80033e4:	f243 00d4 	movw	r0, #12500	@ 0x30d4 ;; ARR = 12500 → 120MHz/12500 = 9600Hz
+ 80033e8:	9008      	str	r0, [sp, #32] ;; timer_struct.arr = 12500
  80033ea:	2400      	movs	r4, #0
  80033ec:	f8ad 4018 	strh.w	r4, [sp, #24]
  80033f0:	f8ad 4024 	strh.w	r4, [sp, #36]	@ 0x24
  80033f4:	9407      	str	r4, [sp, #28]
  80033f6:	f88d 4026 	strb.w	r4, [sp, #38]	@ 0x26
- 80033fa:	0705      	lsls	r5, r0, #28
+ 80033fa:	0705      	lsls	r5, r0, #28 ;; r5 = 12500<<28 = 0x40000000 = TIM2 base
  80033fc:	a906      	add	r1, sp, #24
  80033fe:	4628      	mov	r0, r5
  8003400:	f01e fba2 	bl	0x8021b48
- 8003404:	2160      	movs	r1, #96	@ 0x60
- 8003406:	f8ad 1004 	strh.w	r1, [sp, #4]
- 800340a:	f8ad 4006 	strh.w	r4, [sp, #6]
- 800340e:	21ff      	movs	r1, #255	@ 0xff
- 8003410:	9103      	str	r1, [sp, #12]
+;; --- Step 2: TIM2 output compare + update interrupt ---
+ 8003404:	2160      	movs	r1, #96	@ 0x60 ;; 0x60 = output compare mode
+ 8003406:	f8ad 1004 	strh.w	r1, [sp, #4] ;; oc_struct.mode = 0x60
+ 800340a:	f8ad 4006 	strh.w	r4, [sp, #6] ;; oc_struct.output_enable = 0
+ 800340e:	21ff      	movs	r1, #255	@ 0xff ;; compare value = 255
+ 8003410:	9103      	str	r1, [sp, #12] ;; oc_struct.compare = 255
  8003412:	2102      	movs	r1, #2
- 8003414:	f8ad 1010 	strh.w	r1, [sp, #16]
+ 8003414:	f8ad 1010 	strh.w	r1, [sp, #16] ;; oc_struct.polarity = 2
  8003418:	a901      	add	r1, sp, #4
  800341a:	4628      	mov	r0, r5
- 800341c:	f01e faa6 	bl	0x802196c
+ 800341c:	f01e faa6 	bl	0x802196c ;; timer_oc_config(TIM2, oc_struct)
  8003420:	2201      	movs	r2, #1
- 8003422:	2104      	movs	r1, #4
+ 8003422:	2104      	movs	r1, #4 ;; irq_flag = 4 = TIM_UPD_INT
  8003424:	4628      	mov	r0, r5
- 8003426:	f01e fa87 	bl	0x8021938
+ 8003426:	f01e fa87 	bl	0x8021938 ;; timer_interrupt_enable(TIM2, UPD, 1)
+;; --- Step 3: DMA1_CH1 config (ADC1→RAM circular, 4096 samples) ---
  800342a:	a80a      	add	r0, sp, #40	@ 0x28
- 800342c:	f007 f90a 	bl	0x800a644
+ 800342c:	f007 f90a 	bl	0x800a644 ;; dma_init_struct(defaults)
  8003430:	482a      	ldr	r0, [pc, #168]	@ (0x80034dc)                    ; = 0x4001244C
- 8003432:	900a      	str	r0, [sp, #40]	@ 0x28
+ 8003432:	900a      	str	r0, [sp, #40]	@ 0x28 ;; dma.periph_addr = 0x4001244C (ADC1_ORDINARYDATA)
  8003434:	482a      	ldr	r0, [pc, #168]	@ (0x80034e0)                    ; = 0x2000BBEC (RAM+0xBBEC)
- 8003436:	900b      	str	r0, [sp, #44]	@ 0x2c
- 8003438:	940c      	str	r4, [sp, #48]	@ 0x30
- 800343a:	14a8      	asrs	r0, r5, #18
- 800343c:	900d      	str	r0, [sp, #52]	@ 0x34
- 800343e:	940e      	str	r4, [sp, #56]	@ 0x38
+ 8003436:	900b      	str	r0, [sp, #44]	@ 0x2c ;; dma.memory_addr = 0x2000BBEC (ADC sample buf)
+ 8003438:	940c      	str	r4, [sp, #48]	@ 0x30 ;; dma.direction = PERIPH_TO_MEM
+ 800343a:	14a8      	asrs	r0, r5, #18 ;; r0 = 0x40000000>>18 = 0x1000 = 4096
+ 800343c:	900d      	str	r0, [sp, #52]	@ 0x34 ;; dma.buffer_size = 4096 samples
+ 800343e:	940e      	str	r4, [sp, #56]	@ 0x38 ;; dma.periph_inc = 0 (fixed ADC reg)
  8003440:	2080      	movs	r0, #128	@ 0x80
- 8003442:	900f      	str	r0, [sp, #60]	@ 0x3c
- 8003444:	0040      	lsls	r0, r0, #1
- 8003446:	9010      	str	r0, [sp, #64]	@ 0x40
- 8003448:	0080      	lsls	r0, r0, #2
- 800344a:	9011      	str	r0, [sp, #68]	@ 0x44
- 800344c:	2020      	movs	r0, #32
- 800344e:	9012      	str	r0, [sp, #72]	@ 0x48
- 8003450:	0200      	lsls	r0, r0, #8
- 8003452:	9013      	str	r0, [sp, #76]	@ 0x4c
- 8003454:	9414      	str	r4, [sp, #80]	@ 0x50
+ 8003442:	900f      	str	r0, [sp, #60]	@ 0x3c ;; dma.memory_inc = ENABLE
+ 8003444:	0040      	lsls	r0, r0, #1 ;; 0x80<<1 = 0x100 = halfword
+ 8003446:	9010      	str	r0, [sp, #64]	@ 0x40 ;; dma.periph_width = HALFWORD
+ 8003448:	0080      	lsls	r0, r0, #2 ;; 0x100<<2 = 0x400 = halfword
+ 800344a:	9011      	str	r0, [sp, #68]	@ 0x44 ;; dma.memory_width = HALFWORD
+ 800344c:	2020      	movs	r0, #32 ;; 0x20 = circular
+ 800344e:	9012      	str	r0, [sp, #72]	@ 0x48 ;; dma.loop_mode = CIRCULAR
+ 8003450:	0200      	lsls	r0, r0, #8 ;; 0x20<<8 = 0x2000 = high priority
+ 8003452:	9013      	str	r0, [sp, #76]	@ 0x4c ;; dma.priority = HIGH
+ 8003454:	9414      	str	r4, [sp, #80]	@ 0x50 ;; dma.m2m = disabled
  8003456:	4e23      	ldr	r6, [pc, #140]	@ (0x80034e4)                    ; = 0x40020008
  8003458:	a90a      	add	r1, sp, #40	@ 0x28
  800345a:	4630      	mov	r0, r6
- 800345c:	f007 f91c 	bl	0x800a698
+ 800345c:	f007 f91c 	bl	0x800a698 ;; dma_config(DMA1_CH1, dma) - ADC1→RAM
  8003460:	2201      	movs	r2, #1
- 8003462:	2106      	movs	r1, #6
+ 8003462:	2106      	movs	r1, #6 ;; flag=6 = TCIE|HTIE (half+full transfer IRQ)
  8003464:	4630      	mov	r0, r6
- 8003466:	f007 f90d 	bl	0x800a684
+ 8003466:	f007 f90d 	bl	0x800a684 ;; dma_interrupt_enable(DMA1_CH1, TC|HT, 1)
  800346a:	2101      	movs	r1, #1
  800346c:	4630      	mov	r0, r6
- 800346e:	f007 f8c3 	bl	0x800a5f8
+ 800346e:	f007 f8c3 	bl	0x800a5f8 ;; dma_channel_enable(DMA1_CH1, 1)
+;; --- Step 4: ADC1 config (ch2, TIM2-triggered, right-aligned) ---
  8003472:	a815      	add	r0, sp, #84	@ 0x54
- 8003474:	f7ff ff32 	bl	0x80032dc
- 8003478:	9415      	str	r4, [sp, #84]	@ 0x54
- 800347a:	f88d 4058 	strb.w	r4, [sp, #88]	@ 0x58
- 800347e:	f88d 4059 	strb.w	r4, [sp, #89]	@ 0x59
- 8003482:	f44f 20c0 	mov.w	r0, #393216	@ 0x60000
- 8003486:	9017      	str	r0, [sp, #92]	@ 0x5c
- 8003488:	9418      	str	r4, [sp, #96]	@ 0x60
+ 8003474:	f7ff ff32 	bl	0x80032dc ;; adc_init_struct(defaults)
+ 8003478:	9415      	str	r4, [sp, #84]	@ 0x54 ;; adc.mode = independent
+ 800347a:	f88d 4058 	strb.w	r4, [sp, #88]	@ 0x58 ;; adc.continuous = 0
+ 800347e:	f88d 4059 	strb.w	r4, [sp, #89]	@ 0x59 ;; adc.scan = 0
+ 8003482:	f44f 20c0 	mov.w	r0, #393216	@ 0x60000 ;; 0x60000 = ext trigger = TIM2 event
+ 8003486:	9017      	str	r0, [sp, #92]	@ 0x5c ;; adc.ext_trigger = TIM2_TRGO
+ 8003488:	9418      	str	r4, [sp, #96]	@ 0x60 ;; adc.data_align = right
  800348a:	2001      	movs	r0, #1
- 800348c:	f88d 0064 	strb.w	r0, [sp, #100]	@ 0x64
+ 800348c:	f88d 0064 	strb.w	r0, [sp, #100]	@ 0x64 ;; adc.channel_count = 1
  8003490:	4c12      	ldr	r4, [pc, #72]	@ (0x80034dc)                     ; = 0x4001244C
  8003492:	a915      	add	r1, sp, #84	@ 0x54
- 8003494:	3c4c      	subs	r4, #76	@ 0x4c
+ 8003494:	3c4c      	subs	r4, #76	@ 0x4c ;; r4 = 0x4001244C-0x4C = 0x40012400 = ADC1
  8003496:	4620      	mov	r0, r4
- 8003498:	f7ff feac 	bl	0x80031f4
- 800349c:	2303      	movs	r3, #3
- 800349e:	2201      	movs	r2, #1
- 80034a0:	2102      	movs	r1, #2
+ 8003498:	f7ff feac 	bl	0x80031f4 ;; adc_config(ADC1, adc_struct)
+ 800349c:	2303      	movs	r3, #3 ;; sample_time = 3
+ 800349e:	2201      	movs	r2, #1 ;; rank = 1
+ 80034a0:	2102      	movs	r1, #2 ;; channel = 2
  80034a2:	4620      	mov	r0, r4
- 80034a4:	f7ff feca 	bl	0x800323c
- 80034a8:	2101      	movs	r1, #1
+ 80034a4:	f7ff feca 	bl	0x800323c ;; adc_regular_ch_config(ADC1, ch2, rank1, samp=3)
+;; --- Step 5: Enable ADC1 ext trigger + DMA + calibrate ---
+ 80034a8:	2101      	movs	r1, #1 ;; enable = 1
  80034aa:	4620      	mov	r0, r4
- 80034ac:	f7ff fe72 	bl	0x8003194
- 80034b0:	2101      	movs	r1, #1
+ 80034ac:	f7ff fe72 	bl	0x8003194 ;; adc_ext_trigger_enable(ADC1, 1)
+ 80034b0:	2101      	movs	r1, #1 ;; enable = 1
  80034b2:	4620      	mov	r0, r4
- 80034b4:	f7ff fe7a 	bl	0x80031ac
- 80034b8:	2101      	movs	r1, #1
+ 80034b4:	f7ff fe7a 	bl	0x80031ac ;; adc_dma_enable(ADC1, 1) - ADC→DMA pipeline
+ 80034b8:	2101      	movs	r1, #1 ;; enable = 1
  80034ba:	4620      	mov	r0, r4
- 80034bc:	f7ff fe5e 	bl	0x800317c
+ 80034bc:	f7ff fe5e 	bl	0x800317c ;; adc_enable(ADC1, 1)
  80034c0:	4620      	mov	r0, r4
- 80034c2:	f7ff fef5 	bl	0x80032b0
+ 80034c2:	f7ff fef5 	bl	0x80032b0 ;; adc_calibration_init(ADC1)
  80034c6:	4620      	mov	r0, r4
- 80034c8:	f7ff fe8d 	bl	0x80031e6
+ 80034c8:	f7ff fe8d 	bl	0x80031e6 ;; adc_calibration_status(ADC1)
  80034cc:	2800      	cmp	r0, #0
- 80034ce:	d1fa      	bne.n	0x80034c6
- 80034d0:	2100      	movs	r1, #0
+ 80034ce:	d1fa      	bne.n	0x80034c6 ;; loop until calibration complete
+;; --- Step 6: Leave TIM2 disabled (started on demand later) ---
+ 80034d0:	2100      	movs	r1, #0 ;; disable = 0
  80034d2:	4628      	mov	r0, r5
- 80034d4:	f01e fa3b 	bl	0x802194e                                        ; tim_enable
+ 80034d4:	f01e fa3b 	bl	0x802194e                                        ; tim_enable ;; tim_enable(TIM2, 0) - timer OFF at boot
  80034d8:	b01a      	add	sp, #104	@ 0x68
  80034da:	bd70      	pop	{r4, r5, r6, pc}
 
@@ -7093,43 +7237,93 @@
   0x08003770: 40 F0 01 00 84 F8 14 08 EA E7 00 00 50 B2 00 20  |@...........P.. | [+12] 0x2000B250=RAM+0xB250
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: beep_tone_generate(uint16_t *out_buf, uint32_t n_samp) │
+; │                                                                     │
+; │   g_beep_state  = (uint16_t *)0x2000E082;  // phase accumulator    │
+; │   sine_lut      = (uint16_t *)0x0802FC84;  // 256-entry sine LUT   │
+; │   freq_accum    = (uint32_t *)(g_beep_state + 0x0C);               │
+; │                                                                     │
+; │   for (block = 0; block < n_samp >> 5; block++) {                   │
+; │       if (g_beep_state[0x101] >= g_beep_state[0x102]) break;        │
+; │       uint32_t incr = tick_config_helper(g_beep_state)              │
+; │                       ? 0x08000000 : 0x0EAAAAAB;                    │
+; │       g_beep_state[0x101]++;                                        │
+; │       for (s = 0; s < 32; s++) {                                    │
+; │           *freq_accum += incr;          // phase accumulate         │
+; │           idx = (*freq_accum) >> 24;    // top 8 bits = LUT index   │
+; │           out_buf[block*32 + s] = sine_lut[idx];                    │
+; │       }                                                             │
+; │   }                                                                 │
+; │   // Fill remaining with mid-scale silence (0x0800)                 │
+; │   for (; remaining < n_samp; remaining++)                           │
+; │       out_buf[remaining] = 0x0800;                                  │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  tick_config_helper                                                        ║
 ; ║  0x08003780  size=120                                           ║
 ; ║  Called by: beep_play                                                 ║
 ; ║  Calls: tick_config_helper                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * beep_tone_generate  [AUDIO] - Beep tone generation - 120B, ←beep_play
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: beep_tone_generate(uint16_t *buf, uint32_t n_samp)  │
+; │                                                                     │
+; │ Fills audio buffer with sine wave samples using phase accumulator. │
+; │ Called by beep_play to pre-fill both 2048-sample DMA buffers.      │
+; │                                                                     │
+; │   phase_acc = &g_phase_accumulator;   // @ 0x20000234 + 12        │
+; │   sine_lut  = (uint16_t*)0x0802FC84;  // 256 entries in flash     │
+; │   ctrl      = (struct*)0x2000E082;     // DMA control struct       │
+; │                                                                     │
+; │   for (block = 0; block < n_samp / 32; block++) {                  │
+; │       if (ctrl->sample_count >= ctrl->total_samples) break;        │
+; │       freq_step = check_mode() ? 0x08000000 : 0x0EAAAAAB;        │
+; │       ctrl->sample_count++;                                        │
+; │       for (i = 0; i < 32; i++) {                                   │
+; │           *phase_acc += freq_step;                                  │
+; │           idx = (*phase_acc >> 24) & 0xFF;  // top 8 bits          │
+; │           buf[block*32 + i] = sine_lut[idx];                       │
+; │       }                                                             │
+; │   }                                                                 │
+; │   // Pad remaining samples with DC midpoint (0x0800)               │
+; │   for (; i < n_samp; i++) buf[i] = 0x0800;                        │
+; │                                                                     │
+; │ NOTE: Phase accumulator uses top 8 bits as LUT index (>>24),       │
+; │ giving 256 steps per cycle. freq_step determines tone frequency:   │
+; │   0x0EAAAAAB at 7936 Hz ≈ 460 Hz tone (standard boot beep)       │
+; │   0x08000000 at 7936 Hz ≈ 248 Hz tone (alternate)                │
+; └---------------------------------------------------------------------┘
+; * beep_tone_generate  [AUDIO] - Fills DMA buffer with sine wave from phase accumulator + flash LUT
  8003780:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
  8003784:	4606      	mov	r6, r0
  8003786:	460f      	mov	r7, r1
  8003788:	2200      	movs	r2, #0
  800378a:	2400      	movs	r4, #0
- 800378c:	f8df 8068 	ldr.w	r8, [pc, #104]	@ 0x80037f8                    ; = 0x2000E082 (RAM+0xE082)
+ 800378c:	f8df 8068 	ldr.w	r8, [pc, #104]	@ 0x80037f8 ;; DMA ctrl @ 0x2000E082                    ; = 0x2000E082 (RAM+0xE082)
  8003790:	e025      	b.n	0x80037de
- 8003792:	f8b8 1202 	ldrh.w	r1, [r8, #514]	@ 0x202
- 8003796:	f8b8 0204 	ldrh.w	r0, [r8, #516]	@ 0x204
+ 8003792:	f8b8 1202 	ldrh.w	r1, [r8, #514] ;; sample_count	@ 0x202
+ 8003796:	f8b8 0204 	ldrh.w	r0, [r8, #516] ;; total_samples	@ 0x204
  800379a:	4281      	cmp	r1, r0
  800379c:	d222      	bcs.n	0x80037e4
  800379e:	4816      	ldr	r0, [pc, #88]	@ (0x80037f8)                     ; = 0x2000E082 (RAM+0xE082)
  80037a0:	f003 fcc6 	bl	0x8007130
  80037a4:	b110      	cbz	r0, 0x80037ac
- 80037a6:	f04f 6100 	mov.w	r1, #134217728	@ 0x8000000
+ 80037a6:	f04f 6100 	mov.w	r1, #134217728 ;; freq_step = 0x08000000 (248 Hz alt tone)	@ 0x8000000
  80037aa:	e000      	b.n	0x80037ae
- 80037ac:	4913      	ldr	r1, [pc, #76]	@ (0x80037fc)                     ; = 0x0EAAAAAB
+ 80037ac:	4913      	ldr	r1, [pc, #76]	@ (0x80037fc ;; freq_step = 0x0EAAAAAB (460 Hz std tone))                     ; = 0x0EAAAAAB
  80037ae:	f8b8 0202 	ldrh.w	r0, [r8, #514]	@ 0x202
  80037b2:	1c40      	adds	r0, r0, #1
  80037b4:	f8a8 0202 	strh.w	r0, [r8, #514]	@ 0x202
  80037b8:	0162      	lsls	r2, r4, #5
- 80037ba:	4d11      	ldr	r5, [pc, #68]	@ (0x8003800)                     ; = 0x20000234 (RAM+0x234)
- 80037bc:	f8df c044 	ldr.w	ip, [pc, #68]	@ 0x8003804                     ; = 0x0802FC84 (flash+0x2FC84)
+ 80037ba:	4d11      	ldr	r5, [pc, #68]	@ (0x8003800 ;; phase accumulator @ 0x20000234+12)                     ; = 0x20000234 (RAM+0x234)
+ 80037bc:	f8df c044 	ldr.w	ip, [pc, #68]	@ 0x8003804 ;; sine LUT @ flash 0x0802FC84 (256 entries)                     ; = 0x0802FC84 (flash+0x2FC84)
  80037c0:	1c60      	adds	r0, r4, #1
  80037c2:	e008      	b.n	0x80037d6
- 80037c4:	68eb      	ldr	r3, [r5, #12]
+ 80037c4:	68eb      	ldr	r3, [r5, #12] ;; load phase accumulator
  80037c6:	440b      	add	r3, r1
  80037c8:	60eb      	str	r3, [r5, #12]
- 80037ca:	0e1b      	lsrs	r3, r3, #24
- 80037cc:	f83c 3013 	ldrh.w	r3, [ip, r3, lsl #1]
+ 80037ca:	0e1b      	lsrs	r3, r3, #24 ;; top 8 bits → LUT index (0..255)
+ 80037cc:	f83c 3013 	ldrh.w	r3, [ip, r3, lsl #1] ;; sine_lut[idx] → 12-bit DAC sample
  80037d0:	f826 3012 	strh.w	r3, [r6, r2, lsl #1]
  80037d4:	1c52      	adds	r2, r2, #1
  80037d6:	ebb2 1f40 	cmp.w	r2, r0, lsl #5
@@ -7137,7 +7331,7 @@
  80037dc:	1c64      	adds	r4, r4, #1
  80037de:	ebb4 1f57 	cmp.w	r4, r7, lsr #5
  80037e2:	d3d6      	bcc.n	0x8003792
- 80037e4:	f44f 6000 	mov.w	r0, #2048	@ 0x800
+ 80037e4:	f44f 6000 	mov.w	r0, #2048 ;; DC midpoint = 0x0800 (12-bit DAC center)	@ 0x800
  80037e8:	e002      	b.n	0x80037f0
  80037ea:	f826 0012 	strh.w	r0, [r6, r2, lsl #1]
  80037ee:	1c52      	adds	r2, r2, #1
@@ -7150,6 +7344,38 @@
   0x08003800: 34 02 00 20 84 FC 02 08 2D E9 F8 4F 5B 4E 30 46  |4.. ....-..O[N0F| [+0] 0x20000234=RAM+0x234; [+4] 0x0802FC84=flash+0x2FC84
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: beep_play(void)                                        │
+; │                                                                     │
+; │   // PHASE 1: Reset and configure TIM6 for sample clock            │
+; │   tim_reset(TIM6);                                                  │
+; │   tim_config_prescaler(TIM6, PSC=3, reload=0);                     │
+; │   tim_config_arr(TIM6, ARR=781);  // 120MHz/4/782 = 38.36kHz      │
+; │   tim_config_clkdiv(TIM6, 32);                                     │
+; │   tim_enable(TIM6, 1);                                              │
+; │                                                                     │
+; │   // PHASE 2: Generate two waveform buffers in RAM                 │
+; │   beep_tone_generate(g_dma_buf @ 0x2000E87C, sample_count);        │
+; │   beep_tone_generate(g_dma_buf2 @ 0x2000F87C, sample_count);       │
+; │                                                                     │
+; │   // PHASE 3: Set PC12 (BEEP_SW) HIGH - OEM beep routing              │
+; │   // NOTE: OEM sets HIGH here, but V12 custom FW test found DAC audio │
+; │   // only with PC12=LOW. See polarity discrepancy note above.         │
+; │   gpio_bits_set(GPIOC, 0x1000);  // PC12 = SET HIGH (OEM operation)  │
+; │                                                                     │
+; │   // PHASE 4: Configure DMA2 CH3 (peripheral=0x40007408=DHR12R1)  │
+; │   dma_channel_reset(DMA2_CH3);                                      │
+; │   dma_config(DMA2_CH3, src=g_dma_buf, dst=DAC_DHR12R1,            │
+; │              count=sample_count, mode=circular, 16-bit);            │
+; │                                                                     │
+; │   // PHASE 5: Enable DAC + DMA trigger (read-modify-write)         │
+; │   dac_enable(channel=0, enable=1);     // DAC_CTRL |= EN1          │
+; │   dac_dma_enable(channel=0, enable=1); // DAC_CTRL |= DMAEN1       │
+; │                                                                     │
+; │   // PHASE 6: Loop if double-buffered; re-fill DMA buffers        │
+; │   // PHASE 7: Reconfigure TIM6 for tone mode: PSC=119, ARR=125    │
+; │   //          120MHz/120/126 = ~7.94 kHz sample rate               │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  beep_play                                                           ║
 ; ║  0x08003808  size=360                                           ║
@@ -7157,164 +7383,230 @@
 ; ║  Called by: audio_state_machine                                       ║
 ; ║  Calls: memcpy, tick_config_helper, dac_enable, dac_dma_enable, display_tx_status (+8 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-;; ═══════════════════════════════════════════════════════════════════
-;; BEEP_PLAY - Generates audible tone through DAC+DMA+TIM6
-;;
-;; Audio generation: TIM6 triggers DMA2 CH3 -> DAC1 (PA4)
-;; Sequence: Enable DAC DMA -> configure TIM6 period -> start DMA transfer
-;; After completion: CLR PC12(BEEP_SW)
-;;
-;; Called by audio_state_machine (state 3)
-;; PB8 must already be HIGH (amp on) before calling this!
-;; ═══════════════════════════════════════════════════════════════════
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: beep_play(void)                                      │
+; │                                                                     │
+; │ 9-phase beep playback using DAC+DMA+TIM6. Called by                │
+; │ audio_state_machine (state 3). PB8 (amp) must already be HIGH.     │
+; │                                                                     │
+; │ Phase 1 - Fast TIM6 for sample generation:                        │
+; │   TIM6->PSC = 3; TIM6->ARR = 781;                                 │
+; │   // 120MHz / 4 / 782 = 38,363 Hz (fast generation rate)          │
+; │   TIM6->CR1 |= CEN;                                               │
+; │                                                                     │
+; │ Phase 2 - Generate 2048 samples into buffer 1 (0x2000E87C):       │
+; │   for (i = 0; i < 2048; i++) {                                     │
+; │       phase_acc += freq_step;      // g_audio[0x20000234]          │
+; │       idx = (phase_acc >> 8) & 0xFF;                               │
+; │       buf1[i] = sine_lut[idx];     // flash @ 0x0802FC84          │
+; │   }                                                                 │
+; │   // sine_lut is 256×16-bit unsigned, centered at 0x0800           │
+; │                                                                     │
+; │ Phase 3 - Generate 2048 samples into buffer 2 (0x2000F87C):       │
+; │   for (i = 0; i < 2048; i++) {                                     │
+; │       phase_acc += freq_step;                                       │
+; │       idx = (phase_acc >> 8) & 0xFF;                               │
+; │       buf2[i] = sine_lut[idx];                                     │
+; │   }                                                                 │
+; │                                                                     │
+; │ Phase 4 - Enable beep switch (SET PC12 HIGH - OEM polarity):         │
+; │   GPIOC->SCR = (1 << 12);   // SET PC12 HIGH (OEM beep routing)     │
+; │                                                                     │
+; │ Phase 5 - Configure DMA2_CH3:                                      │
+; │   DMA2_CH3->CCR &= ~EN;     // disable channel                    │
+; │   DMA2_CH3->CNDTR = 2048;   // buffer size                        │
+; │   DMA2_CH3->CPAR = 0x40007408; // DAC_DHR12R1                     │
+; │   DMA2_CH3->CMAR = 0x2000E87C; // buffer 1                        │
+; │   DMA2_CH3->CCR = MEM_TO_PERIPH | MEM_INC | HALFWORD              │
+; │                  | CIRC | TCIE | EN;                                │
+; │                                                                     │
+; │ Phase 6 - Enable DAC:                                              │
+; │   DAC->CR |= (EN1 | DMAEN1);  // enable output + DMA req          │
+; │                                                                     │
+; │ Phase 7 - Double-buffer refill loop:                               │
+; │   while (playback_active) {                                         │
+; │       // DMA TC interrupt sets flag in g_audio DMA ctrl struct     │
+; │       if (buf1_consumed) { refill buf1 with next 2048 samples; }   │
+; │       if (buf2_consumed) { refill buf2 with next 2048 samples; }   │
+; │       // ISR swaps CMAR between buf1 and buf2 on each TC           │
+; │   }                                                                 │
+; │                                                                     │
+; │ Phase 8 - Switch to playback sample rate:                          │
+; │   TIM6->PSC = 119; TIM6->ARR = 125;                               │
+; │   // 120MHz / 120 / 126 = 7,936 Hz (actual playback rate)         │
+; │                                                                     │
+; │ Phase 9 - Cleanup (tail-call):                                     │
+; │   GPIOC->CLR = (1 << 12);   // CLR PC12 LOW (restore radio path)   │
+; │                                                                     │
+; │ KEY CONSTANTS:                                                      │
+; │   Sine LUT:     0x0802FC84 (256 × 16-bit, unsigned 12-bit values) │
+; │   Beep config:  0x0802FE90 (freq/duration table)                   │
+; │   DMA buf 1:    0x2000E87C (2048 halfwords = 4096 bytes)          │
+; │   DMA buf 2:    0x2000F87C (2048 halfwords = 4096 bytes)          │
+; │   DMA ctrl:     0x2000E864 (24-byte header: flags, counters)       │
+; │   Phase acc:    0x20000234 (32-bit frequency accumulator)          │
+; │                                                                     │
+; │ SIGNAL PATH: TIM6→DMA2_CH3→DAC_DHR12R1→PA4→(PC12 switch)→AMP→SPK │
+; │                                                                     │
+; │ NOTE: Phase 1→8 sequence means samples are pre-generated at 38kHz │
+; │ then played back at 8kHz. The two-speed approach fills buffers     │
+; │ quickly before switching to the real-time playback rate.            │
+; └---------------------------------------------------------------------┘
+;; ==== PHASE 1: TIM6 reset + configure for fast fill rate (~38kHz) ====
  8003808:	e92d 4ff8 	stmdb	sp!, {r3, r4, r5, r6, r7, r8, r9, sl, fp, lr}
- 800380c:	4e5b      	ldr	r6, [pc, #364]	@ (0x800397c)                    ; = 0x40001000 (TIM6)
+ 800380c:	4e5b      	ldr	r6, [pc, #364]	@ (0x800397c)                    ; r6 = 0x40001000 (TIM6 base)
  800380e:	4630      	mov	r0, r6
- 8003810:	f01e f8e6 	bl	0x80219e0                                        ; tim_reset
+ 8003810:	f01e f8e6 	bl	0x80219e0                                        ; tim_reset(TIM6)
  8003814:	2200      	movs	r2, #0
- 8003816:	2103      	movs	r1, #3
+ 8003816:	2103      	movs	r1, #3                                           ; PSC=3 → /4 prescaler
  8003818:	4630      	mov	r0, r6
- 800381a:	f01e f8a4 	bl	0x8021966                                        ; tim_config_prescaler
- 800381e:	f240 310d 	movw	r1, #781	@ 0x30d
+ 800381a:	f01e f8a4 	bl	0x8021966                                        ; tim_config_prescaler(TIM6, 3, 0)
+ 800381e:	f240 310d 	movw	r1, #781	@ 0x30d                              ; ARR=781 → 120MHz/4/782 ≈ 38.4kHz
  8003822:	4630      	mov	r0, r6
- 8003824:	f01e f98e 	bl	0x8021b44                                        ; tim_config_arr
- 8003828:	2120      	movs	r1, #32
+ 8003824:	f01e f98e 	bl	0x8021b44                                        ; tim_config_arr(TIM6, 781)
+ 8003828:	2120      	movs	r1, #32                                          ; CKDIV=32
  800382a:	4630      	mov	r0, r6
- 800382c:	f01e f982 	bl	0x8021b34                                        ; tim_config_clkdiv
+ 800382c:	f01e f982 	bl	0x8021b34                                        ; tim_config_clkdiv(TIM6, 32)
  8003830:	2101      	movs	r1, #1
  8003832:	4630      	mov	r0, r6
- 8003834:	f01e f88b 	bl	0x802194e                                        ; tim_enable
- 8003838:	4851      	ldr	r0, [pc, #324]	@ (0x8003980)                    ; = 0x20000234 (RAM+0x234)
- 800383a:	2500      	movs	r5, #0
- 800383c:	60c5      	str	r5, [r0, #12]
+ 8003834:	f01e f88b 	bl	0x802194e                                        ; tim_enable(TIM6, 1) - start timer
+;; ==== PHASE 2: Calculate tone frequency + fill waveform buffers ====
+ 8003838:	4851      	ldr	r0, [pc, #324]	@ (0x8003980)                    ; r0 = 0x20000234 (phase accumulator)
+ 800383a:	2500      	movs	r5, #0                                           ; r5 = 0 (constant zero)
+ 800383c:	60c5      	str	r5, [r0, #12]                                    ; clear phase acc[12]
  800383e:	4851      	ldr	r0, [pc, #324]	@ (0x8003984)                    ; = 0x2000ADD0 (g_config)
- 8003840:	2109      	movs	r1, #9
- 8003842:	7f80      	ldrb	r0, [r0, #30]
- 8003844:	fbb0 f2f1 	udiv	r2, r0, r1
- 8003848:	fb01 0012 	mls	r0, r1, r2, r0
- 800384c:	1c80      	adds	r0, r0, #2
- 800384e:	eb00 0080 	add.w	r0, r0, r0, lsl #2
- 8003852:	0044      	lsls	r4, r0, #1
+ 8003840:	2109      	movs	r1, #9                                           ; divisor = 9 (volume levels)
+ 8003842:	7f80      	ldrb	r0, [r0, #30]                                    ; r0 = g_config[0x1E] (beep volume setting)
+ 8003844:	fbb0 f2f1 	udiv	r2, r0, r1                                       ; r2 = volume / 9
+ 8003848:	fb01 0012 	mls	r0, r1, r2, r0                                   ; r0 = volume % 9 (remainder)
+ 800384c:	1c80      	adds	r0, r0, #2                                       ; r0 += 2 → base tone index
+ 800384e:	eb00 0080 	add.w	r0, r0, r0, lsl #2                               ; r0 *= 5
+ 8003852:	0044      	lsls	r4, r0, #1                                       ; r4 = r0*10 → total sample count for lead-in
  8003854:	2000      	movs	r0, #0
- 8003856:	f8df 8130 	ldr.w	r8, [pc, #304]	@ 0x8003988                    ; = 0x2000DF34 (g_timer_state)
- 800385a:	f508 77a7 	add.w	r7, r8, #334	@ 0x14e
- 800385e:	f898 1000 	ldrb.w	r1, [r8]
+ 8003856:	f8df 8130 	ldr.w	r8, [pc, #304]	@ 0x8003988                    ; r8 = 0x2000DF34 (g_timer_state - waveform table)
+ 800385a:	f508 77a7 	add.w	r7, r8, #334	@ 0x14e                          ; r7 = r8+0x14E (DMA waveform start)
+ 800385e:	f898 1000 	ldrb.w	r1, [r8]                                       ; r1 = g_timer_state[0] (base sample value)
+;; fill lead-in: r4 samples of constant value r1
  8003862:	e002      	b.n	0x800386a
- 8003864:	5439      	strb	r1, [r7, r0]
+ 8003864:	5439      	strb	r1, [r7, r0]                                     ; waveform[i] = r1
  8003866:	1c40      	adds	r0, r0, #1
  8003868:	b280      	uxth	r0, r0
- 800386a:	42a0      	cmp	r0, r4
- 800386c:	d3fa      	bcc.n	0x8003864
- 800386e:	f8b8 214c 	ldrh.w	r2, [r8, #332]	@ 0x14c
- 8003872:	1938      	adds	r0, r7, r4
- 8003874:	4944      	ldr	r1, [pc, #272]	@ (0x8003988)                    ; = 0x2000DF34 (g_timer_state)
- 8003876:	f7fd fb35 	bl	0x8000ee4
- 800387a:	f8b8 314c 	ldrh.w	r3, [r8, #332]	@ 0x14c
- 800387e:	1918      	adds	r0, r3, r4
+ 800386a:	42a0      	cmp	r0, r4                                           ; i < lead_in_count?
+ 800386c:	d3fa      	bcc.n	0x8003864                                       ; → loop
+;; ==== PHASE 3: Copy waveform body from sine LUT data ====
+ 800386e:	f8b8 214c 	ldrh.w	r2, [r8, #332]	@ 0x14c                       ; r2 = waveform body length
+ 8003872:	1938      	adds	r0, r7, r4                                       ; r0 = dest = waveform + lead_in
+ 8003874:	4944      	ldr	r1, [pc, #272]	@ (0x8003988)                    ; r1 = 0x2000DF34 (source)
+ 8003876:	f7fd fb35 	bl	0x8000ee4                                        ; memcpy(waveform+lead_in, src, body_len)
+;; ==== PHASE 4: Append 5-sample tail with ramp-down ====
+ 800387a:	f8b8 314c 	ldrh.w	r3, [r8, #332]	@ 0x14c                       ; r3 = body_len
+ 800387e:	1918      	adds	r0, r3, r4                                       ; r0 = total so far (lead_in + body)
  8003880:	b280      	uxth	r0, r0
- 8003882:	2100      	movs	r1, #0
- 8003884:	f1a8 0801 	sub.w	r8, r8, #1
- 8003888:	f813 2008 	ldrb.w	r2, [r3, r8]
+ 8003882:	2100      	movs	r1, #0                                           ; loop counter = 0
+ 8003884:	f1a8 0801 	sub.w	r8, r8, #1                                       ; r8 adjusted -1 for indexed access
+ 8003888:	f813 2008 	ldrb.w	r2, [r3, r8]                                   ; r2 = tail sample from table
  800388c:	4684      	mov	ip, r0
  800388e:	1c40      	adds	r0, r0, #1
  8003890:	b280      	uxth	r0, r0
- 8003892:	f807 200c 	strb.w	r2, [r7, ip]
+ 8003892:	f807 200c 	strb.w	r2, [r7, ip]                                   ; waveform[pos] = tail sample
  8003896:	1c49      	adds	r1, r1, #1
  8003898:	b289      	uxth	r1, r1
- 800389a:	2905      	cmp	r1, #5
- 800389c:	d3f6      	bcc.n	0x800388c
- 800389e:	00d8      	lsls	r0, r3, #3
- 80038a0:	1d64      	adds	r4, r4, #5
- 80038a2:	eb00 00c4 	add.w	r0, r0, r4, lsl #3
- 80038a6:	b280      	uxth	r0, r0
- 80038a8:	f8a7 0204 	strh.w	r0, [r7, #516]	@ 0x204
- 80038ac:	f8a7 5202 	strh.w	r5, [r7, #514]	@ 0x202
- 80038b0:	4c36      	ldr	r4, [pc, #216]	@ (0x800398c)                    ; = 0x2000E864 (g_dma_buf)
+ 800389a:	2905      	cmp	r1, #5                                           ; 5 tail samples
+ 800389c:	d3f6      	bcc.n	0x800388c                                       ; → loop
+;; ==== PHASE 5: Compute total DMA transfer length + set up DMA control struct ====
+ 800389e:	00d8      	lsls	r0, r3, #3                                       ; r0 = body_len * 8
+ 80038a0:	1d64      	adds	r4, r4, #5                                       ; r4 = lead_in + 5 (tail)
+ 80038a2:	eb00 00c4 	add.w	r0, r0, r4, lsl #3                               ; r0 += (lead_in+5)*8
+ 80038a6:	b280      	uxth	r0, r0                                           ; total DMA transfer count
+ 80038a8:	f8a7 0204 	strh.w	r0, [r7, #516]	@ 0x204                       ; store total count at waveform+0x204
+ 80038ac:	f8a7 5202 	strh.w	r5, [r7, #514]	@ 0x202                       ; clear current position counter
+ 80038b0:	4c36      	ldr	r4, [pc, #216]	@ (0x800398c)                    ; r4 = 0x2000E864 (g_dma_buf - DMA control header)
  80038b2:	2102      	movs	r1, #2
- 80038b4:	7221      	strb	r1, [r4, #8]
- 80038b6:	6020      	str	r0, [r4, #0]
- 80038b8:	60e5      	str	r5, [r4, #12]
- 80038ba:	7265      	strb	r5, [r4, #9]
+ 80038b4:	7221      	strb	r1, [r4, #8]                                     ; dma_ctrl.state = 2 (ready)
+ 80038b6:	6020      	str	r0, [r4, #0]                                     ; dma_ctrl.total_count = total
+ 80038b8:	60e5      	str	r5, [r4, #12]                                    ; dma_ctrl.current_pos = 0
+ 80038ba:	7265      	strb	r5, [r4, #9]                                     ; dma_ctrl.complete_flag = 0
  80038bc:	2001      	movs	r0, #1
- 80038be:	7520      	strb	r0, [r4, #20]
- 80038c0:	7565      	strb	r5, [r4, #21]
- 80038c2:	75a5      	strb	r5, [r4, #22]
- 80038c4:	6125      	str	r5, [r4, #16]
- 80038c6:	02c7      	lsls	r7, r0, #11
- 80038c8:	f104 0018 	add.w	r0, r4, #24
- 80038cc:	4639      	mov	r1, r7
- 80038ce:	4682      	mov	sl, r0
- 80038d0:	f7ff ff56 	bl	0x8003780
- 80038d4:	482e      	ldr	r0, [pc, #184]	@ (0x8003990)                    ; = 0x2000F87C (g_dma_buf2)
- 80038d6:	4639      	mov	r1, r7
- 80038d8:	9000      	str	r0, [sp, #0]
- 80038da:	f7ff ff51 	bl	0x8003780
- 80038de:	f8df 90b4 	ldr.w	r9, [pc, #180]	@ 0x8003994                    ; = 0x40011000 (GPIOC)
- 80038e2:	f44f 5880 	mov.w	r8, #4096	@ 0x1000
- 80038e6:	4641      	mov	r1, r8
- 80038e8:	4648      	mov	r0, r9
- 80038ea:	f00e fe62 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOC -> PC12/BEEP_SW
- 80038ee:	f8df b0a8 	ldr.w	fp, [pc, #168]	@ 0x8003998                    ; = 0x40020430 (DMA2_CH3)
+ 80038be:	7520      	strb	r0, [r4, #20]                                    ; dma_ctrl.buf1_ready = 1
+ 80038c0:	7565      	strb	r5, [r4, #21]                                    ; dma_ctrl.buf1_consumed = 0
+ 80038c2:	75a5      	strb	r5, [r4, #22]                                    ; dma_ctrl.buf2_consumed = 0
+ 80038c4:	6125      	str	r5, [r4, #16]                                    ; dma_ctrl.play_pos = 0
+ 80038c6:	02c7      	lsls	r7, r0, #11                                      ; r7 = 2048 (0x800) - halfwords per DMA buffer
+ 80038c8:	f104 0018 	add.w	r0, r4, #24                                      ; r0 = &dma_ctrl[24] = DMA buf 1 (0x2000E87C)
+ 80038cc:	4639      	mov	r1, r7                                           ; r1 = 2048 samples
+ 80038ce:	4682      	mov	sl, r0                                           ; sl = buf1 address (saved for DMA config)
+ 80038d0:	f7ff ff56 	bl	0x8003780                                        ; beep_tone_generate(buf1, 2048) - fill buf1
+ 80038d4:	482e      	ldr	r0, [pc, #184]	@ (0x8003990)                    ; r0 = 0x2000F87C (DMA buf 2)
+ 80038d6:	4639      	mov	r1, r7                                           ; r1 = 2048 samples
+ 80038d8:	9000      	str	r0, [sp, #0]                                     ; save buf2 addr on stack
+ 80038da:	f7ff ff51 	bl	0x8003780                                        ; beep_tone_generate(buf2, 2048) - fill buf2
+;; ==== PHASE 6: Connect beep to amp (PC12), configure DMA2_CH3→DAC ====
+ 80038de:	f8df 90b4 	ldr.w	r9, [pc, #180]	@ 0x8003994                    ; r9 = 0x40011000 (GPIOC base)
+ 80038e2:	f44f 5880 	mov.w	r8, #4096	@ 0x1000                          ; r8 = 0x1000 = PC12 bit mask
+ 80038e6:	4641      	mov	r1, r8                                           ; r1 = PC12
+ 80038e8:	4648      	mov	r0, r9                                           ; r0 = GPIOC
+ 80038ea:	f00e fe62 	bl	0x80125b2                                        ; gpio_bits_set ;; SET PC12 (BEEP_SW) HIGH - beep routing
+ 80038ee:	f8df b0a8 	ldr.w	fp, [pc, #168]	@ 0x8003998                    ; fp = 0x40020430 (DMA2_CH3 base)
  80038f2:	2201      	movs	r2, #1
- 80038f4:	2102      	movs	r1, #2
- 80038f6:	4658      	mov	r0, fp
- 80038f8:	f006 fec4 	bl	0x800a684
- 80038fc:	4827      	ldr	r0, [pc, #156]	@ (0x800399c)                    ; = 0x10000100
- 80038fe:	f006 fe89 	bl	0x800a614
- 8003902:	463a      	mov	r2, r7
- 8003904:	4651      	mov	r1, sl
- 8003906:	4658      	mov	r0, fp
- 8003908:	f009 fc04 	bl	0x800d114                                        ; dma_config
+ 80038f4:	2102      	movs	r1, #2                                           ; DMA priority = 2 (high)
+ 80038f6:	4658      	mov	r0, fp                                           ; r0 = DMA2_CH3
+ 80038f8:	f006 fec4 	bl	0x800a684                                        ; dma_channel_config(DMA2_CH3, priority=2, enable=1)
+ 80038fc:	4827      	ldr	r0, [pc, #156]	@ (0x800399c)                    ; = 0x10000100 (DMA config flags)
+ 80038fe:	f006 fe89 	bl	0x800a614                                        ; dma_flags_set(0x10000100) - M2M=0, PL=high, MSIZE/PSIZE=half
+ 8003902:	463a      	mov	r2, r7                                           ; r2 = 2048 (transfer count)
+ 8003904:	4651      	mov	r1, sl                                           ; r1 = buf1 addr (memory source)
+ 8003906:	4658      	mov	r0, fp                                           ; r0 = DMA2_CH3
+ 8003908:	f009 fc04 	bl	0x800d114                                        ; dma_config(DMA2_CH3, buf1, 2048) - set CMAR + CNDTR
  800390c:	2101      	movs	r1, #1
  800390e:	2000      	movs	r0, #0
- 8003910:	f006 fdfa 	bl	0x800a508                                        ; dac_enable
+ 8003910:	f006 fdfa 	bl	0x800a508                                        ; dac_enable(ch0, 1) - enable DAC channel 1
  8003914:	2101      	movs	r1, #1
  8003916:	2000      	movs	r0, #0
- 8003918:	f006 fe06 	bl	0x800a528                                        ; dac_dma_enable
- 800391c:	7a60      	ldrb	r0, [r4, #9]
- 800391e:	2801      	cmp	r0, #1
- 8003920:	d00f      	beq.n	0x8003942
- 8003922:	7d60      	ldrb	r0, [r4, #21]
- 8003924:	b120      	cbz	r0, 0x8003930
- 8003926:	4639      	mov	r1, r7
- 8003928:	4650      	mov	r0, sl
- 800392a:	f7ff ff29 	bl	0x8003780
- 800392e:	7565      	strb	r5, [r4, #21]
- 8003930:	7da0      	ldrb	r0, [r4, #22]
+ 8003918:	f006 fe06 	bl	0x800a528                                        ; dac_dma_enable(ch0, 1) - DAC DMA request on
+;; ==== PHASE 7: Double-buffer playback loop (wait for DMA completion) ====
+ 800391c:	7a60      	ldrb	r0, [r4, #9]                                     ; r0 = dma_ctrl.complete_flag
+ 800391e:	2801      	cmp	r0, #1                                           ; playback done?
+ 8003920:	d00f      	beq.n	0x8003942                                       ; → Phase 8 (post-play)
+ 8003922:	7d60      	ldrb	r0, [r4, #21]                                    ; r0 = dma_ctrl.buf1_consumed (set by DMA ISR)
+ 8003924:	b120      	cbz	r0, 0x8003930                                    ; if 0 → check buf2
+ 8003926:	4639      	mov	r1, r7                                           ; r1 = 2048
+ 8003928:	4650      	mov	r0, sl                                           ; r0 = buf1 addr
+ 800392a:	f7ff ff29 	bl	0x8003780                                        ; beep_tone_generate(buf1, 2048) - refill buf1
+ 800392e:	7565      	strb	r5, [r4, #21]                                    ; buf1_consumed = 0 (mark refilled)
+ 8003930:	7da0      	ldrb	r0, [r4, #22]                                    ; r0 = dma_ctrl.buf2_consumed
  8003932:	2800      	cmp	r0, #0
- 8003934:	d0f2      	beq.n	0x800391c
- 8003936:	4639      	mov	r1, r7
- 8003938:	9800      	ldr	r0, [sp, #0]
- 800393a:	f7ff ff21 	bl	0x8003780
- 800393e:	75a5      	strb	r5, [r4, #22]
- 8003940:	e7ec      	b.n	0x800391c
+ 8003934:	d0f2      	beq.n	0x800391c                                       ; both clear → poll again
+ 8003936:	4639      	mov	r1, r7                                           ; r1 = 2048
+ 8003938:	9800      	ldr	r0, [sp, #0]                                     ; r0 = buf2 addr (from stack)
+ 800393a:	f7ff ff21 	bl	0x8003780                                        ; beep_tone_generate(buf2, 2048) - refill buf2
+ 800393e:	75a5      	strb	r5, [r4, #22]                                    ; buf2_consumed = 0 (mark refilled)
+ 8003940:	e7ec      	b.n	0x800391c                                        ; → back to poll loop
+;; ==== PHASE 8: Post-playback - stop timer, reconfigure for 8kHz sample rate ====
  8003942:	4817      	ldr	r0, [pc, #92]	@ (0x80039a0)                     ; = 0x2000E858 (g_beep_state)
- 8003944:	7045      	strb	r5, [r0, #1]
+ 8003944:	7045      	strb	r5, [r0, #1]                                     ; g_beep_state[1] = 0 (playback complete)
  8003946:	2100      	movs	r1, #0
- 8003948:	4630      	mov	r0, r6
- 800394a:	f01e f800 	bl	0x802194e                                        ; tim_enable
+ 8003948:	4630      	mov	r0, r6                                           ; r0 = TIM6
+ 800394a:	f01e f800 	bl	0x802194e                                        ; tim_enable(TIM6, 0) - stop timer
  800394e:	2200      	movs	r2, #0
- 8003950:	2177      	movs	r1, #119	@ 0x77
+ 8003950:	2177      	movs	r1, #119	@ 0x77                               ; PSC=119 → /120 prescaler
  8003952:	4630      	mov	r0, r6
- 8003954:	f01e f807 	bl	0x8021966                                        ; tim_config_prescaler
- 8003958:	217d      	movs	r1, #125	@ 0x7d
+ 8003954:	f01e f807 	bl	0x8021966                                        ; tim_config_prescaler(TIM6, 119, 0)
+ 8003958:	217d      	movs	r1, #125	@ 0x7d                               ; ARR=125 → 120MHz/120/126 ≈ 7.94kHz
  800395a:	4630      	mov	r0, r6
- 800395c:	f01e f8f2 	bl	0x8021b44                                        ; tim_config_arr
+ 800395c:	f01e f8f2 	bl	0x8021b44                                        ; tim_config_arr(TIM6, 125)
  8003960:	2120      	movs	r1, #32
  8003962:	4630      	mov	r0, r6
- 8003964:	f01e f8e6 	bl	0x8021b34                                        ; tim_config_clkdiv
+ 8003964:	f01e f8e6 	bl	0x8021b34                                        ; tim_config_clkdiv(TIM6, 32)
  8003968:	2101      	movs	r1, #1
  800396a:	4630      	mov	r0, r6
- 800396c:	f01d ffef 	bl	0x802194e                                        ; tim_enable
-; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  tmr6_handler                                                        ║
-; ║  0x08003970  size=12                                            ║
-; ╚══════════════════════════════════════════════════════════════════════╝
-; * tmr6_handler [TIMER] - TMR6 handler (12B). Refs TMR6 + GPIOC + g_rf. Timer6 periodic callback.
- 8003970:	4641      	mov	r1, r8
- 8003972:	4648      	mov	r0, r9
+ 800396c:	f01d ffef 	bl	0x802194e                                        ; tim_enable(TIM6, 1) - restart at playback rate
+;; ---- beep_play epilogue - disable BEEP_SW, restore regs, return ----
+;; r9 = GPIOC (0x40011000), r8 = PC12 bit mask (0x1000)
+;; tail-call gpio_bits_reset to CLR PC12/BEEP_SW (disconnect beep from amp)
+ 8003970:	4641      	mov	r1, r8                                           ; r1 = 0x1000 (PC12 bit mask)
+ 8003972:	4648      	mov	r0, r9                                           ; r0 = GPIOC base
  8003974:	e8bd 4ff8 	ldmia.w	sp!, {r3, r4, r5, r6, r7, r8, r9, sl, fp, lr}
- 8003978:	f00e be19 	b.w	0x80125ae                                       ; -> gpio_bits_reset
+ 8003978:	f00e be19 	b.w	0x80125ae                                       ; -> gpio_bits_reset ;; CLR GPIOC -> PC12/BEEP_SW
 
 ; --- DATA @ 0x0800397C --------------------------------------------
   0x08003970: 41 46 48 46 BD E8 F8 4F 0E F0 19 BE 00 10 00 40  |AFHF...O.......@| [+12] 0x40001000=TIM6
@@ -7334,89 +7626,152 @@
 ; ║  Called by: keypad_audio_handler, main_task_dispatch                                ║
 ; ║  Calls: rf_rssi_read, display_mode_update, rf_channel_display, rf_state_flag_set, bt_state_sync (+8 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * rf_audio_gate_ctrl [RF/AUDIO] - RF audio gate control (218B, 7 callers). Controls squelch/audio path based on RF state.
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: rf_audio_gate_ctrl(uint8_t open)                     │
+; │                                                                     │
+; │ Master squelch audio gate - opens/closes RX audio path.            │
+; │ Called by keypad_audio_handler, main_task_dispatch (7 callers).     │
+; │                                                                     │
+; │ RAM structs:                                                        │
+; │   g_rf_state  @ 0x2000A3B4 - RF state (mode, timers)              │
+; │   g_rf_cfg    @ 0x2000A8B0 - RF configuration (+17=bt_mode)       │
+; │   g_squelch   @ 0x2000A2D4 - Squelch state (+0=gate, +4/6/8=tmrs)│
+; │                                                                     │
+; │ if (open == 0) {  // CLOSE squelch gate - mute RX audio           │
+; │   g_squelch.timer_a = 0;                                           │
+; │   g_squelch.timer_b = 0;                                           │
+; │   g_squelch.timer_c = 0;                                           │
+; │   display_mode_update(0);       // clear signal indicators         │
+; │   rf_channel_display(0);        // clear frequency display flag    │
+; │   rf_state_flag_set(g_rf_state[0x20]); // restore RF flag         │
+; │   bt_audio_gate(0);             // BT audio off                    │
+; │   if (g_rf_cfg.bt_mode != 0) {                                    │
+; │       bt_state_sync();          // sync BT state                   │
+; │       rf_audio_mixer_stop(0, 0);                                   │
+; │   }                                                                 │
+; │   g_squelch.gate = 0;           // gate closed                     │
+; │   tail → rf_flag_set(8);        // flag 8 = squelch close event   │
+; │                                                                     │
+; │ } else {  // OPEN squelch gate - unmute RX audio                   │
+; │   // Check frequency boundary (~2.8 MHz range check)               │
+; │   uint32_t freq = *(g_rf_freq + 0x1C);                            │
+; │   if (freq - 0x00A4CB80 < 0x002AB980 && g_rf_cfg.bt_mode != 0) { │
+; │       tail → bk4829_hal_cmd(7); // special BT audio routing       │
+; │   }                                                                 │
+; │   rf_audio_mixer_start(1, 1);   // start audio mixer               │
+; │   g_rf_state[5:6] = 500;        // 500ms squelch hold timer       │
+; │   g_squelch.timer_a = 12;       // 12-cycle debounce              │
+; │   g_squelch.timer_b = 100;      // 100-cycle timeout              │
+; │   g_squelch.timer_c = 3000;     // 3000-cycle max open            │
+; │   bk4829_audio_mode_switch(0);  // configure BK4829 for RX audio  │
+; │   if (g_rf_cfg.bt_mode && bt_audio_ready() != 0) {                │
+; │       // BT audio path                                             │
+; │       if (g_rf_cfg[18] == 0) rf_flag_set(8);                      │
+; │       bt_audio_start();                                            │
+; │       bk4829_audio_mode_extended(0);                               │
+; │   } else {                                                         │
+; │       bt_audio_gate(1);         // normal speaker path             │
+; │       if (g_rf_cfg.bt_mode != 2) display_mode_update(1);          │
+; │       rf_channel_display(0);                                       │
+; │       rf_state_flag_set(1);                                        │
+; │   }                                                                 │
+; │   g_squelch.gate = 1;           // gate open                       │
+; │ }                                                                   │
+; │                                                                     │
+; │ KEY INSIGHT: This function is the master audio gate for RX.        │
+; │ When squelch opens, it starts the audio mixer, sets timers, and    │
+; │ configures BK4829 for RX audio. When squelch closes, it stops     │
+; │ audio and clears all state. BT audio has a separate code path.    │
+; └---------------------------------------------------------------------┘
+; * rf_audio_gate_ctrl [RF/AUDIO] - Master squelch audio gate (open/close RX audio path)
  80039f8:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
- 80039fc:	4605      	mov	r5, r0
- 80039fe:	f009 fe21 	bl	0x800d644
- 8003a02:	4f34      	ldr	r7, [pc, #208]	@ (0x8003ad4)                    ; = 0x2000A3B4 (g_rf_state)
- 8003a04:	4e34      	ldr	r6, [pc, #208]	@ (0x8003ad8)                    ; = 0x2000A8B0 (RAM+0xA8B0)
- 8003a06:	4c35      	ldr	r4, [pc, #212]	@ (0x8003adc)                    ; = 0x2000A2D4 (RAM+0xA2D4)
- 8003a08:	2d01      	cmp	r5, #1
- 8003a0a:	d01e      	beq.n	0x8003a4a
+ 80039fc:	4605      	mov	r5, r0                                           ; r5 = open (0=close, 1=open)
+ 80039fe:	f009 fe21 	bl	0x800d644                                        ; rf_state_flag_set() - sync RF flags
+ 8003a02:	4f34      	ldr	r7, [pc, #208]	@ (0x8003ad4)                    ; r7 = 0x2000A3B4 (g_rf_state)
+ 8003a04:	4e34      	ldr	r6, [pc, #208]	@ (0x8003ad8)                    ; r6 = 0x2000A8B0 (rf_cfg - BT mode at +17)
+ 8003a06:	4c35      	ldr	r4, [pc, #212]	@ (0x8003adc)                    ; r4 = 0x2000A2D4 (g_squelch - gate+timers)
+ 8003a08:	2d01      	cmp	r5, #1                                           ; open == 1?
+ 8003a0a:	d01e      	beq.n	0x8003a4a                                       ; → OPEN squelch gate
+;; ---- CLOSE squelch gate - mute RX audio ----
  8003a0c:	2500      	movs	r5, #0
- 8003a0e:	80a5      	strh	r5, [r4, #4]
- 8003a10:	80e5      	strh	r5, [r4, #6]
- 8003a12:	8125      	strh	r5, [r4, #8]
+ 8003a0e:	80a5      	strh	r5, [r4, #4]                                     ; g_squelch.timer_a = 0
+ 8003a10:	80e5      	strh	r5, [r4, #6]                                     ; g_squelch.timer_b = 0
+ 8003a12:	8125      	strh	r5, [r4, #8]                                     ; g_squelch.timer_c = 0
  8003a14:	2000      	movs	r0, #0
- 8003a16:	f011 fc3f 	bl	0x8015298
+ 8003a16:	f011 fc3f 	bl	0x8015298                                        ; display_mode_update(0) - clear signal indicators
  8003a1a:	2000      	movs	r0, #0
- 8003a1c:	f011 fc5e 	bl	0x80152dc
- 8003a20:	f897 0020 	ldrb.w	r0, [r7, #32]
- 8003a24:	f011 fc7d 	bl	0x8015322
+ 8003a1c:	f011 fc5e 	bl	0x80152dc                                        ; rf_channel_display(0) - clear freq display flag
+ 8003a20:	f897 0020 	ldrb.w	r0, [r7, #32]                                  ; r0 = g_rf_state[0x20] (saved RF flag)
+ 8003a24:	f011 fc7d 	bl	0x8015322                                        ; rf_state_flag_set(g_rf_state[0x20])
  8003a28:	2000      	movs	r0, #0
- 8003a2a:	f000 f85f 	bl	0x8003aec
- 8003a2e:	7c70      	ldrb	r0, [r6, #17]
- 8003a30:	b128      	cbz	r0, 0x8003a3e
- 8003a32:	f01e fba5 	bl	0x8022180
+ 8003a2a:	f000 f85f 	bl	0x8003aec                                        ; bt_audio_gate(0) - BT audio off
+ 8003a2e:	7c70      	ldrb	r0, [r6, #17]                                    ; r0 = rf_cfg.bt_mode
+ 8003a30:	b128      	cbz	r0, 0x8003a3e                                    ; no BT → skip BT sync
+ 8003a32:	f01e fba5 	bl	0x8022180                                        ; bt_state_sync()
  8003a36:	2100      	movs	r1, #0
  8003a38:	4608      	mov	r0, r1
- 8003a3a:	f009 fa33 	bl	0x800cea4
- 8003a3e:	7025      	strb	r5, [r4, #0]
+ 8003a3a:	f009 fa33 	bl	0x800cea4                                        ; rf_audio_mixer_stop(0, 0)
+ 8003a3e:	7025      	strb	r5, [r4, #0]                                     ; g_squelch.gate = 0 (closed)
  8003a40:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 8003a44:	2008      	movs	r0, #8
- 8003a46:	f01c b9f9 	b.w	0x801fe3c
- 8003a4a:	4825      	ldr	r0, [pc, #148]	@ (0x8003ae0)                    ; = 0x2000A858 (RAM+0xA858)
- 8003a4c:	4925      	ldr	r1, [pc, #148]	@ (0x8003ae4)                    ; = 0xFF5B3480
- 8003a4e:	69c0      	ldr	r0, [r0, #28]
- 8003a50:	6800      	ldr	r0, [r0, #0]
- 8003a52:	4408      	add	r0, r1
- 8003a54:	4924      	ldr	r1, [pc, #144]	@ (0x8003ae8)                    ; = 0x002AB980
- 8003a56:	4288      	cmp	r0, r1
- 8003a58:	d206      	bcs.n	0x8003a68
- 8003a5a:	7c70      	ldrb	r0, [r6, #17]
- 8003a5c:	b120      	cbz	r0, 0x8003a68
+ 8003a44:	2008      	movs	r0, #8                                           ; flag 8 = squelch close event
+ 8003a46:	f01c b9f9 	b.w	0x801fe3c                                       ; → lcd_parallel_write(8) (tail call)
+;; ---- OPEN squelch gate - unmute RX audio ----
+ 8003a4a:	4825      	ldr	r0, [pc, #148]	@ (0x8003ae0)                    ; = 0x2000A858 (freq struct ptr)
+ 8003a4c:	4925      	ldr	r1, [pc, #148]	@ (0x8003ae4)                    ; = 0xFF5B3480 (= -0x00A4CB80, freq offset)
+ 8003a4e:	69c0      	ldr	r0, [r0, #28]                                    ; r0 = freq_struct[0x1C] (ptr to freq data)
+ 8003a50:	6800      	ldr	r0, [r0, #0]                                     ; r0 = current frequency (Hz)
+ 8003a52:	4408      	add	r0, r1                                           ; r0 = freq - 0x00A4CB80 (10.8 MHz offset)
+ 8003a54:	4924      	ldr	r1, [pc, #144]	@ (0x8003ae8)                    ; = 0x002AB980 (2.8 MHz range)
+ 8003a56:	4288      	cmp	r0, r1                                           ; in 10.8–13.6 MHz range?
+ 8003a58:	d206      	bcs.n	0x8003a68                                       ; out of range → normal path
+ 8003a5a:	7c70      	ldrb	r0, [r6, #17]                                    ; r0 = rf_cfg.bt_mode
+ 8003a5c:	b120      	cbz	r0, 0x8003a68                                    ; no BT → normal path
+;; Special BT audio routing for 10.8-13.6 MHz band
  8003a5e:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 8003a62:	2007      	movs	r0, #7
- 8003a64:	f003 bb56 	b.w	0x8007114
+ 8003a62:	2007      	movs	r0, #7                                           ; cmd = 7
+ 8003a64:	f003 bb56 	b.w	0x8007114                                       ; → bk4829_hal_cmd(7) (tail call)
+;; ---- Normal squelch open path ----
  8003a68:	2101      	movs	r1, #1
  8003a6a:	4608      	mov	r0, r1
- 8003a6c:	f00a fcd4 	bl	0x800e418
- 8003a70:	f44f 70fa 	mov.w	r0, #500	@ 0x1f4
- 8003a74:	f8a7 0005 	strh.w	r0, [r7, #5]
- 8003a78:	200c      	movs	r0, #12
- 8003a7a:	80a0      	strh	r0, [r4, #4]
- 8003a7c:	2064      	movs	r0, #100	@ 0x64
- 8003a7e:	80e0      	strh	r0, [r4, #6]
- 8003a80:	f640 30b8 	movw	r0, #3000	@ 0xbb8
- 8003a84:	8120      	strh	r0, [r4, #8]
- 8003a86:	2000      	movs	r0, #0
- 8003a88:	f016 fd7c 	bl	0x801a584
- 8003a8c:	7c70      	ldrb	r0, [r6, #17]
- 8003a8e:	b110      	cbz	r0, 0x8003a96
- 8003a90:	f005 fea8 	bl	0x80097e4
- 8003a94:	b190      	cbz	r0, 0x8003abc
+ 8003a6c:	f00a fcd4 	bl	0x800e418                                        ; rf_audio_mixer_start(1, 1)
+ 8003a70:	f44f 70fa 	mov.w	r0, #500	@ 0x1f4                            ; 500ms squelch hold
+ 8003a74:	f8a7 0005 	strh.w	r0, [r7, #5]                                  ; g_rf_state[5:6] = 500
+ 8003a78:	200c      	movs	r0, #12                                          ; 12-cycle debounce
+ 8003a7a:	80a0      	strh	r0, [r4, #4]                                     ; g_squelch.timer_a = 12
+ 8003a7c:	2064      	movs	r0, #100	@ 0x64                               ; 100-cycle timeout
+ 8003a7e:	80e0      	strh	r0, [r4, #6]                                     ; g_squelch.timer_b = 100
+ 8003a80:	f640 30b8 	movw	r0, #3000	@ 0xbb8                            ; 3000-cycle max open duration
+ 8003a84:	8120      	strh	r0, [r4, #8]                                     ; g_squelch.timer_c = 3000
+ 8003a86:	2000      	movs	r0, #0                                           ; chip = 0
+ 8003a88:	f016 fd7c 	bl	0x801a584                                        ; bk4829_reg_read(0) - read BK4829 status
+ 8003a8c:	7c70      	ldrb	r0, [r6, #17]                                    ; r0 = rf_cfg.bt_mode
+ 8003a8e:	b110      	cbz	r0, 0x8003a96                                    ; no BT → speaker path
+ 8003a90:	f005 fea8 	bl	0x80097e4                                        ; bt_audio_ready()
+ 8003a94:	b190      	cbz	r0, 0x8003abc                                    ; BT ready → BT audio path
+;; ---- Speaker audio path (no BT or BT not ready) ----
  8003a96:	2001      	movs	r0, #1
- 8003a98:	f000 f828 	bl	0x8003aec
- 8003a9c:	7c70      	ldrb	r0, [r6, #17]
- 8003a9e:	2802      	cmp	r0, #2
- 8003aa0:	d002      	beq.n	0x8003aa8
+ 8003a98:	f000 f828 	bl	0x8003aec                                        ; bt_audio_gate(1) - enable speaker path
+ 8003a9c:	7c70      	ldrb	r0, [r6, #17]                                    ; r0 = rf_cfg.bt_mode
+ 8003a9e:	2802      	cmp	r0, #2                                           ; BT mode 2 = BT-only?
+ 8003aa0:	d002      	beq.n	0x8003aa8                                       ; → skip display update
  8003aa2:	2001      	movs	r0, #1
- 8003aa4:	f011 fbf8 	bl	0x8015298
+ 8003aa4:	f011 fbf8 	bl	0x8015298                                        ; display_mode_update(1) - show signal
  8003aa8:	2000      	movs	r0, #0
- 8003aaa:	f011 fc17 	bl	0x80152dc
+ 8003aaa:	f011 fc17 	bl	0x80152dc                                        ; rf_channel_display(0)
  8003aae:	2001      	movs	r0, #1
- 8003ab0:	f011 fc37 	bl	0x8015322
+ 8003ab0:	f011 fc37 	bl	0x8015322                                        ; rf_state_flag_set(1)
  8003ab4:	2001      	movs	r0, #1
- 8003ab6:	7020      	strb	r0, [r4, #0]
- 8003ab8:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}
- 8003abc:	7cb0      	ldrb	r0, [r6, #18]
- 8003abe:	b910      	cbnz	r0, 0x8003ac6
+ 8003ab6:	7020      	strb	r0, [r4, #0]                                     ; g_squelch.gate = 1 (open)
+ 8003ab8:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}                ; return
+;; ---- BT audio path ----
+ 8003abc:	7cb0      	ldrb	r0, [r6, #18]                                    ; r0 = rf_cfg[18] (BT sub-flag)
+ 8003abe:	b910      	cbnz	r0, 0x8003ac6                                    ; sub-flag set → skip RF flag
  8003ac0:	2008      	movs	r0, #8
- 8003ac2:	f01c f9bb 	bl	0x801fe3c
- 8003ac6:	f015 ffa7 	bl	0x8019a18
+ 8003ac2:	f01c f9bb 	bl	0x801fe3c                                        ; lcd_parallel_write(8) - RF flag event
+ 8003ac6:	f015 ffa7 	bl	0x8019a18                                        ; bt_audio_start()
  8003aca:	2000      	movs	r0, #0
- 8003acc:	f016 fdaa 	bl	0x801a624
- 8003ad0:	e7e4      	b.n	0x8003a9c
+ 8003acc:	f016 fdaa 	bl	0x801a624                                        ; bk4829_audio_mode_extended(0)
+ 8003ad0:	e7e4      	b.n	0x8003a9c                                        ; → join speaker path (display + gate)
 
 ; --- DATA @ 0x08003AD2 --------------------------------------------
   0x08003AD0: E4 E7 00 00 B4 A3 00 20 B0 A8 00 20 D4 A2 00 20  |....... ... ... | [+4] 0x2000A3B4=g_rf_state; [+8] 0x2000A8B0=RAM+0xA8B0; [+12] 0x2000A2D4=RAM+0xA2D4
@@ -7430,8 +7785,29 @@
 ; ║  Calls: bk4829_rf_control                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_rssi_read  [RF] - Reads RSSI from BK4829 - 244B, called by rf_audio_gate_ctrl
+; -- rf_rssi_read --------------------------------------------------------
+; RSSI read + squelch timer control (56B actual, size field is wrong).
+; Sets up RSSI polling interval and routes to BK4829 RSSI read functions.
+;
+; r0 = mode (0=close/disable, 1=open/enable RSSI polling)
+;
+; Squelch ctrl struct @ 0x2000A2D4:
+;   [0]   = gate state
+;   [2:3] = RSSI polling interval (halfword)
+;   [4:5] = timer_a
+;
+; Mode 0 (disable):
+;   Set interval = 0, call bk4829_rf_control(0)
+;   TAIL-CALL bk4829_rf_control_b(0) → stop RSSI polling
+;
+; Mode 1 (enable):
+;   Set interval = 100 (0x64), call bk4829_rf_control(1)
+;   Check BT mode (rf_cfg[17]): if BT active AND g_rf_state[0]==1
+;     → TAIL-CALL bk4829_rf_control_c (BT-aware RSSI)
+;   Else → TAIL-CALL bk4829_rf_control_b(1) → start RSSI polling
+; ------------------------------------------------------------------------
  8003aec:	b510      	push	{r4, lr}
- 8003aee:	4910      	ldr	r1, [pc, #64]	@ (0x8003b30)                     ; = 0x2000A2D4 (RAM+0xA2D4)
+ 8003aee:	4910      	ldr	r1, [pc, #64]	@ (0x8003b30 ;; squelch ctrl @ 0x2000A2D4)                     ; = 0x2000A2D4 (RAM+0xA2D4)
  8003af0:	2801      	cmp	r0, #1
  8003af2:	d008      	beq.n	0x8003b06
  8003af4:	2000      	movs	r0, #0
@@ -7440,15 +7816,15 @@
  8003afc:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  8003b00:	2000      	movs	r0, #0
  8003b02:	f016 bd3f 	b.w	0x801a584
- 8003b06:	2064      	movs	r0, #100	@ 0x64
+ 8003b06:	2064      	movs	r0, #100 ;; RSSI polling interval = 100	@ 0x64
  8003b08:	8048      	strh	r0, [r1, #2]
  8003b0a:	f016 fd39 	bl	0x801a580
  8003b0e:	4809      	ldr	r0, [pc, #36]	@ (0x8003b34)                     ; = 0x2000A8B0 (RAM+0xA8B0)
- 8003b10:	7c40      	ldrb	r0, [r0, #17]
+ 8003b10:	7c40      	ldrb	r0, [r0, #17] ;; BT mode flag
  8003b12:	2801      	cmp	r0, #1
  8003b14:	d103      	bne.n	0x8003b1e
  8003b16:	4808      	ldr	r0, [pc, #32]	@ (0x8003b38)                     ; = 0x2000A3B4 (g_rf_state)
- 8003b18:	7800      	ldrb	r0, [r0, #0]
+ 8003b18:	7800      	ldrb	r0, [r0, #0] ;; g_rf_state[0] = main state
  8003b1a:	2801      	cmp	r0, #1
  8003b1c:	d004      	beq.n	0x8003b28
  8003b1e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
@@ -7469,16 +7845,41 @@
 ; ║  Calls: rf_rssi_read, lcd_ctrl_pin_set, lcd_dc_ctrl, display_nop_2b, display_mode_update (+4 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_periodic_refresh [DISPLAY] - Display periodic refresh, called from dispatch. 10 subcalls.
+; -- display_periodic_refresh --------------------------------------------
+; Periodic display refresh handler (184B). Called from main_task_dispatch
+; as an always-run subsystem. Manages RSSI bar animation, display block
+; counter, and conditional RF state refresh.
+;
+; State struct @ 0x2000A2D4:
+;   [0] = gate state (1=active)
+;   [1] = animation direction (0=down, 1=up)
+;   [2:3] = RSSI animation value (70..250 range)
+;   [4:5] = timer (countdown, reload = 12)
+;
+; Main logic (when gate==1):
+;   1. Decrement timer; when timer reaches 0:
+;      - Reload timer = 12
+;      - Animate RSSI bar: direction ? value+=12 : value-=12
+;      - Wrap at boundaries: ≥250 → reverse down, <70 → reverse up
+;      - rf_rssi_read(1) → enable RSSI polling
+;   2. Call display_mode_update with RSSI value
+;   3. Check g_rf_state[0x66] (display block counter):
+;      - If non-zero: decrement; when reaches 0 → clear display-pending
+;   4. Check g_rf_state[0x64] (display pending):
+;      - If set: call lcd_ctrl operations + display_mode_update
+;      - Then: rf_channel_display(1), display_freq_update(1)
+;   5. When gate==0 (inactive): just process display block counter
+; ------------------------------------------------------------------------
  8003b3c:	b570      	push	{r4, r5, r6, lr}
- 8003b3e:	4c2d      	ldr	r4, [pc, #180]	@ (0x8003bf4)                    ; = 0x2000A2D4 (RAM+0xA2D4)
+ 8003b3e:	4c2d      	ldr	r4, [pc, #180]	@ (0x8003bf4 ;; state @ 0x2000A2D4)                    ; = 0x2000A2D4 (RAM+0xA2D4)
  8003b40:	7820      	ldrb	r0, [r4, #0]
  8003b42:	2801      	cmp	r0, #1
  8003b44:	d14a      	bne.n	0x8003bdc
  8003b46:	88a0      	ldrh	r0, [r4, #4]
- 8003b48:	4e2b      	ldr	r6, [pc, #172]	@ (0x8003bf8)                    ; = 0x2000A3B4 (g_rf_state)
+ 8003b48:	4e2b      	ldr	r6, [pc, #172]	@ (0x8003bf8 ;; g_rf_state @ 0x2000A3B4)                    ; = 0x2000A3B4 (g_rf_state)
  8003b4a:	4d2c      	ldr	r5, [pc, #176]	@ (0x8003bfc)                    ; = 0x2000A8B0 (RAM+0xA8B0)
  8003b4c:	bb60      	cbnz	r0, 0x8003ba8
- 8003b4e:	200c      	movs	r0, #12
+ 8003b4e:	200c      	movs	r0, #12 ;; reload timer = 12
  8003b50:	80a0      	strh	r0, [r4, #4]
  8003b52:	4620      	mov	r0, r4
  8003b54:	7861      	ldrb	r1, [r4, #1]
@@ -7487,7 +7888,7 @@
  8003b5a:	300c      	adds	r0, #12
  8003b5c:	b280      	uxth	r0, r0
  8003b5e:	8060      	strh	r0, [r4, #2]
- 8003b60:	28fa      	cmp	r0, #250	@ 0xfa
+ 8003b60:	28fa      	cmp	r0, #250 ;; upper bound (250)	@ 0xfa
  8003b62:	d909      	bls.n	0x8003b78
  8003b64:	2000      	movs	r0, #0
  8003b66:	7060      	strb	r0, [r4, #1]
@@ -7495,7 +7896,7 @@
  8003b6a:	380c      	subs	r0, #12
  8003b6c:	b280      	uxth	r0, r0
  8003b6e:	8060      	strh	r0, [r4, #2]
- 8003b70:	2846      	cmp	r0, #70	@ 0x46
+ 8003b70:	2846      	cmp	r0, #70 ;; lower bound (70)	@ 0x46
  8003b72:	d201      	bcs.n	0x8003b78
  8003b74:	2001      	movs	r0, #1
  8003b76:	7060      	strb	r0, [r4, #1]
@@ -7612,6 +8013,17 @@
 ; ║  Called by: config_data_handler                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_boot_init  [DISPLAY] - Display boot init - ←display_boot_msg
+; -- display_boot_init (ACTUALLY: freq_to_khz_convert) -------------------
+; DISCOVERY: This is NOT a display boot function. This is a frequency
+; unit converter (18B). Converts a raw frequency step value to kHz.
+;
+; r0 = frequency step count
+; Returns: r0 = frequency in kHz (truncated, byte-clamped)
+;
+; Algorithm: r0 = (r0 * 3 * 2) / 1000 = r0 * 6 / 1000
+; The *3 + lsl#1 computes *6, then /1000 converts to kHz.
+; The uxtb clamps result to 0-255 range (0-255 kHz).
+; ------------------------------------------------------------------------
  8003c88:	eb00 0040 	add.w	r0, r0, r0, lsl #1
  8003c8c:	0040      	lsls	r0, r0, #1
  8003c8e:	f44f 717a 	mov.w	r1, #1000	@ 0x3e8
@@ -7624,6 +8036,26 @@
 ; ║  Called by: audio_usart1_init                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_boot_msg [DISPLAY] - Boot message display (96B). Shows boot text on LCD during startup.
+; -- display_boot_msg (ACTUALLY: channel_name_decode) --------------------
+; DISCOVERY: This is NOT boot message display. This is a channel name
+; decoder (96B). Decodes packed channel data from flash/EEPROM into a
+; readable name string with optional channel number suffix.
+;
+; r0 = packed channel data (7 bytes: 6 name chars + 1 flags byte)
+; r1 = output buffer (name string + null terminator)
+; r2 = mode (0=include channel number suffix, non-0=just store flags)
+;
+; Encoding: each name byte is LSR #1 (divided by 2) to decode ASCII.
+; A decoded value of 0x20 (space) terminates the name early.
+; Name is max 6 characters.
+;
+; Flags byte [6]: bits [4:1] = channel number (0-15)
+;   If r2==0 and channel != 0:
+;     Append "-N" or "-NN" suffix (number as decimal ASCII)
+;   If r2!=0: just store channel number at output[6]
+;
+; bit 0 of flags byte: returned in r0 (scan list flag?)
+; ------------------------------------------------------------------------
  8003c9a:	b570      	push	{r4, r5, r6, lr}
  8003c9c:	2500      	movs	r5, #0
  8003c9e:	600d      	str	r5, [r1, #0]
@@ -8789,30 +9221,62 @@
 ; ║  Calls: math_format_util, display_animation, aprs_codec_data_format, crc_calculate       ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * audio_codec_data [AUDIO] - Audio codec data handler (450B). Refs g_audio. CRC-verified audio data processing.
+; -- audio_codec_data ----------------------------------------------------
+; Audio codec command handler (450B). Processes ASCII-coded audio config
+; commands received via serial/BT. Parses command byte at offset [0x65]
+; of the input buffer and dispatches accordingly.
+;
+; r0 = input buffer pointer, r1 = output response buffer
+;
+; State structs:
+;   0x20010C88 = codec control struct ([0]=enabled, [27:30]=config, [31:32]=param)
+;   0x2000A994 = g_audio_state ([0x62:65]=config word, [0x64]=channel, [0x65]=gain)
+;
+; Command dispatch (byte at input[0x65]):
+;   '!' (0x21), '=' (0x3D):
+;     If next byte == '/' → respond 'p' (0x70) + call config_read
+;     Else → respond 'P' (0x50) + if codec enabled, copy config→audio_state
+;     Then call protocol_write → send response
+;
+;   '`' (0x60):
+;     Respond 'E' (0x45) + call verify_crc
+;     If CRC OK and codec enabled → copy config→audio_state
+;     Return 1 on success
+;
+;   '/' (0x2F), '@' (0x40):
+;     Check sub-type at input[6]: '/' or 'z' or 'h'
+;     Parse 3 fields (halfword each) as ASCII-encoded numbers:
+;       field[0] → channel (1..31), field[2] → gain (0..23), field[4] → param
+;     'z' path: call squelch_config with parsed parameters
+;     '/' path: call tone_config with CTCSS/DCS setup
+;     'h' path: parse frequency (24-bit) → call freq_config
+;
+; Returns: 0=unrecognized command, 1=command processed
+; ------------------------------------------------------------------------
  80060a4:	e92d 43fe 	stmdb	sp!, {r1, r2, r3, r4, r5, r6, r7, r8, r9, lr}
  80060a8:	4602      	mov	r2, r0
  80060aa:	460d      	mov	r5, r1
  80060ac:	f102 0466 	add.w	r4, r2, #102	@ 0x66
  80060b0:	f892 0065 	ldrb.w	r0, [r2, #101]	@ 0x65
  80060b4:	2770      	movs	r7, #112	@ 0x70
- 80060b6:	f8df 91b0 	ldr.w	r9, [pc, #432]	@ 0x8006268                    ; = 0x20010C88 (RAM+0x10C88)
- 80060ba:	4e6c      	ldr	r6, [pc, #432]	@ (0x800626c)                    ; = 0x2000A994 (g_audio_state)
+ 80060b6:	f8df 91b0 	ldr.w	r9, [pc, #432]	@ 0x8006268 ;; codec ctrl @ 0x20010C88                    ; = 0x20010C88 (RAM+0x10C88)
+ 80060ba:	4e6c      	ldr	r6, [pc, #432]	@ (0x800626c ;; g_audio_state @ 0x2000A994)                    ; = 0x2000A994 (g_audio_state)
  80060bc:	f04f 0850 	mov.w	r8, #80	@ 0x50
- 80060c0:	283d      	cmp	r0, #61	@ 0x3d
+ & ;; '=' (0x3D)?	@ 0x3d
  80060c2:	d022      	beq.n	0x800610a
  80060c4:	dc04      	bgt.n	0x80060d0
  80060c6:	2821      	cmp	r0, #33	@ 0x21
  80060c8:	d01f      	beq.n	0x800610a
- 80060ca:	282f      	cmp	r0, #47	@ 0x2f
+ & ;; '/' (0x2F)?	@ 0x2f
  80060cc:	d104      	bne.n	0x80060d8
  80060ce:	e038      	b.n	0x8006142
- 80060d0:	2840      	cmp	r0, #64	@ 0x40
+ & ;; '@' (0x40)?	@ 0x40
  80060d2:	d036      	beq.n	0x8006142
- 80060d4:	2860      	cmp	r0, #96	@ 0x60
+ & ;; '`' (0x60)?	@ 0x60
  80060d6:	d002      	beq.n	0x80060de
  80060d8:	2000      	movs	r0, #0
  80060da:	e8bd 83fe 	ldmia.w	sp!, {r1, r2, r3, r4, r5, r6, r7, r8, r9, pc}
- 80060de:	2045      	movs	r0, #69	@ 0x45
+ & ;; response = 'E' (0x45)	@ 0x45
  80060e0:	7028      	strb	r0, [r5, #0]
  80060e2:	4629      	mov	r1, r5
  80060e4:	4610      	mov	r0, r2
@@ -8830,7 +9294,7 @@
  8006106:	2000      	movs	r0, #0
  8006108:	e7e7      	b.n	0x80060da
  800610a:	7820      	ldrb	r0, [r4, #0]
- 800610c:	282f      	cmp	r0, #47	@ 0x2f
+ & ;; sub-type '/'?	@ 0x2f
  800610e:	d006      	beq.n	0x800611e
  8006110:	f885 8000 	strb.w	r8, [r5]
  8006114:	f899 0000 	ldrb.w	r0, [r9]
@@ -8867,9 +9331,9 @@
  8006164:	f8b9 001f 	ldrh.w	r0, [r9, #31]
  8006168:	f8a6 0066 	strh.w	r0, [r6, #102]	@ 0x66
  800616c:	79a0      	ldrb	r0, [r4, #6]
- 800616e:	287a      	cmp	r0, #122	@ 0x7a
+ & ;; sub-type 'z' (squelch)?	@ 0x7a
  8006170:	d02d      	beq.n	0x80061ce
- 8006172:	282f      	cmp	r0, #47	@ 0x2f
+ & ;; sub-type '/' (tone)?	@ 0x2f
  8006174:	d04e      	beq.n	0x8006214
  8006176:	8820      	ldrh	r0, [r4, #0]
  8006178:	f8ad 0000 	strh.w	r0, [sp]
@@ -9012,6 +9476,26 @@
 ; ║  Calls: config_data_handler, audio_ui_update, audio_ui_draw_state, rf_display_state_manager, rf_state_flag_set  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * audio_ui_update [AUDIO] - Audio status display update. Refs g_audio + g_display, calls beep control.
+; -- audio_ui_update -----------------------------------------------------
+; Mode 20 dispatch handler (186B). Processes audio UI sub-commands from
+; the main task dispatch loop. Routes commands to audio, display, and
+; RF subsystems.
+;
+; r0 = state struct pointer → [4] = sub-command code
+;
+; Sub-command dispatch table:
+;   2  → TAIL: display_freq_update (0x801417C)
+;   3  → TAIL: rf_audio_gate_ctrl(1) - open squelch
+;   5  → TAIL: audio_dma_config (0x800DD68)
+;   13 → rf_state_flag_set + check → thin_dispatcher(7)
+;   17 → call audio_ui_mode_config + TAIL: bk4829_hal_cmd(6)
+;   18 → TAIL: audio_ui_draw_state (EQ display)
+;   19 → audio_draw(0) + set EQ params + TAIL: thin_dispatcher(1)
+;   21 → audio_draw(1) + set EQ params + TAIL: thin_dispatcher(2)
+;   24 → same as 17 (audio mode config + hal cmd 6)
+;   ≥0xA0 → return (ignore high commands)
+;   other → TAIL: thin_dispatcher(0) - clear mode
+; ------------------------------------------------------------------------
  80062e4:	b510      	push	{r4, lr}
  80062e6:	6840      	ldr	r0, [r0, #4]
  80062e8:	2811      	cmp	r0, #17
@@ -9304,6 +9788,39 @@
   0x08006570: 94 A9 00 20 2D E9 F0 41 00 25 4F F4 80 76 1B 4F  |... -..A.%O..v.O| [+0] 0x2000A994=g_audio_state
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: audio_state_machine(void)                              │
+; │   Called by: main_task_dispatch (scheduler)                         │
+; │                                                                     │
+; │   g_audio_state = (uint8_t *)0x2000A994;                           │
+; │   do {                                                              │
+; │     state = g_audio_state[14];                                      │
+; │     switch (state) {                                                │
+; │       case 0: // IDLE - turn off amplifier                         │
+; │         g_audio_state[14] = 0;                                      │
+; │         if (g_rf_state[0x4B] != 0) break; // RF busy               │
+; │         gpio_bits_reset(GPIOB, 0x100); // CLR PB8 (amp OFF)        │
+; │         break;                                                      │
+; │       case 1: // EXIT - return immediately                         │
+; │         return;                                                     │
+; │       case 2: // SETUP - configure audio route, enable amp          │
+; │         beep_cfg = beep_table[g_config[0x1E]];                     │
+; │         g_audio_state[15] = beep_cfg;                               │
+; │         if (g_audio_state[13] == 1)                                 │
+; │           audio_route_setup(0x2000AA95 + 0xE5); // alt route       │
+; │           g_audio_state[13] = 0;                                    │
+; │         else                                                        │
+; │           audio_route_setup(0x2000AA95);         // normal route    │
+; │         g_audio_state[14] = 3;                                      │
+; │         gpio_bits_set(GPIOB, 0x100); // SET PB8 (amp ON)           │
+; │         break;                                                      │
+; │       case 3: // PLAY - generate beep tone                         │
+; │         beep_play();  // TIM6+DMA2+DAC generate tone                │
+; │         g_audio_state[14] = 4;                                      │
+; │         break;                                                      │
+; │     }                                                               │
+; │   } while (state != 0);                                             │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_state_machine                                                 ║
 ; ║  0x08006574  size=118                                           ║
@@ -9312,71 +9829,118 @@
 ; ║  Calls: beep_play, audio_route_setup, gpio_bits_reset, gpio_bits_set  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ;; ═══════════════════════════════════════════════════════════════════
-;; AUDIO STATE MACHINE - Controls speaker amplifier and beep playback
-;; 
-;; State variable at g_audio_state + 14 (0x2000A9A2)
-;;   State 0: IDLE - CLR PB8 (amp off), check g_rf_state[0x4B]
-;;   State 1: EXIT - return immediately
-;;   State 2: SETUP - load beep config, call audio_route_setup,
-;;            SET PB8 HIGH (amp on), advance to state 3
-;;   State 3: PLAY - call beep_play (TIM6+DMA2+DAC), advance to state 4
-;;   State 4: (falls through to state 0 -> amp off)
-;;
-;; Audio path: DAC(PA4) -> SPK_MUTE(PE1,active-LOW) -> BEEP_SW(PC12) -> AMP_EN(PB8) -> speaker
-;; PB8 = audio amplifier enable (CONFIRMED by OEM firmware analysis)
-;;
-;; Beep config lookup:  g_config[0x1E] indexes into table at 0x0802FE90
-;; Two paths: if g_audio_state[13]==1, uses offset+0xE5 route
-;; ═══════════════════════════════════════════════════════════════════
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_state_machine(void)                            │
+; │                                                                     │
+; │ 5-state do-while loop controlling beep playback. Executes the      │
+; │ ENTIRE sequence (setup→play→cleanup) in ONE call, not one state    │
+; │ per frame. Called by main_task_dispatch (mode 1 path).             │
+; │                                                                     │
+; │   do {                                                              │
+; │     state = g_audio_state[14];  // @ 0x2000A9A2 (g_audio+0x0E)   │
+; │                                                                     │
+; │     switch (state) {                                                │
+; │     case 0: // IDLE - just exit the loop (amp already off)         │
+; │         break;  // → loop exit (state==0 is the exit condition)    │
+; │                                                                     │
+; │     case 1: // DONE - exit immediately (explicit stop)             │
+; │         break;  // → loop exit                                     │
+; │                                                                     │
+; │     case 2: // SETUP - configure tone, enable amp                  │
+; │         freq_idx = g_config[0x1E]; // @ 0x2000ADEE                │
+; │         tone = beep_config_table[freq_idx];  // @ 0x0802FE90      │
+; │         g_audio_state[15] = tone;                                  │
+; │         if (g_audio_state[13] == 1) {                              │
+; │             audio_route_setup(route_buf + 0xE5);  // alt tone      │
+; │             g_audio_state[13] = 0;     // clear alt flag           │
+; │         } else {                                                    │
+; │             audio_route_setup(route_buf);          // normal tone  │
+; │         }                                                           │
+; │         g_audio_state[14] = 3;         // → PLAY                  │
+; │         GPIOB->BSRR = (1 << 8);       // SET PB8 (AMP_EN on)     │
+; │         continue;  // → re-enter loop immediately                  │
+; │                                                                     │
+; │     case 3: // PLAY - execute beep via DAC+DMA+TIM6               │
+; │         beep_play();                   // fills buffers + plays    │
+; │         g_audio_state[14] = 4;         // → CLEANUP               │
+; │         continue;  // → re-enter loop immediately                  │
+; │                                                                     │
+; │     default: // CLEANUP (state 4+) - check for chained beeps      │
+; │         g_audio_state[14] = 0;         // clear state              │
+; │         if (g_rf_state[0x4B] != 0) {   // another beep pending?   │
+; │             break;  // → exit with AMP still ON (next call chains) │
+; │         }                                                           │
+; │         GPIOB->BRR = (1 << 8);        // CLR PB8 (AMP_EN off)    │
+; │         continue;  // → re-enter, state=0 → exit                  │
+; │     }                                                               │
+; │   } while (state != 0 && state != 1);                              │
+; │                                                                     │
+; │ EXECUTION: A single call runs 2→3→4(default)→0 in sequence.       │
+; │ All states execute within one invocation, not across frames.        │
+; │ The amp is enabled for the duration of beep_play() + cleanup.      │
+; │                                                                     │
+; │ CHAINING: If g_rf_state[0x4B] is set during playback, the amp     │
+; │ stays on and the next call starts a new beep without amp glitch.   │
+; │                                                                     │
+; │ SIGNAL: DAC(PA4) → [PC12 beep sw] → [PB8 amp] → speaker          │
+; │         PE1 (SPK_MUTE) must be LOW for audio to pass              │
+; └---------------------------------------------------------------------┘
  8006574:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
- 8006578:	2500      	movs	r5, #0
- 800657a:	f44f 7680 	mov.w	r6, #256	@ 0x100
- 800657e:	4f1b      	ldr	r7, [pc, #108]	@ (0x80065ec)                    ; = 0x40010C00 (GPIOB)
- 8006580:	4c1b      	ldr	r4, [pc, #108]	@ (0x80065f0)                    ; = 0x2000A994 (g_audio_state)
- 8006582:	e02d      	b.n	0x80065e0
- 8006584:	2a01      	cmp	r2, #1
- 8006586:	d02e      	beq.n	0x80065e6
- 8006588:	2a02      	cmp	r2, #2
- 800658a:	d007      	beq.n	0x800659c
- 800658c:	2a03      	cmp	r2, #3
- 800658e:	d01e      	beq.n	0x80065ce
- 8006590:	73a5      	strb	r5, [r4, #14]
+ 8006578:	2500      	movs	r5, #0                                           ; r5 = 0 (constant for state clears)
+ 800657a:	f44f 7680 	mov.w	r6, #256	@ 0x100                          ; r6 = 0x100 = bit 8 mask (PB8/AMP_EN)
+ 800657e:	4f1b      	ldr	r7, [pc, #108]	@ (0x80065ec)                    ; r7 = 0x40010C00 (GPIOB base)
+ 8006580:	4c1b      	ldr	r4, [pc, #108]	@ (0x80065f0)                    ; r4 = 0x2000A994 (g_audio_state base)
+ 8006582:	e02d      	b.n	0x80065e0                                        ; → jump to do-while loop condition
+;; ---- state dispatch (entered when state != 0) ----
+ 8006584:	2a01      	cmp	r2, #1                                           ; state == 1? (DONE)
+ 8006586:	d02e      	beq.n	0x80065e6                                       ; → exit loop immediately
+ 8006588:	2a02      	cmp	r2, #2                                           ; state == 2? (SETUP)
+ 800658a:	d007      	beq.n	0x800659c                                       ; → setup tone + amp
+ 800658c:	2a03      	cmp	r2, #3                                           ; state == 3? (PLAY)
+ 800658e:	d01e      	beq.n	0x80065ce                                       ; → call beep_play
+;; ---- default case (state 4 = CLEANUP, or any unknown) ----
+ 8006590:	73a5      	strb	r5, [r4, #14]                                    ; g_audio_state[14] = 0 (clear state)
  8006592:	4818      	ldr	r0, [pc, #96]	@ (0x80065f4)                     ; = 0x2000A3B4 (g_rf_state)
- 8006594:	f890 004b 	ldrb.w	r0, [r0, #75]	@ 0x4b
- 8006598:	bb10      	cbnz	r0, 0x80065e0
- 800659a:	e01d      	b.n	0x80065d8
+ 8006594:	f890 004b 	ldrb.w	r0, [r0, #75]	@ 0x4b                        ; read beep-pending flag
+ 8006598:	bb10      	cbnz	r0, 0x80065e0                                    ; if pending → loop (exit w/AMP still ON for chaining)
+ 800659a:	e01d      	b.n	0x80065d8                                        ; else → AMP OFF
+;; ---- state 2: SETUP - configure tone route, enable amplifier ----
  800659c:	4816      	ldr	r0, [pc, #88]	@ (0x80065f8)                     ; = 0x2000ADD0 (g_config)
- 800659e:	4917      	ldr	r1, [pc, #92]	@ (0x80065fc)                     ; = 0x0802FE90 (flash+0x2FE90)
- 80065a0:	7f80      	ldrb	r0, [r0, #30]
- 80065a2:	f811 0010 	ldrb.w	r0, [r1, r0, lsl #1]
- 80065a6:	73e0      	strb	r0, [r4, #15]
- 80065a8:	7b60      	ldrb	r0, [r4, #13]
- 80065aa:	2801      	cmp	r0, #1
- 80065ac:	d009      	beq.n	0x80065c2
- 80065ae:	4814      	ldr	r0, [pc, #80]	@ (0x8006600)                     ; = 0x2000AA95 (RAM+0xAA95)
- 80065b0:	f000 f8f8 	bl	0x80067a4                                        ; audio_route_setup
- 80065b4:	2003      	movs	r0, #3
- 80065b6:	73a0      	strb	r0, [r4, #14]
- 80065b8:	4631      	mov	r1, r6
- 80065ba:	4638      	mov	r0, r7
- 80065bc:	f00b fff9 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOB -> PB8/AMP_EN
- 80065c0:	e00e      	b.n	0x80065e0
- 80065c2:	480f      	ldr	r0, [pc, #60]	@ (0x8006600)                     ; = 0x2000AA95 (RAM+0xAA95)
- 80065c4:	30e5      	adds	r0, #229	@ 0xe5
- 80065c6:	f000 f8ed 	bl	0x80067a4                                        ; audio_route_setup
- 80065ca:	7365      	strb	r5, [r4, #13]
- 80065cc:	e7f2      	b.n	0x80065b4
- 80065ce:	f7fd f91b 	bl	0x8003808                                        ; beep_play
- 80065d2:	2004      	movs	r0, #4
- 80065d4:	73a0      	strb	r0, [r4, #14]
- 80065d6:	e003      	b.n	0x80065e0
- 80065d8:	4631      	mov	r1, r6
- 80065da:	4638      	mov	r0, r7
- 80065dc:	f00b ffe7 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOB -> PB8/AMP_EN
- 80065e0:	7ba2      	ldrb	r2, [r4, #14]
- 80065e2:	2a00      	cmp	r2, #0
- 80065e4:	d1ce      	bne.n	0x8006584
- 80065e6:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}
+ 800659e:	4917      	ldr	r1, [pc, #92]	@ (0x80065fc)                     ; = 0x0802FE90 (beep config table in flash)
+ 80065a0:	7f80      	ldrb	r0, [r0, #30]                                    ; r0 = g_config[0x1E] (beep volume/index)
+ 80065a2:	f811 0010 	ldrb.w	r0, [r1, r0, lsl #1]                          ; r0 = beep_table[idx*2] (tone frequency byte)
+ 80065a6:	73e0      	strb	r0, [r4, #15]                                    ; g_audio_state[15] = tone freq param
+ 80065a8:	7b60      	ldrb	r0, [r4, #13]                                    ; r0 = g_audio_state[13] (alt-tone flag)
+ 80065aa:	2801      	cmp	r0, #1                                           ; alt tone requested?
+ 80065ac:	d009      	beq.n	0x80065c2                                       ; → alt route path
+ 80065ae:	4814      	ldr	r0, [pc, #80]	@ (0x8006600)                     ; r0 = 0x2000AA95 (route buffer in g_audio)
+ 80065b0:	f000 f8f8 	bl	0x80067a4                                        ; audio_route_setup(route_buf) - build waveform params
+ 80065b4:	2003      	movs	r0, #3                                           ; next state = 3 (PLAY)
+ 80065b6:	73a0      	strb	r0, [r4, #14]                                    ; g_audio_state[14] = 3
+ 80065b8:	4631      	mov	r1, r6                                           ; r1 = 0x100 (PB8 bit mask)
+ 80065ba:	4638      	mov	r0, r7                                           ; r0 = GPIOB
+ 80065bc:	f00b fff9 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOB -> PB8/AMP_EN (amp ON)
+ 80065c0:	e00e      	b.n	0x80065e0                                        ; → loop back (will enter state 3 immediately)
+;; ---- state 2 alt-tone path ----
+ 80065c2:	480f      	ldr	r0, [pc, #60]	@ (0x8006600)                     ; r0 = 0x2000AA95 (route buffer)
+ 80065c4:	30e5      	adds	r0, #229	@ 0xe5                               ; offset +0xE5 for alternate tone table
+ 80065c6:	f000 f8ed 	bl	0x80067a4                                        ; audio_route_setup(route_buf + 0xE5)
+ 80065ca:	7365      	strb	r5, [r4, #13]                                    ; g_audio_state[13] = 0 (clear alt flag)
+ 80065cc:	e7f2      	b.n	0x80065b4                                        ; → set state=3, AMP ON, loop
+;; ---- state 3: PLAY - execute beep via DAC+DMA+TIM6 ----
+ 80065ce:	f7fd f91b 	bl	0x8003808                                        ; beep_play() - generates + plays entire tone
+ 80065d2:	2004      	movs	r0, #4                                           ; next state = 4 (CLEANUP)
+ 80065d4:	73a0      	strb	r0, [r4, #14]                                    ; g_audio_state[14] = 4
+ 80065d6:	e003      	b.n	0x80065e0                                        ; → loop back (will enter default/cleanup)
+;; ---- AMP OFF (reached from default when no beep pending) ----
+ 80065d8:	4631      	mov	r1, r6                                           ; r1 = 0x100 (PB8 bit mask)
+ 80065da:	4638      	mov	r0, r7                                           ; r0 = GPIOB
+ 80065dc:	f00b ffe7 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOB -> PB8/AMP_EN (amp OFF)
+;; ---- do-while loop condition: exit when state == 0 or 1 ----
+ 80065e0:	7ba2      	ldrb	r2, [r4, #14]                                    ; r2 = current state
+ 80065e2:	2a00      	cmp	r2, #0                                           ; state == 0?
+ 80065e4:	d1ce      	bne.n	0x8006584                                       ; no → re-enter state dispatch
+ 80065e6:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}                ; exit
 
 ; --- DATA @ 0x080065EA --------------------------------------------
   0x080065E0: A2 7B 00 2A CE D1 BD E8 F0 81 00 00 00 0C 01 40  |.{.*...........@| [+12] 0x40010C00=GPIOB
@@ -9385,11 +9949,11 @@
 ; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  display_boot_sequence                                                        ║
+; ║  lookup_table_apply                                                        ║
 ; ║  0x08006604  size=20                                            ║
-; ║  Called by: audio_usart1_init                                              ║
+; ║  Called by: display_boot_sequence                                          ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * lookup_table_apply  [UTIL] - Boot seq tail - ←display_boot_sequence
+; * lookup_table_apply  [UTIL] - CRC16 table lookup: XOR byte with running CRC, index into table @ 0x0802FA84
  8006604:	880a      	ldrh	r2, [r1, #0]
  8006606:	4b04      	ldr	r3, [pc, #16]	@ (0x8006618)                     ; = 0x0802FA84 (flash+0x2FA84)
  8006608:	4050      	eors	r0, r2
@@ -9404,12 +9968,12 @@
 ; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  flash_settings_save                                                        ║
+; ║  string_copy_safe                                                         ║
 ; ║  0x0800661C  size=110                                           ║
-; ║  Called by: flash_settings_save                                              ║
+; ║  Called by: display_boot_sequence                                          ║
 ; ║  Calls: strlen, memcpy                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * string_copy_safe  [LIBC] - Safe string copy - calls memcpy, strlen
+; * string_copy_safe  [LIBC] - BCD string packer: packs ASCII digits into nibble-packed BCD format
  800661c:	b53e      	push	{r1, r2, r3, r4, r5, lr}
  800661e:	4604      	mov	r4, r0
  8006620:	2000      	movs	r0, #0
@@ -9450,38 +10014,57 @@
 ; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  audio_usart1_init                                                        ║
+; ║  display_boot_sequence                                                    ║
 ; ║  0x0800668C  size=272                                           ║
 ; ║  Called by: bit_flag_toggle                                              ║
-; ║  Calls: memcpy, display_boot_msg, display_boot_sequence, usart1_status_read       ║
+; ║  Calls: memcpy, lookup_table_apply, string_copy_safe, usart1_status_read  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * display_boot_sequence  [DISPLAY] - Boot display sequence - ->display_boot_msg, memcpy
+; * display_boot_sequence  [DISPLAY] - CRC16 frame validator + boot display: verifies frame CRC then unpacks/displays
+; -- display_boot_sequence -----------------------------------------------
+; CRC16 frame validator + boot display unpacker (272B).
+; Validates incoming data frame CRC16, then unpacks structured display
+; data for boot screen or configuration display.
+;
+; Entry: r0 = data frame pointer, r1 = frame length
+; Stack: 520B (frame copy + working space)
+;
+; Flow:
+;   1. CRC16 validate: compute over data[0..len-2], compare with
+;      trailing 2-byte CRC (little-endian). Return 0 if mismatch.
+;   2. Copy frame to stack buffer (sp+8)
+;   3. Parse header: first 7 bytes → RAM[0x2000A9B7]
+;      next 7 bytes → RAM[0x2000A9B0] (with flag=1)
+;   4. Scan data from offset 14 for 0x03,0xF0 delimiter → count entries
+;   5. Loop: unpack entries (7 bytes each) → channel table slots
+;      (stride 7, base 0x2000A994+0x2A per slot)
+;   6. Return 1 (valid frame processed)
+; ------------------------------------------------------------------------
  800668c:	e92d 47f0 	stmdb	sp!, {r4, r5, r6, r7, r8, r9, sl, lr}
- 8006690:	f5ad 7d02 	sub.w	sp, sp, #520	@ 0x208
+ 8006690:	f5ad 7d02 	sub.w	sp, sp, #520 ;; 520B stack frame	@ 0x208
  8006694:	4604      	mov	r4, r0
  8006696:	460e      	mov	r6, r1
- 8006698:	f64f 70ff 	movw	r0, #65535	@ 0xffff
+ 8006698:	f64f 70ff 	movw	r0, #65535 ;; CRC16 init = 0xFFFF	@ 0xffff
  800669c:	9001      	str	r0, [sp, #4]
  800669e:	2500      	movs	r5, #0
- 80066a0:	1eb7      	subs	r7, r6, #2
+ 80066a0:	1eb7      	subs	r7, r6, #2 ;; r7 = len-2 (exclude trailing CRC)
  80066a2:	e004      	b.n	0x80066ae
  80066a4:	5d60      	ldrb	r0, [r4, r5]
  80066a6:	a901      	add	r1, sp, #4
- 80066a8:	f7ff ffac 	bl	0x8006604
+ 80066a8:	f7ff ffac 	bl	0x8006604 ;; crc16_byte_update()
  80066ac:	1c6d      	adds	r5, r5, #1
  80066ae:	42bd      	cmp	r5, r7
  80066b0:	d3f8      	bcc.n	0x80066a4
  80066b2:	f8bd 0004 	ldrh.w	r0, [sp, #4]
- 80066b6:	43c0      	mvns	r0, r0
+ 80066b6:	43c0      	mvns	r0, r0 ;; CRC16 final invert
  80066b8:	b280      	uxth	r0, r0
  80066ba:	9001      	str	r0, [sp, #4]
  80066bc:	19a1      	adds	r1, r4, r6
  80066be:	f811 2d02 	ldrb.w	r2, [r1, #-2]!
  80066c2:	7849      	ldrb	r1, [r1, #1]
  80066c4:	ea42 2101 	orr.w	r1, r2, r1, lsl #8
- 80066c8:	4281      	cmp	r1, r0
+ 80066c8:	4281      	cmp	r1, r0 ;; compare computed vs trailing CRC
  80066ca:	d004      	beq.n	0x80066d6
- 80066cc:	2000      	movs	r0, #0
+ 80066cc:	2000      	movs	r0, #0 ;; CRC mismatch → return 0
  80066ce:	f50d 7d02 	add.w	sp, sp, #520	@ 0x208
  80066d2:	e8bd 87f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, pc}
  80066d6:	1eb2      	subs	r2, r6, #2
@@ -9497,16 +10080,16 @@
  80066ee:	2201      	movs	r2, #1
  80066f0:	1fc9      	subs	r1, r1, #7
  80066f2:	f7fd fad2 	bl	0x8003c9a
- 80066f6:	260e      	movs	r6, #14
+ 80066f6:	260e      	movs	r6, #14 ;; data entries start at offset 14
  80066f8:	f04f 0800 	mov.w	r8, #0
  80066fc:	4635      	mov	r5, r6
  80066fe:	e00b      	b.n	0x8006718
  8006700:	5d60      	ldrb	r0, [r4, r5]
- 8006702:	2803      	cmp	r0, #3
+ 8006702:	2803      	cmp	r0, #3 ;; look for 0x03 delimiter
  8006704:	d103      	bne.n	0x800670e
  8006706:	1960      	adds	r0, r4, r5
  8006708:	7840      	ldrb	r0, [r0, #1]
- 800670a:	28f0      	cmp	r0, #240	@ 0xf0
+ 800670a:	28f0      	cmp	r0, #240 ;; look for 0xF0 end marker	@ 0xf0
  800670c:	d006      	beq.n	0x800671c
  800670e:	f108 0801 	add.w	r8, r8, #1
  8006712:	f008 08ff 	and.w	r8, r8, #255	@ 0xff
@@ -9573,6 +10156,21 @@
   0x080067A0: D0 AD 00 20 2D E9 F0 41 AD F5 66 7D 06 46 00 27  |... -..A..f}.F.'| [+0] 0x2000ADD0=g_config
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: audio_route_setup(uint8_t *route_buf)                  │
+; │   920 bytes stack frame. Formats beep waveform parameters.         │
+; │                                                                     │
+; │   // Parse route configuration from route_buf                       │
+; │   // Format frequency/amplitude strings                             │
+; │   // Check g_config[0x27] and g_config[0x77] for special modes     │
+; │   // Build waveform parameter table                                 │
+; │   // Call timer_waveform_setup(params)  @ 0x8026B24                │
+; │   // Copy waveform to g_timer_state @ 0x2000DF34 via 0x8026220    │
+; │   //                                                                │
+; │   // NOTE: This function does NOT write hardware registers.         │
+; │   // It prepares the waveform lookup data that beep_tone_generate   │
+; │   // later reads from g_timer_state to fill DMA buffers.            │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_route_setup                                                   ║
 ; ║  0x080067A4  size=378                                           ║
@@ -9580,18 +10178,82 @@
 ; ║  Called by: audio_state_machine                                       ║
 ; ║  Calls: strlen, memset, status_bar_text_format, usart1_status_read, audio_route_string_fmt (+4 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_route_setup(uint8_t *route_cfg)                │
+; │                                                                     │
+; │ Builds tone/audio route configuration on stack from route_cfg      │
+; │ parameter. Allocates 920 bytes on stack for working buffers.       │
+; │ Called by audio_state_machine during SETUP phase (state 2).        │
+; │                                                                     │
+; │   uint8_t buf[920];  // sub sp, #0x398                            │
+; │   uint8_t *work = &buf[0xFC];  // working area                    │
+; │                                                                     │
+; │   // Copy 7 bytes from route_cfg+7 into working area              │
+; │   memcpy(work, route_cfg + 7, 7);                                 │
+; │                                                                     │
+; │   // Parse primary tone from working area                          │
+; │   struct tone_data *td = audio_route_string_fmt(work);            │
+; │   buf[0x354] = td->freq;    // primary tone frequency             │
+; │   buf[0x358] = td->mod;     // modulation type                    │
+; │   buf[0x35A] = td->flags;   // tone flags                         │
+; │                                                                     │
+; │   // Parse alternate tone if present                               │
+; │   if (route_cfg[6] valid) {                                        │
+; │       // Build alternate route, store at buf[0x35B]                │
+; │   }                                                                 │
+; │                                                                     │
+; │   buf[0x394] = 14;  // initial duration counter                    │
+; │                                                                     │
+; │   // Build up to 8 tone entries from route_cfg                     │
+; │   for (i=0; i<8; i++) {                                            │
+; │       parse route_cfg[i*8], store at buf[0x354 + i*7]             │
+; │       duration += 7;                                                │
+; │   }                                                                 │
+; │                                                                     │
+; │   // Apply to audio hardware                                       │
+; │   audio_route_config_apply(&buf[0x354], duration);                │
+; │                                                                     │
+; │ NOTE: Tone data stored to g_timer_state @ 0x2000DF34 for          │
+; │ beep_tone_generate() to read during DMA buffer fills.              │
+; └---------------------------------------------------------------------┘
+; -- audio_route_setup ---------------------------------------------------
+; Tone/audio route configuration builder (378B).
+; Builds a multi-tone descriptor on the stack (920B frame) from input
+; tone table entries, then applies to DAC hardware.
+;
+; Entry: r0 = tone descriptor pointer (header + up to 8 tone entries)
+;   [0:5]  = header data
+;   [6]    = tone count (1-8, 0xFF=end marker)
+;   [7:13] = first tone (7 bytes each: freq_word[4] + duration[2] + flags[1])
+;   [14+]  = subsequent tones (7 bytes each, up to 8 total)
+;
+; Stack layout (920B):
+;   sp+0xFC  (252): working buffer for tone parsing
+;   sp+0x354 (852): output tone descriptor (freq_word + duration + flags)
+;   sp+0x394 (916): running length counter (starts at 14, +7 per tone)
+;   sp+0x254 (596): intermediate audio config (188B)
+;   sp+0x104 (260): final tone data for DMA
+;
+; Flow:
+;   1. Parse header → build first tone descriptor at sp+0x354
+;   2. Loop up to 8 additional tones (7B each) → append to descriptor
+;   3. Set end-of-sequence flag (OR 0x01 on last byte)
+;   4. Call audio_usart3_config() → configure DAC output path
+;   5. If g_config[0x27]==1 && g_config[0x77]==1 → apply EQ filter
+;   6. Call audio_route_config_apply() → write to g_timer_state
+; ------------------------------------------------------------------------
  80067a4:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
- 80067a8:	f5ad 7d66 	sub.w	sp, sp, #920	@ 0x398
+ 80067a8:	f5ad 7d66 	sub.w	sp, sp, #920 ;; 920B stack frame for tone builder	@ 0x398
  80067ac:	4606      	mov	r6, r0
  80067ae:	2700      	movs	r7, #0
  80067b0:	973f      	str	r7, [sp, #252]	@ 0xfc
  80067b2:	9740      	str	r7, [sp, #256]	@ 0x100
- 80067b4:	2207      	movs	r2, #7
+ 80067b4:	2207      	movs	r2, #7 ;; copy 7 bytes (one tone entry)
  80067b6:	1df1      	adds	r1, r6, #7
  80067b8:	a83f      	add	r0, sp, #252	@ 0xfc
  80067ba:	f7fa fc53 	bl	0x8001064
  80067be:	a83f      	add	r0, sp, #252	@ 0xfc
- 80067c0:	f01e fa82 	bl	0x8024cc8
+ 80067c0:	f01e fa82 	bl	0x8024cc8 ;; parse_tone_entry() → freq+duration
  80067c4:	6801      	ldr	r1, [r0, #0]
  80067c6:	91d5      	str	r1, [sp, #852]	@ 0x354
  80067c8:	8881      	ldrh	r1, [r0, #4]
@@ -9609,7 +10271,7 @@
  80067e8:	f10d 08fc 	add.w	r8, sp, #252	@ 0xfc
  80067ec:	1e4a      	subs	r2, r1, #1
  80067ee:	4614      	mov	r4, r2
- 80067f0:	2a0f      	cmp	r2, #15
+ 80067f0:	2a0f      	cmp	r2, #15 ;; max 15 separator entries
  80067f2:	d20b      	bcs.n	0x800680c
  80067f4:	232d      	movs	r3, #45	@ 0x2d
  80067f6:	1c42      	adds	r2, r0, #1
@@ -9629,7 +10291,7 @@
  800681e:	f8ad 135f 	strh.w	r1, [sp, #863]	@ 0x35f
  8006822:	7980      	ldrb	r0, [r0, #6]
  8006824:	f88d 0361 	strb.w	r0, [sp, #865]	@ 0x361
- 8006828:	200e      	movs	r0, #14
+ 8006828:	200e      	movs	r0, #14 ;; initial descriptor length = 14 bytes
  800682a:	f8ad 0394 	strh.w	r0, [sp, #916]	@ 0x394
  800682e:	2c0f      	cmp	r4, #15
  8006830:	d227      	bcs.n	0x8006882
@@ -9663,14 +10325,14 @@
  8006876:	f8ad 0394 	strh.w	r0, [sp, #916]	@ 0x394
  800687a:	1c64      	adds	r4, r4, #1
  800687c:	b2e4      	uxtb	r4, r4
- 800687e:	2c08      	cmp	r4, #8
+ 800687e:	2c08      	cmp	r4, #8 ;; max 8 tone entries per sequence
  8006880:	d3d8      	bcc.n	0x8006834
  8006882:	f8bd 1394 	ldrh.w	r1, [sp, #916]	@ 0x394
  8006886:	f20d 3053 	addw	r0, sp, #851	@ 0x353
  800688a:	5c0a      	ldrb	r2, [r1, r0]
  800688c:	f042 0201 	orr.w	r2, r2, #1
  8006890:	540a      	strb	r2, [r1, r0]
- 8006892:	2236      	movs	r2, #54	@ 0x36
+ 8006892:	2236      	movs	r2, #54 ;; 54B intermediate config block	@ 0x36
  8006894:	a9d8      	add	r1, sp, #864	@ 0x360
  8006896:	4668      	mov	r0, sp
  8006898:	f7fa fb69 	bl	0x8000f6e
@@ -9697,10 +10359,10 @@
  80068cc:	a895      	add	r0, sp, #596	@ 0x254
  80068ce:	f7fa fb4e 	bl	0x8000f6e
  80068d2:	4813      	ldr	r0, [pc, #76]	@ (0x8006920)                     ; = 0x2000ADD0 (g_config)
- 80068d4:	f890 1027 	ldrb.w	r1, [r0, #39]	@ 0x27
+ 80068d4:	f890 1027 	ldrb.w	r1, [r0, #39] ;; g_config[0x27] - EQ enable flag	@ 0x27
  80068d8:	2901      	cmp	r1, #1
  80068da:	d10b      	bne.n	0x80068f4
- 80068dc:	f890 0077 	ldrb.w	r0, [r0, #119]	@ 0x77
+ 80068dc:	f890 0077 	ldrb.w	r0, [r0, #119] ;; g_config[0x77] - EQ type flag	@ 0x77
  80068e0:	2801      	cmp	r0, #1
  80068e2:	d107      	bne.n	0x80068f4
  80068e4:	f8bd 030e 	ldrh.w	r0, [sp, #782]	@ 0x30e
@@ -9716,11 +10378,11 @@
  80068fe:	f7fa fb36 	bl	0x8000f6e
  8006902:	a895      	add	r0, sp, #596	@ 0x254
  8006904:	c80f      	ldmia	r0, {r0, r1, r2, r3}
- 8006906:	f020 f90d 	bl	0x8026b24
+ 8006906:	f020 f90d 	bl	0x8026b24 ;; → audio_usart3_config()
  800690a:	f8bd 2250 	ldrh.w	r2, [sp, #592]	@ 0x250
  800690e:	a941      	add	r1, sp, #260	@ 0x104
- 8006910:	4804      	ldr	r0, [pc, #16]	@ (0x8006924)                     ; = 0x2000DF34 (g_timer_state)
- 8006912:	f01f fc85 	bl	0x8026220
+ 8006910:	4804      	ldr	r0, [pc, #16]	@ (0x8006924 ;; r0 = g_timer_state @ 0x2000DF34)                     ; = 0x2000DF34 (g_timer_state)
+ 8006912:	f01f fc85 	bl	0x8026220 ;; → audio_route_config_apply()
  8006916:	f50d 7d66 	add.w	sp, sp, #920	@ 0x398
  800691a:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}
 
@@ -9741,6 +10403,25 @@
 ; ║  Calls: tick_delay_check, buffer_init, debug_format_info, thin_dispatcher, flash_settings_save (+1 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * tx_prep_sequence  [RF/TX] - TX preparation - calls thin_dispatcher, checks g_settings
+; -- tx_prep_sequence ----------------------------------------------------
+; TX preparation handler (86B). Manages the transmit setup pipeline
+; including DTMF/tone sequencing and frequency configuration.
+;
+; State struct @ 0x2000025D = pending DTMF digit count
+; Playback state @ 0x2000B12C = g_playback (audio sequencer state)
+;
+; Flow:
+;   1. Call thin_dispatcher(5) → set TX sub-mode
+;   2. Call rf_state_update → sync RF state flags
+;   3. If no pending DTMF digits → TAIL-CALL tx_setup_sequence
+;   4. If playback active (g_playback[1]==1):
+;      - Reset playback: g_playback[1]=0, g_playback[3]=0
+;      - Re-check digit count
+;   5. For each pending digit:
+;      - Decrement count, clear digit slot
+;      - Call modulation_apply + freq_config
+;   6. When all digits sent: call rf_complete + tx_finalize(2)
+; ------------------------------------------------------------------------
  8006980:	b510      	push	{r4, lr}
  8006982:	2005      	movs	r0, #5
  8006984:	f000 fb9c 	bl	0x80070c0
@@ -9786,6 +10467,25 @@
 ; ║  Calls: thin_dispatcher                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * tx_setup_sequence  [RF] - TX setup sequence - called by tx_prep_sequence, radio_tx_engine
+; -- tx_setup_sequence ---------------------------------------------------
+; TX data setup (86B). Prepares the transmit data buffer by copying
+; data from a source buffer into the TX working area.
+;
+; TX buffer struct @ 0x2000A360:
+;   [4]  = source buffer length (total bytes to send)
+;   [12] = remaining byte count
+;   [17] = current position offset
+;   [18] = per-byte data field
+;
+; Algorithm:
+;   1. Call rf_state_update → sync RF state
+;   2. If remaining==0 OR source_len==0 → return 1 (done)
+;   3. Check byte at [offset + 17]: if > 0x80 → copy 2 bytes per step
+;      Otherwise → copy 1 byte per step
+;   4. Copy data[position..] into work buffer at offset [18]
+;   5. Update remaining count, null-terminate
+;   6. Return 0 (more data pending)
+; ------------------------------------------------------------------------
  80069dc:	b570      	push	{r4, r5, r6, lr}
  80069de:	f011 f997 	bl	0x8017d10
  80069e2:	4a14      	ldr	r2, [pc, #80]	@ (0x8006a34)                     ; = 0x2000A360 (RAM+0xA360)
@@ -10651,136 +11351,157 @@
 ; │    +0x08: bk4829_reg_write(reg_addr, value)                       │
 ; │    +0x0C: data/state buffer                                        │
 ; │  Command codes = BK4829 register addresses (decimal):              │
-; │    12=0x0C(DTMF), 13=0x0D(status), 48=0x30(enables)               │
+; │    12=0x0C(tone status), 13=0x0D(DTMF), 48=0x30(enables)               │
 ; │    55=0x37(CTCSS), 56=0x38(freq_lo), 57=0x39(freq_hi)             │
-; │    63=0x3F(BW/IF), 71=0x47(CTCSS_freq), 81=0x51(GPIO/TX)          │
+; │    63=0x3F(BW/IF), 71=0x47(AF_path/gain), 81=0x51(GPIO/TX)        │
 ; │    88=0x58(audio_filt), 89=0x59(IF_freq), 93=0x5D(AGC)            │
-; │    101=0x65(RSSI), 103=0x67(IRQ_flags)                            │
+; │    101=0x65(RSSI), 103=0x67(CTCSS_code)                            │
 ; │    112=0x70(audio_proc), 113=0x71(TX_power), 114=0x72(deviation)  │
+; │                                                                      │
+; │  STATUS REGISTER READBACK (CTCSS/DCS/DTMF detection):              │
+; │    REG 0x0C bit 1  : RX tone gate (0=pass, 1=mismatch)             │
+; │    REG 0x0C bit 10 : CTCSS frequency detected (0x0400)             │
+; │    REG 0x0C bit 14 : CTCSS/DCS intermediate flag (0x4000)          │
+; │    REG 0x0C bit 15 : DCS codeword matched (0x8000, mode 3)         │
+; │    REG 0x0C [11:10]=3: CTCSS confirmed (detect + valid)            │
+; │    REG 0x0D bit 15 : DTMF flag (1=no DTMF, 0=detected)            │
+; │    REG 0x0E        : DTMF digit code (16-bit)                      │
+; │    REG 0x67 [8:0]  : Detected CTCSS tone index (0-50)              │
 ; │  42 functions total use this HAL. All 19 former [SI4732] labels    │
 ; │  were BK4829 operations through this abstraction layer.            │
 ; └---------------------------------------------------------------------┘
-; * bk4829_hal_init  [BK4829] - BK4829 HAL init via dispatch - 476B, ->spi_bitbang_timing
+; * bk4829_hal_init  [BK4829] - BK4829 HAL init via dispatch - 476B, ->bk4829_af_path_config
+; -- bk4829_hal_init -----------------------------------------------------
+; BK4829 RF transceiver full initialization (476B).
+; Called twice during boot (once per chip) via g_hal_dispatch vtable.
+;
+; r4 = g_hal_dispatch @ 0x20000C28 (vtable):
+;   [4] = reg_read(reg) → value
+;   [8] = reg_write(reg, value)
+;
+; Sequence: chip reset → 43 register writes → tail-call AF path config
+; See register table below hw_init_main for full decode of all 43 values.
+; ------------------------------------------------------------------------
  8007144:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
- 8007148:	f003 fc12 	bl	0x800a970
- 800714c:	4c74      	ldr	r4, [pc, #464]	@ (0x8007320)                    ; = 0x20000C28 (RAM+0xC28)
- 800714e:	f44f 4100 	mov.w	r1, #32768	@ 0x8000
+ 8007148:	f003 fc12 	bl	0x800a970 ;; select chip (chip_select toggle)
+ 800714c:	4c74      	ldr	r4, [pc, #464]	@ (0x8007320 ;; r4 = g_hal_dispatch vtable)                    ; = 0x20000C28 (RAM+0xC28)
+ 800714e:	f44f 4100 	mov.w	r1, #32768 ;; -- REG 0x00 = 0x8000 (chip reset assert)	@ 0x8000
  8007152:	2000      	movs	r0, #0
  8007154:	68a2      	ldr	r2, [r4, #8]
  8007156:	4790      	blx	r2
- 8007158:	2100      	movs	r1, #0
+ 8007158:	2100      	movs	r1, #0 ;; -- REG 0x00 = 0x0000 (chip reset release)
  800715a:	68a2      	ldr	r2, [r4, #8]
  800715c:	4608      	mov	r0, r1
  800715e:	4790      	blx	r2
  8007160:	68a2      	ldr	r2, [r4, #8]
- 8007162:	f649 511f 	movw	r1, #40223	@ 0x9d1f
+ 8007162:	f649 511f 	movw	r1, #40223 ;; -- REG 0x37 = 0x9D1F (CTCSS/audio ctrl)	@ 0x9d1f
  8007166:	2037      	movs	r0, #55	@ 0x37
  8007168:	4790      	blx	r2
  800716a:	68a2      	ldr	r2, [r4, #8]
- 800716c:	f240 31df 	movw	r1, #991	@ 0x3df
+ 800716c:	f240 31df 	movw	r1, #991 ;; -- REG 0x13 = 0x03DF (RX gain/AGC)	@ 0x3df
  8007170:	2013      	movs	r0, #19
  8007172:	4790      	blx	r2
  8007174:	68a2      	ldr	r2, [r4, #8]
- 8007176:	f240 31db 	movw	r1, #987	@ 0x3db
+ 8007176:	f240 31db 	movw	r1, #987 ;; -- REG 0x12 = 0x03DB (IRQ enable 2)	@ 0x3db
  800717a:	2012      	movs	r0, #18
  800717c:	4790      	blx	r2
  800717e:	68a2      	ldr	r2, [r4, #8]
- 8007180:	f240 313a 	movw	r1, #826	@ 0x33a
+ 8007180:	f240 313a 	movw	r1, #826 ;; -- REG 0x11 = 0x033A (IRQ enable 1)	@ 0x33a
  8007184:	2011      	movs	r0, #17
  8007186:	4790      	blx	r2
  8007188:	68a2      	ldr	r2, [r4, #8]
- 800718a:	f44f 7146 	mov.w	r1, #792	@ 0x318
+ 800718a:	f44f 7146 	mov.w	r1, #792 ;; -- REG 0x10 = 0x0318 (IRQ status/ctrl)	@ 0x318
  800718e:	2010      	movs	r0, #16
  8007190:	4790      	blx	r2
  8007192:	68a2      	ldr	r2, [r4, #8]
- 8007194:	f44f 7104 	mov.w	r1, #528	@ 0x210
+ 8007194:	f44f 7104 	mov.w	r1, #528 ;; -- REG 0x14 = 0x0210 (misc control)	@ 0x210
  8007198:	2014      	movs	r0, #20
  800719a:	4790      	blx	r2
- 800719c:	f642 25b2 	movw	r5, #10930	@ 0x2ab2
+ 800719c:	f642 25b2 	movw	r5, #10930 ;; r5 = 0x2AB2 (reused for REG 0x49)	@ 0x2ab2
  80071a0:	68a2      	ldr	r2, [r4, #8]
  80071a2:	4629      	mov	r1, r5
  80071a4:	2049      	movs	r0, #73	@ 0x49
  80071a6:	4790      	blx	r2
  80071a8:	68a2      	ldr	r2, [r4, #8]
- 80071aa:	f247 31dc 	movw	r1, #29660	@ 0x73dc
+ 80071aa:	f247 31dc 	movw	r1, #29660 ;; -- REG 0x7B = 0x73DC (calibration)	@ 0x73dc
  80071ae:	207b      	movs	r0, #123	@ 0x7b
  80071b0:	4790      	blx	r2
  80071b2:	68a2      	ldr	r2, [r4, #8]
- 80071b4:	f44f 61f8 	mov.w	r1, #1984	@ 0x7c0
+ 80071b4:	f44f 61f8 	mov.w	r1, #1984 ;; -- REG 0x1C = 0x07C0 (IF filter)	@ 0x7c0
  80071b8:	201c      	movs	r0, #28
  80071ba:	4790      	blx	r2
  80071bc:	68a2      	ldr	r2, [r4, #8]
- 80071be:	f24e 5155 	movw	r1, #58709	@ 0xe555
+ 80071be:	f24e 5155 	movw	r1, #58709 ;; -- REG 0x1D = 0xE555 (IF coeff)	@ 0xe555
  80071c2:	201d      	movs	r0, #29
  80071c4:	4790      	blx	r2
  80071c6:	68a2      	ldr	r2, [r4, #8]
- 80071c8:	f644 4158 	movw	r1, #19544	@ 0x4c58
+ 80071c8:	f644 4158 	movw	r1, #19544 ;; -- REG 0x1E = 0x4C58 (IF coeff)	@ 0x4c58
  80071cc:	201e      	movs	r0, #30
  80071ce:	4790      	blx	r2
  80071d0:	68a2      	ldr	r2, [r4, #8]
- 80071d2:	f248 615a 	movw	r1, #34394	@ 0x865a
+ 80071d2:	f248 615a 	movw	r1, #34394 ;; -- REG 0x1F = 0x865A (IF coeff)	@ 0x865a
  80071d6:	201f      	movs	r0, #31
  80071d8:	4790      	blx	r2
  80071da:	68a2      	ldr	r2, [r4, #8]
- 80071dc:	f249 41c6 	movw	r1, #38086	@ 0x94c6
+ 80071dc:	f249 41c6 	movw	r1, #38086 ;; -- REG 0x3E = 0x94C6 (unknown)	@ 0x94c6
  80071e0:	203e      	movs	r0, #62	@ 0x3e
  80071e2:	4790      	blx	r2
  80071e4:	68a2      	ldr	r2, [r4, #8]
- 80071e6:	f240 71fe 	movw	r1, #2046	@ 0x7fe
+ 80071e6:	f240 71fe 	movw	r1, #2046 ;; -- REG 0x3F = 0x07FE (BW/IF filter)	@ 0x7fe
  80071ea:	203f      	movs	r0, #63	@ 0x3f
  80071ec:	4790      	blx	r2
  80071ee:	68a2      	ldr	r2, [r4, #8]
- 80071f0:	f24c 11ba 	movw	r1, #49594	@ 0xc1ba
+ 80071f0:	f24c 11ba 	movw	r1, #49594 ;; -- REG 0x25 = 0xC1BA (unknown)	@ 0xc1ba
  80071f4:	2025      	movs	r0, #37	@ 0x25
  80071f6:	4790      	blx	r2
  80071f8:	68a2      	ldr	r2, [r4, #8]
- 80071fa:	f649 217c 	movw	r1, #39548	@ 0x9a7c
+ 80071fa:	f649 217c 	movw	r1, #39548 ;; -- REG 0x3A = 0x9A7C (freq domain)	@ 0x9a7c
  80071fe:	203a      	movs	r0, #58	@ 0x3a
  8007200:	4790      	blx	r2
  8007202:	68a2      	ldr	r2, [r4, #8]
- 8007204:	f241 0141 	movw	r1, #4161	@ 0x1041
+ 8007204:	f241 0141 	movw	r1, #4161 ;; -- REG 0x19 = 0x1041 (unknown)	@ 0x1041
  8007208:	2019      	movs	r0, #25
  800720a:	4790      	blx	r2
  800720c:	68a2      	ldr	r2, [r4, #8]
- 800720e:	f44f 6134 	mov.w	r1, #2880	@ 0xb40
+ 800720e:	f44f 6134 	mov.w	r1, #2880 ;; -- REG 0x28 = 0x0B40 (RSSI threshold)	@ 0xb40
  8007212:	2028      	movs	r0, #40	@ 0x28
  8007214:	4790      	blx	r2
  8007216:	68a2      	ldr	r2, [r4, #8]
- 8007218:	f44f 412a 	mov.w	r1, #43520	@ 0xaa00
+ 8007218:	f44f 412a 	mov.w	r1, #43520 ;; -- REG 0x29 = 0xAA00 (RSSI adjust)	@ 0xaa00
  800721c:	2029      	movs	r0, #41	@ 0x29
  800721e:	4790      	blx	r2
  8007220:	68a2      	ldr	r2, [r4, #8]
- 8007222:	f44f 41cc 	mov.w	r1, #26112	@ 0x6600
+ 8007222:	f44f 41cc 	mov.w	r1, #26112 ;; -- REG 0x2A = 0x6600 (RSSI adjust)	@ 0x6600
  8007226:	202a      	movs	r0, #42	@ 0x2a
  8007228:	4790      	blx	r2
- 800722a:	2122      	movs	r1, #34	@ 0x22
+ 800722a:	2122      	movs	r1, #34 ;; -- REG 0x2C = 0x0022 (squelch)	@ 0x22
  800722c:	68a2      	ldr	r2, [r4, #8]
  800722e:	202c      	movs	r0, #44	@ 0x2c
  8007230:	4790      	blx	r2
  8007232:	68a2      	ldr	r2, [r4, #8]
- 8007234:	f649 0190 	movw	r1, #39056	@ 0x9890
+ 8007234:	f649 0190 	movw	r1, #39056 ;; -- REG 0x2F = 0x9890 (unknown)	@ 0x9890
  8007238:	202f      	movs	r0, #47	@ 0x2f
  800723a:	4790      	blx	r2
  800723c:	68a2      	ldr	r2, [r4, #8]
- 800723e:	f242 0128 	movw	r1, #8232	@ 0x2028
+ 800723e:	f242 0128 	movw	r1, #8232 ;; -- REG 0x53 = 0x2028 (TX dev/ctrl)	@ 0x2028
  8007242:	2053      	movs	r0, #83	@ 0x53
  8007244:	4790      	blx	r2
- 8007246:	f243 063e 	movw	r6, #12350	@ 0x303e
+ 8007246:	f243 063e 	movw	r6, #12350 ;; r6 = 0x303E (reused for REG 0x7E + 0x45)	@ 0x303e
  800724a:	68a2      	ldr	r2, [r4, #8]
  800724c:	4631      	mov	r1, r6
  800724e:	207e      	movs	r0, #126	@ 0x7e
  8007250:	4790      	blx	r2
  8007252:	68a2      	ldr	r2, [r4, #8]
- 8007254:	f246 0150 	movw	r1, #24656	@ 0x6050
+ 8007254:	f246 0150 	movw	r1, #24656 ;; -- REG 0x46 = 0x6050 (audio routing)	@ 0x6050
  8007258:	2046      	movs	r0, #70	@ 0x46
  800725a:	4790      	blx	r2
- 800725c:	f245 4730 	movw	r7, #21552	@ 0x5430
+ 800725c:	f245 4730 	movw	r7, #21552 ;; r7 = 0x5430 (reused for REG 0x4A)	@ 0x5430
  8007260:	68a2      	ldr	r2, [r4, #8]
  8007262:	4639      	mov	r1, r7
  8007264:	204a      	movs	r0, #74	@ 0x4a
  8007266:	4790      	blx	r2
  8007268:	68a2      	ldr	r2, [r4, #8]
- 800726a:	f24b 31bf 	movw	r1, #46015	@ 0xb3bf
+ 800726a:	f24b 31bf 	movw	r1, #46015 ;; -- REG 0x48 = 0xB3BF (AF gain init)	@ 0xb3bf
  800726e:	2048      	movs	r0, #72	@ 0x48
  8007270:	4790      	blx	r2
  8007272:	68a2      	ldr	r2, [r4, #8]
@@ -10792,47 +11513,47 @@
  800727e:	204a      	movs	r0, #74	@ 0x4a
  8007280:	4790      	blx	r2
  8007282:	68a2      	ldr	r2, [r4, #8]
- 8007284:	f24a 0104 	movw	r1, #40964	@ 0xa004
+ 8007284:	f24a 0104 	movw	r1, #40964 ;; -- REG 0x4D = 0xA004 (PA bias)	@ 0xa004
  8007288:	204d      	movs	r0, #77	@ 0x4d
  800728a:	4790      	blx	r2
  800728c:	68a2      	ldr	r2, [r4, #8]
- 800728e:	f643 0115 	movw	r1, #14357	@ 0x3815
+ 800728e:	f643 0115 	movw	r1, #14357 ;; -- REG 0x4E = 0x3815 (PA control)	@ 0x3815
  8007292:	204e      	movs	r0, #78	@ 0x4e
  8007294:	4790      	blx	r2
  8007296:	68a2      	ldr	r2, [r4, #8]
- 8007298:	f643 713b 	movw	r1, #16187	@ 0x3f3b
+ 8007298:	f643 713b 	movw	r1, #16187 ;; -- REG 0x4F = 0x3F3B (PA control)	@ 0x3f3b
  800729c:	204f      	movs	r0, #79	@ 0x4f
  800729e:	4790      	blx	r2
  80072a0:	68a2      	ldr	r2, [r4, #8]
- 80072a2:	f64c 41ef 	movw	r1, #52463	@ 0xccef
+ 80072a2:	f64c 41ef 	movw	r1, #52463 ;; -- REG 0x77 = 0xCCEF (unknown)	@ 0xccef
  80072a6:	2077      	movs	r0, #119	@ 0x77
  80072a8:	4790      	blx	r2
  80072aa:	68a2      	ldr	r2, [r4, #8]
  80072ac:	4631      	mov	r1, r6
  80072ae:	207e      	movs	r0, #126	@ 0x7e
  80072b0:	4790      	blx	r2
- 80072b2:	6861      	ldr	r1, [r4, #4]
- 80072b4:	2040      	movs	r0, #64	@ 0x40
+ 80072b2:	6861      	ldr	r1, [r4, #4] ;; r1 = reg_read fn ptr
+ 80072b4:	2040      	movs	r0, #64 ;; REG 0x40 read (VCO cal)	@ 0x40
  80072b6:	4788      	blx	r1
- 80072b8:	f400 4170 	and.w	r1, r0, #61440	@ 0xf000
- 80072bc:	f240 40d2 	movw	r0, #1234	@ 0x4d2
+ 80072b8:	f400 4170 	and.w	r1, r0, #61440 ;; keep upper 4 bits (0xF000 mask)	@ 0xf000
+ 80072bc:	f240 40d2 	movw	r0, #1234 ;; merge with 0x04D2 → VCO cal config	@ 0x4d2
  80072c0:	4301      	orrs	r1, r0
  80072c2:	68a2      	ldr	r2, [r4, #8]
  80072c4:	2040      	movs	r0, #64	@ 0x40
  80072c6:	4790      	blx	r2
  80072c8:	68a2      	ldr	r2, [r4, #8]
- 80072ca:	f64e 1112 	movw	r1, #59666	@ 0xe912
+ 80072ca:	f64e 1112 	movw	r1, #59666 ;; -- REG 0x7D = 0xE912 (unknown)	@ 0xe912
  80072ce:	207d      	movs	r0, #125	@ 0x7d
  80072d0:	4790      	blx	r2
  80072d2:	68a2      	ldr	r2, [r4, #8]
- 80072d4:	f24b 31ff 	movw	r1, #46079	@ 0xb3ff
+ 80072d4:	f24b 31ff 	movw	r1, #46079 ;; -- REG 0x48 = 0xB3FF (AF gain final)	@ 0xb3ff
  80072d8:	2048      	movs	r0, #72	@ 0x48
  80072da:	4790      	blx	r2
  80072dc:	68a2      	ldr	r2, [r4, #8]
- 80072de:	f64d 7122 	movw	r1, #57122	@ 0xdf22
+ 80072de:	f64d 7122 	movw	r1, #57122 ;; -- REG 0x74 = 0xDF22 (unknown)	@ 0xdf22
  80072e2:	2074      	movs	r0, #116	@ 0x74
  80072e4:	4790      	blx	r2
- 80072e6:	f249 15c1 	movw	r5, #37313	@ 0x91c1
+ 80072e6:	f249 15c1 	movw	r5, #37313 ;; r5 = 0x91C1 (dual-use R0x44 + R0x54)	@ 0x91c1
  80072ea:	68a2      	ldr	r2, [r4, #8]
  80072ec:	4629      	mov	r1, r5
  80072ee:	2044      	movs	r0, #68	@ 0x44
@@ -10843,7 +11564,7 @@
  80072f8:	2045      	movs	r0, #69	@ 0x45
  80072fa:	4790      	blx	r2
  80072fc:	68a2      	ldr	r2, [r4, #8]
- 80072fe:	f24e 611c 	movw	r1, #58908	@ 0xe61c
+ 80072fe:	f24e 611c 	movw	r1, #58908 ;; -- REG 0x75 = 0xE61C (unknown)	@ 0xe61c
  8007302:	2075      	movs	r0, #117	@ 0x75
  8007304:	4790      	blx	r2
  8007306:	68a2      	ldr	r2, [r4, #8]
@@ -10855,8 +11576,11 @@
  8007312:	2055      	movs	r0, #85	@ 0x55
  8007314:	4790      	blx	r2
  8007316:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 800731a:	2000      	movs	r0, #0
- 800731c:	f014 bc86 	b.w	0x801bc2c
+ 800731a:	2000      	movs	r0, #0 ;; mode=0 (normal audio path)
+ 800731c:	f014 bc86 	b.w	0x801bc2c                                        ; TAIL-CALL bk4829_af_path_config(mode=0)
+;; ^^^ CRITICAL: configures REG_47 (AF source) + REG_48 (AF gain) after init.
+;; mode=0 → REG_47 = 0x6042|LUT[0] = 0xFB67, REG_48 = 0xB00F|(cal<<4)
+;; Without this write, the BK4829 speaker path is misconfigured → silence.
 
 ; --- DATA @ 0x08007320 --------------------------------------------
   0x08007320: 28 0C 00 20 10 B5 1A F0 5D F9 11 F0 11 FA 0C F0  |(.. ....].......| [+0] 0x20000C28=RAM+0xC28
@@ -11256,27 +11980,52 @@
 ;       spi_write(0x54, 0x91C1);  spi_write(0x55, 0x3040);
 ;   }
 ;
-; --- 6. gpio_modes_init @ 0x0801391C (470B) -- ASM lines 30218-30690 -------
+; --- 6. gpio_modes_init @ 0x0801391C (470B) -----------------------------
 ;
-;   /* Full GPIO pin configuration called by hw_init_main.
-;    * Enables RCC clocks, configures all 5 GPIO ports (A-E).
-;    * Key output pins initialized: */
+;   /* Configure ALL GPIO pins for RT-950 Pro hardware.
+;    * Called once from hw_init_main step [6]. Sets up 5 GPIO ports with
+;    * ~45 pins covering: LCD (16-bit data bus), keypad matrix, RF front-end
+;    * relays, BK4829 SPI, SPI2 flash, audio path, PTT, encoder, USB, I2C.
+;    * See inline pin map at function body for complete assignment table. */
 ;   void gpio_modes_init(void) {
-;       rcc_enable_all_gpio_clocks();
-;       // GPIOA: PA6(FM_RESET), PA12(USB), PA11, PA7, PA4 set HIGH
-;       gpio_config_pins(GPIOA, 0x8DC8, MODE_OUT_2MHZ, CNF_PP);
-;       gpio_set(GPIOA, PA11 | PA7 | PA4);
-;       // GPIOB: PB6(SCL), PB7(SDA), PB8(MIC_EN), PB12-15(SPI2)
-;       gpio_config_pins(GPIOB, 0x1BCF, MODE_OUT_2MHZ, CNF_PP);
-;       gpio_clear(GPIOB, 0x11A0);  // clear PB5,PB8,PB12
-;       // GPIOC: PC4(BAND_RELAY), PC6(LCD_BL), PC12(BEEP_SW), PC15(SIDEPORT)
-;       gpio_config_pins(GPIOC, 0x7E7F, MODE_OUT_2MHZ, CNF_PP);
-;       gpio_clear(GPIOC, PC4 | PC6 | PC12);
-;       // GPIOE: PE0(PWR_DET), PE1(SPK_MUTE), PE2-3(PTT), PE5(SIDE_KEY)
-;       //        PE7-14(RF relay outputs)
-;       // ... (4 more config passes for remaining ports)
-;   }
+;       // Step 1: Enable AFIO clock, configure JTAG remap (free PA15,PB3,PB4)
+;       crm_periph_clock_enable(AFIO, ENABLE);
+;       gpio_pin_remap(SWJ_JTAG_DISABLE);  // free JTAG pins for GPIO
+;       gpio_pin_remap(REMAP_TYPE_3);
+;       crm_periph_clock_enable(ALL_GPIO);  // enable all port clocks
 ;
+;       // Step 2: PORT A - ADC analog(PA0-2,4,5), FM reset(PA6), GPS(PA8), USB(PA11-12)
+;       gpio_config(GPIOA, 0x8DC8, OUT_OD);  // PA3,6,7,8,10,11,15 output OD
+;       gpio_set(GPIOA, PA15 | PA11 | PA8);  // USB_DM + GPS_PWR ON
+;       gpio_config(GPIOA, PA12, INPUT_PU);   // USB_DP input
+;       gpio_config(GPIOA, 0x0037, ANALOG);   // PA0-2,4,5 → ADC/DAC
+;
+;       // Step 3: PORT B - RF relays(PB0-1), encoder(PB4-5), I2C(PB6-7),
+;       //         amp(PB8), LED(PB9), SPI2(PB12-15)
+;       gpio_config(GPIOB, 0x1BCF, OUT_OD);
+;       gpio_clear(GPIOB, 0x11A0);           // PB5,7,8,12 LOW (amp off)
+;       gpio_config(GPIOB, PB4|PB5, INPUT_PU);  // encoder inputs
+;       gpio_config(GPIOB, PB13|PB15, AF_OD);   // SPI2 SCK+MOSI
+;       gpio_config(GPIOB, PB14, INPUT_FLOAT);   // SPI2 MISO
+;
+;       // Step 4: PORT C - LCD data(PC0-3,5,9-11), band relay(PC4),
+;       //         backlight(PC6), beep switch(PC12)
+;       gpio_config(GPIOC, 0x7E7F, OUT_OD);
+;       gpio_clear(GPIOC, PC4 | PC6 | PC12);  // band off, BL off, beep_sw LOW
+;       gpio_set(GPIOC, PC10);                 // LCD_D6 HIGH
+;       gpio_config(GPIOC, 0x8180, INPUT_PU);  // PC7,8,15 input
+;
+;       // Step 5: PORT D - LCD ctrl(PD0-3), keypad rows(PD4-7), LCD upper(PD8-15)
+;       gpio_config(GPIOD, 0xFF0F, OUT_OD);
+;       gpio_clear(GPIOD, 0xFF0F);            // all output pins LOW
+;       gpio_config(GPIOD, 0x00F0, INPUT_PU); // PD4-7 keypad rows
+;
+;       // Step 6: PORT E - mute(PE1), PTT(PE2-3), RF relays(PE7,12-14),
+;       //         BK4829 SPI(PE8-11,15)
+;       gpio_config(GPIOE, 0xFF92, OUT_OD);
+;       gpio_clear(GPIOE, 0x8D00);  // PE8,10,11,15 LOW (BK4829 CS deselect)
+;       gpio_config(GPIOE, 0x006D, INPUT_PU); // PE0,2,3,5,6 (PTT+misc)
+;   }
 ; --- 8. gpio_output_control (keypad scan) @ 0x08012FF8 (184B) --------------
 ;
 ;   /* OEM keypad scanner - side button direct reads + matrix scan.
@@ -11332,6 +12081,20 @@
 ;       delay_us(10);                    // ~10 us hold
 ;       gpio_set(GPIOA, GPIO_PIN_6);    // PA6 FM_RESET HIGH (release)
 ;   }
+;
+; --- 8. VOICE SCRAMBLER STATUS -----------------------------------------------
+;
+;   ✗ NO VOICE ENCRYPTION/SCRAMBLING IMPLEMENTED in V0.27 firmware.
+;
+;   Evidence:
+;   - Flash string "Scramble" @ 0x0805B210 exists but is NOT referenced by running code
+;   - BK4829 REG 0x46 set ONCE at boot to 0x6050 (audio routing, NOT scrambler)
+;   - REG 0x46 NEVER modified at runtime - scrambler hardware unused
+;   - No frequency inversion constants (2600-3500 Hz) found anywhere
+;   - audio_route_config_apply @ 0x08026220 performs tone CONFIG encoding
+;     (XOR bit manipulation on config data, NOT audio sample processing)
+;   - Zero matches for "encrypt", "secure", "privacy" keywords
+;   - Conclusion: "Scramble" is a dead menu string; hardware scrambler disabled
 ;
 ; --- 9. LCD_Init - ST7789V initialization @ 0x08026954 ----------------------
 ;
@@ -11460,12 +12223,28 @@
 ; --- 13. Audio path - beep_play @ 0x08003808, spk_mute @ 0x08019254 ---------
 ;
 ;   /* OEM audio routing for beep playback:
-;    *   1. SET PC12 (BEEP_SW)  - route beep to speaker    @ 0x080038EA
-;    *   2. SET PB8  (AMP_EN)   - enable audio amplifier   @ 0x08006574
+;    *   1. SET PC12 (BEEP_SW) HIGH            @ 0x080038EA (gpio_bits_set)
+;    *   2. SET PB8  (AMP_EN)  HIGH            @ 0x08006574 (audio_state_machine)
 ;    *   3. Configure TIM6: PSC=3, ARR=781 (~38.4 kHz sample rate)
 ;    *   4. DMA2_CH3 → DAC_DHR12R1 (0x40007408), circular, 16 halfwords
 ;    *   5. Enable DAC + TIM6 → tone plays
 ;    *   6. After duration: stop TIM6, CLR PB8, CLR PC12
+;    *
+;    *   POLARITY NOTE (V12 custom FW discovery):
+;    *   Custom firmware V12 audio diagnostic found DAC audio plays through
+;    *   speaker ONLY with PC12=LOW (gpio_clear_pin). PC12=HIGH produced
+;    *   silence. This contradicts the OEM flow above (SET before beep).
+;    *   The V12 test also zeroed BK4829 R47/R48 and power-cycled the amp
+;    *   (PE4 OFF→ON) - conditions absent in OEM beep_play.
+;    *
+;    *   PE4 = amplifier power rail (V12 hardware-verified). Must be HIGH
+;    *   for any audio output. OEM pairs PE4 with PB8 in rf_frontend_enable().
+;    *
+;    *   BK4829 AF BUS LOADING: Even in standby (R30=0x0000), BK4829 AF
+;    *   output impedance loads the analog bus and attenuates DAC signal.
+;    *   R47 and R48 must be written 0x0000 on both chips before DAC
+;    *   playback to fully disconnect AF output. Without this, DAC audio
+;    *   is intermittent or absent.
 ;    *
 ;    * TX speaker mute:
 ;    *   spk_mute_on_ptt @ 0x08019254: SET PE1 + SET PB8 (mute+mic)
@@ -11570,6 +12349,23 @@
 ;    *
 ;    * NOAA WB frequencies use uint32_t (162400-162550 kHz > uint16_t max).
 ;    * OEM AM tune (@ 0x08003C34): [0x40, flags, freq_hi, freq_lo, 0, 1] */
+;    *
+;    * SI4732 AUDIO OUTPUT PATH (ANALOG ONLY):
+;    *   - Audio output = ANALOG (byte 2 of power-up = 0x05)
+;    *   - SI4732 LOUT/ROUT → external amplifier circuit (PB8 AMP_EN)
+;    *   - NO ADC capture - pure analog passthrough to speaker
+;    *   - NOT routed through MCU DAC (PA4/PA5 are for beep/tone only)
+;    *   - Audio switching: PC12 (BEEP_SW) selects beep vs RF/SI4732 audio
+;    *
+;    * MISLABELED FUNCTIONS (SI4732 I2C, not APRS):
+;    *   aprs_tone_modulate     → si4732_i2c_read_byte   @ 0x080259B4
+;    *   aprs_gpio_modulate_b   → si4732_i2c_start_addr  @ 0x08025A7C
+;    *   aprs_ptt_modulate      → si4732_i2c_write_byte  @ 0x08025BC0
+;    *   aprs_protocol_handler  → si4732_i2c_read_resp   @ 0x080264F0
+;    *   aprs_modulate_dispatch → si4732_i2c_send_cmd    @ 0x08026584
+;    *   display_scroll_delay   → si4732_wait_cts        @ 0x0802662C
+;    *   display_scroll_udiv    → si4732_set_property     @ 0x08026604
+;    *   lcd_bar_draw           → si4732_init_mode_select @ 0x0800E8BC
 ;
 ; --- 18. Menu system + display render engine ----------------------------
 ;
@@ -11768,7 +12564,7 @@
 ;    *      REG_47 = 0x6658 (AGC LUT[2] for TX)
 ;    *      REG_48 = 0xB00F | (cal_value << 4) (RF gain, cal from flash)
 ;    *   3. relay_select(sub, 2) - audio path routing for band
-;    *   4. rf_frontend_enable() - PB8+PE4 HIGH (PA power rail)
+;    *   4. rf_frontend_enable() - PB8+PE4 HIGH (amp power + amp enable)
 ;    *      CRITICAL: PA enable MUST be LAST, after relays settled.
 ;    *      5ms relay settling delay added between step 1 and 2.
 ;    *
@@ -12055,7 +12851,7 @@
 ;
 ; -- BOOT TIMING & INIT ORDER --------------------------------------------------
 ;
-;   VTOR: flag_set_init(0x0801886C) writes 0xE000ED08 with mask 0x1FFFFF80
+;   VTOR: nvic_vtor_set(0x0801886C) writes 0xE000ED08 with mask 0x1FFFFF80
 ;   IWDG: ZERO references to 0x40003000 - OEM does NOT use watchdog
 ;   delay_ms(0x08024D7C): counter at 0x2000A2EC, polls dma_buffer_config
 ;     (keeps audio DMA alive during waits - important pattern)
@@ -12125,33 +12921,33 @@
 ;; HW_INIT_MAIN - Master hardware initialization (THE boot function)
 ;;
 ;; Boot sequence (in order):
-;;   1. rcc_clock_init(0x080215E4)  - PLL, AHB, APB1/2 clocks
-;;   2. rcc_periph_enable(0x08018750) - Enable GPIO/timer/UART clocks
-;;   3. gpio_modes_init(0x0801391C) - Configure all GPIO pin modes
-;;   4. gpio_uart4_adc_init(0x08022738) - GPIOC + UART4 + ADC pins
-;;   5. adc2_init(0x080227AC) - ADC2 calibration
-;;   6. usart1_hw_init(0x080074EC) - USART1 for Bluetooth (PA9/PA10)
-;;   7. spi2_flash_init(0x08014000) - SPI2 for W25Q16 flash
-;;   8. tim6_dac_dma_init(0x08018EC0) - TIM6+DAC+DMA2 audio path
-;;   9. dac_init(0x0800A4F6) - DAC enable
-;;  10. peripheral_init(0x080033D8) - ADC1/DMA + more timer config
-;;  11. periph_init_flash_adc(0x08013820) - SPI flash JEDEC ID read (tail call)
+;;   1. systick_config(0x080215E4)     - SysTick 1ms tick from SystemCoreClock
+;;   2. rcc_periph_enable(0x08018750)  - NVIC priority group + peripheral enables
+;;   3. gpio_modes_init(0x0801391C)    - Configure all GPIO pin modes
+;;   4. gpio_uart4_adc_init(0x08022738)- GPIOC + UART4(PC10/PC11) + ADC2 pins
+;;   5. adc2_convert_read(0x080227AC)  - ADC2 channel config + first conversion
+;;   6. usart1_hw_init(0x080074EC)     - USART1 (PA9/PA10) 115200 baud for BT
+;;   7. spi2_flash_init(0x08014000)    - SPI2 master for W25Q16 flash (PB12-15)
+;;   8. tim6_dac_dma_init(0x08018EC0)  - TIM6+DMA2_CH3+DAC CH1 audio pipeline
+;;   9. dac_init(0x0800A4F6)           - DAC CH2 (PA5) enable
+;;  10. peripheral_init(0x080033D8)    - ADC1+DMA1_CH1 scan mode + timer config
+;;  11. periph_init_flash_adc(0x08013820) - ADC2 calibrate + flash JEDEC (tail)
 ;;
-;; Called by: unknown (likely from main() or startup)
+;; Called by: oem_main (0x08025D88) via math_float_entry
 ;; ═══════════════════════════════════════════════════════════════════
  8007324:	b510      	push	{r4, lr}
- 8007326:	f01a f95d 	bl	0x80215e4
- 800732a:	f011 fa11 	bl	0x8018750
- 800732e:	f00c faf5 	bl	0x801391c
- 8007332:	f01b fa01 	bl	0x8022738
- 8007336:	f01b fa39 	bl	0x80227ac                                        ; system_init
- 800733a:	f000 f8d7 	bl	0x80074ec
- 800733e:	f00c fe5f 	bl	0x8014000
- 8007342:	f011 fdbd 	bl	0x8018ec0
- 8007346:	f003 f8d6 	bl	0x800a4f6
- 800734a:	f7fc f845 	bl	0x80033d8
+ 8007326:	f01a f95d 	bl	0x80215e4                                        ;; [1] systick_config - SysTick 1ms tick
+ 800732a:	f011 fa11 	bl	0x8018750                                        ;; [2] rcc_periph_enable - NVIC + periph clocks
+ 800732e:	f00c faf5 	bl	0x801391c                                        ;; [3] gpio_modes_init - all GPIO pin configs
+ 8007332:	f01b fa01 	bl	0x8022738                                        ;; [4] gpio_uart4_adc_init - GPIOC+UART4+ADC2
+ 8007336:	f01b fa39 	bl	0x80227ac                                        ;; [5] adc2_convert_read - ADC2 first sample
+ 800733a:	f000 f8d7 	bl	0x80074ec                                        ;; [6] usart1_hw_init - USART1/BT 115200
+ 800733e:	f00c fe5f 	bl	0x8014000                                        ;; [7] spi2_flash_init - SPI2 for W25Q16
+ 8007342:	f011 fdbd 	bl	0x8018ec0                                        ;; [8] tim6_dac_dma_init - audio DMA pipeline
+ 8007346:	f003 f8d6 	bl	0x800a4f6                                        ;; [9] dac_init - DAC CH2 (PA5) enable
+ 800734a:	f7fc f845 	bl	0x80033d8                                        ;; [10] peripheral_init - ADC1+DMA1+timer
  800734e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 8007352:	f00c ba65 	b.w	0x8013820                                       ; -> periph_init_flash_adc
+ 8007352:	f00c ba65 	b.w	0x8013820                                        ;; [11] TAIL→periph_init_flash_adc - ADC2 cal+JEDEC
 
 ; --- DATA @ 0x08007356 --------------------------------------------
   0x08007350: 10 40 0C F0 65 BA 00 00 2D E9 F0 5F 01 46 5E 4A  |.@..e...-.._.F^J|
@@ -12164,23 +12960,47 @@
 ; ║  Calls: byte_to_word_pattern, memcpy, memset, eeprom_block_copy, flash_spi_transfer (+1 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * flash_data_load [EEPROM] - Flash data load (382B). Bulk data load from SPI flash to RAM.
+; -- flash_data_load -----------------------------------------------------
+; Bulk EEPROM/flash data load to RAM (382B).
+; Loads configuration blocks from SPI flash based on sector address.
+;
+; Entry: r0 = direction flag (0=flash→RAM, 1=RAM→flash)
+; r4 = sector address (from g_flash_config[17:18], big-endian)
+; Key addresses:
+;   0x2000AF70 = g_flash_config (main config struct)
+;   0x2000A266 = channel table destination
+;   0x2000A8B0 = settings block destination
+;   0x2000A8D0 = extended settings destination
+;   0x2000A979 = calibration data destination
+;
+; Sector dispatch (r4):
+;   0x8000: channel table (96B → 0x2000A266) + display update
+;   0x9000: settings (32B → 0x2000A8B0) + extended (41B → 0x2000A8D0)
+;   0xB000: calibration (128B → 0x2000A8F9)
+;   0xB080: extra config (25B → 0x2000A979)
+;   0xF000+: high-sector - backup/restore 128B blocks
+;   default: generic flash read/write via address
+;
+; Direction 0 (flash→RAM): memcpy from flash buffer
+; Direction 1 (RAM→flash): eeprom_block_copy + flash_spi_transfer
+; ------------------------------------------------------------------------
  8007358:	e92d 5ff0 	stmdb	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, ip, lr}
  800735c:	4601      	mov	r1, r0
- 800735e:	4a5e      	ldr	r2, [pc, #376]	@ (0x80074d8)                    ; = 0x2000AF70 (RAM+0xAF70)
- 8007360:	7c50      	ldrb	r0, [r2, #17]
- 8007362:	7c92      	ldrb	r2, [r2, #18]
+ 800735e:	4a5e      	ldr	r2, [pc, #376]	@ (0x80074d8 ;; r2 = g_flash_config @ 0x2000AF70)                    ; = 0x2000AF70 (RAM+0xAF70)
+ 8007360:	7c50      	ldrb	r0, [r2, #17] ;; sector addr high byte
+ 8007362:	7c92      	ldrb	r2, [r2, #18] ;; sector addr low byte
  8007364:	eb02 2000 	add.w	r0, r2, r0, lsl #8
  8007368:	b284      	uxth	r4, r0
  800736a:	f8df a16c 	ldr.w	sl, [pc, #364]	@ 0x80074d8                    ; = 0x2000AF70 (RAM+0xAF70)
  800736e:	f8df b16c 	ldr.w	fp, [pc, #364]	@ 0x80074dc                    ; = 0x2000A979 (RAM+0xA979)
  8007372:	f1aa 0a60 	sub.w	sl, sl, #96	@ 0x60
- 8007376:	f44f 4610 	mov.w	r6, #36864	@ 0x9000
- 800737a:	f44f 4730 	mov.w	r7, #45056	@ 0xb000
- 800737e:	f44f 4870 	mov.w	r8, #61440	@ 0xf000
+ 8007376:	f44f 4610 	mov.w	r6, #36864 ;; r6 = 0x9000 (settings sector)	@ 0x9000
+ 800737a:	f44f 4730 	mov.w	r7, #45056 ;; r7 = 0xB000 (calibration sector)	@ 0xb000
+ 800737e:	f44f 4870 	mov.w	r8, #61440 ;; r8 = 0xF000 (high-sector threshold)	@ 0xf000
  8007382:	f10a 0574 	add.w	r5, sl, #116	@ 0x74
- 8007386:	f44f 4900 	mov.w	r9, #32768	@ 0x8000
- 800738a:	2900      	cmp	r1, #0
- 800738c:	d053      	beq.n	0x8007436
+ 8007386:	f44f 4900 	mov.w	r9, #32768 ;; r9 = 0x8000 (channel sector)	@ 0x8000
+ 800738a:	2900      	cmp	r1, #0 ;; direction: 0=load, 1=save
+ 800738c:	d053      	beq.n	0x8007436 ;; → flash→RAM path
  800738e:	4544      	cmp	r4, r8
  8007390:	d306      	bcc.n	0x80073a0
  8007392:	2280      	movs	r2, #128	@ 0x80
@@ -12193,7 +13013,7 @@
  80073a4:	3980      	subs	r1, #128	@ 0x80
  80073a6:	4628      	mov	r0, r5
  80073a8:	f018 fa92 	bl	0x801f8d0
- 80073ac:	454c      	cmp	r4, r9
+ 80073ac:	454c      	cmp	r4, r9 ;; -- RAM→flash dispatch by sector
  80073ae:	d00a      	beq.n	0x80073c6
  80073b0:	42b4      	cmp	r4, r6
  80073b2:	d013      	beq.n	0x80073dc
@@ -12205,7 +13025,7 @@
  80073c0:	0520      	lsls	r0, r4, #20
  80073c2:	d02d      	beq.n	0x8007420
  80073c4:	e02f      	b.n	0x8007426
- 80073c6:	4944      	ldr	r1, [pc, #272]	@ (0x80074d8)                    ; = 0x2000AF70 (RAM+0xAF70)
+ 80073c6:	4944      	ldr	r1, [pc, #272]	@ (0x80074d8 ;; -- sector 0x8000: save channel table (96B))                    ; = 0x2000AF70 (RAM+0xAF70)
  80073c8:	2260      	movs	r2, #96	@ 0x60
  80073ca:	3980      	subs	r1, #128	@ 0x80
  80073cc:	4844      	ldr	r0, [pc, #272]	@ (0x80074e0)                    ; = 0x2000A266 (RAM+0xA266)
@@ -12213,7 +13033,7 @@
  80073d2:	e8bd 5ff0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, ip, lr}
  80073d6:	20ff      	movs	r0, #255	@ 0xff
  80073d8:	f008 be5e 	b.w	0x8010098
- 80073dc:	493e      	ldr	r1, [pc, #248]	@ (0x80074d8)                    ; = 0x2000AF70 (RAM+0xAF70)
+ 80073dc:	493e      	ldr	r1, [pc, #248]	@ (0x80074d8 ;; -- sector 0x9000: save settings (32B+41B))                    ; = 0x2000AF70 (RAM+0xAF70)
  80073de:	2220      	movs	r2, #32
  80073e0:	3980      	subs	r1, #128	@ 0x80
  80073e2:	4840      	ldr	r0, [pc, #256]	@ (0x80074e4)                    ; = 0x2000A8B0 (RAM+0xA8B0)
@@ -12224,7 +13044,7 @@
  80073ee:	f7f9 fd79 	bl	0x8000ee4
  80073f2:	e8bd 5ff0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, ip, lr}
  80073f6:	f008 bbdd 	b.w	0x800fbb4
- 80073fa:	e8bd 5ff0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, ip, lr}
+ 80073fa:	e8bd 5ff0 	ldmia.w	sp!, {r4, r5, r6, r7 ;; -- sector 0xB000: save calibration (128B), r8, r9, sl, fp, ip, lr}
  80073fe:	4936      	ldr	r1, [pc, #216]	@ (0x80074d8)                    ; = 0x2000AF70 (RAM+0xAF70)
  8007400:	4836      	ldr	r0, [pc, #216]	@ (0x80074dc)                    ; = 0x2000A979 (RAM+0xA979)
  8007402:	2280      	movs	r2, #128	@ 0x80
@@ -12246,7 +13066,7 @@
  800742e:	2280      	movs	r2, #128	@ 0x80
  8007430:	3980      	subs	r1, #128	@ 0x80
  8007432:	f019 beed 	b.w	0x8021210
- 8007436:	454c      	cmp	r4, r9
+ 8007436:	454c      	cmp	r4, r9 ;; -- flash→RAM dispatch by sector
  8007438:	d017      	beq.n	0x800746a
  800743a:	42b4      	cmp	r4, r6
  800743c:	d022      	beq.n	0x8007484
@@ -12332,51 +13152,57 @@
 ;; Likely AT command interface to BT module (HC-05/similar)
 ;; ═══════════════════════════════════════════════════════════════════
  80074ec:	b510      	push	{r4, lr}
- 80074ee:	b086      	sub	sp, #24
+ 80074ee:	b086      	sub	sp, #24 ;; alloc gpio_init + usart_init structs
+;; --- Step 1: Enable USART1 clock (APB2 bit 14) ---
  80074f0:	2101      	movs	r1, #1
- 80074f2:	0388      	lsls	r0, r1, #14
- 80074f4:	f012 fd0e 	bl	0x8019f14
+ 80074f2:	0388      	lsls	r0, r1, #14 ;; r0 = 0x4000 = USART1 RCC periph bit
+ 80074f4:	f012 fd0e 	bl	0x8019f14 ;; rcc_apb2_periph_enable(USART1, 1)
+;; --- Step 2: PA9 TX pin config (AF push-pull, 50MHz) ---
  80074f8:	a805      	add	r0, sp, #20
- 80074fa:	f00b f85c 	bl	0x80125b6
- 80074fe:	f44f 7000 	mov.w	r0, #512	@ 0x200
- 8007502:	f8ad 0014 	strh.w	r0, [sp, #20]
- 8007506:	2002      	movs	r0, #2
- 8007508:	f88d 0016 	strb.w	r0, [sp, #22]
- 800750c:	2018      	movs	r0, #24
- 800750e:	f88d 0017 	strb.w	r0, [sp, #23]
+ 80074fa:	f00b f85c 	bl	0x80125b6 ;; gpio_init_struct(defaults)
+ 80074fe:	f44f 7000 	mov.w	r0, #512	@ 0x200 ;; pin = GPIO_PIN_9 (PA9 = USART1_TX)
+ 8007502:	f8ad 0014 	strh.w	r0, [sp, #20] ;; struct.pin = PA9
+ 8007506:	2002      	movs	r0, #2 ;; mode = AF_PP (alt func push-pull)
+ 8007508:	f88d 0016 	strb.w	r0, [sp, #22] ;; struct.mode = AF_PP
+ 800750c:	2018      	movs	r0, #24 ;; speed = 50MHz
+ 800750e:	f88d 0017 	strb.w	r0, [sp, #23] ;; struct.speed = 50MHz
  8007512:	4c19      	ldr	r4, [pc, #100]	@ (0x8007578)                    ; = 0x40010800 (GPIOA)
  8007514:	a905      	add	r1, sp, #20
  8007516:	4620      	mov	r0, r4
- 8007518:	f00a fdc2 	bl	0x80120a0
- 800751c:	1521      	asrs	r1, r4, #20
- 800751e:	f8ad 1014 	strh.w	r1, [sp, #20]
- 8007522:	2148      	movs	r1, #72	@ 0x48
- 8007524:	f88d 1017 	strb.w	r1, [sp, #23]
+ 8007518:	f00a fdc2 	bl	0x80120a0 ;; gpio_af_config(GPIOA, {PA9, AF_PP, 50MHz})
+;; --- Step 3: PA10 RX pin config (floating input) ---
+ 800751c:	1521      	asrs	r1, r4, #20 ;; r1 = 0x40010800>>20 = 0x400 = GPIO_PIN_10
+ 800751e:	f8ad 1014 	strh.w	r1, [sp, #20] ;; struct.pin = PA10 (USART1_RX)
+ 8007522:	2148      	movs	r1, #72	@ 0x48 ;; speed = 0x48 = floating input mode
+ 8007524:	f88d 1017 	strb.w	r1, [sp, #23] ;; struct.speed = input floating
  8007528:	a905      	add	r1, sp, #20
  800752a:	4620      	mov	r0, r4
- 800752c:	f00a fdb8 	bl	0x80120a0
+ 800752c:	f00a fdb8 	bl	0x80120a0 ;; gpio_af_config(GPIOA, {PA10, input, float})
+;; --- Step 4: USART1 config: 115200 baud, 8N1, TX+RX ---
  8007530:	a801      	add	r0, sp, #4
- 8007532:	f01b f84f 	bl	0x80225d4
- 8007536:	f44f 30e1 	mov.w	r0, #115200	@ 0x1c200
- 800753a:	9001      	str	r0, [sp, #4]
+ 8007532:	f01b f84f 	bl	0x80225d4 ;; usart_init_struct(defaults)
+ 8007536:	f44f 30e1 	mov.w	r0, #115200	@ 0x1c200 ;; baudrate = 115200
+ 800753a:	9001      	str	r0, [sp, #4] ;; struct.baud = 115200
  800753c:	2000      	movs	r0, #0
- 800753e:	f8ad 0008 	strh.w	r0, [sp, #8]
- 8007542:	f8ad 000a 	strh.w	r0, [sp, #10]
- 8007546:	f8ad 000c 	strh.w	r0, [sp, #12]
- 800754a:	f8ad 0010 	strh.w	r0, [sp, #16]
- 800754e:	200c      	movs	r0, #12
- 8007550:	f8ad 000e 	strh.w	r0, [sp, #14]
+ 800753e:	f8ad 0008 	strh.w	r0, [sp, #8] ;; struct.word_len = 8 bit
+ 8007542:	f8ad 000a 	strh.w	r0, [sp, #10] ;; struct.stop_bits = 1
+ 8007546:	f8ad 000c 	strh.w	r0, [sp, #12] ;; struct.parity = none
+ 800754a:	f8ad 0010 	strh.w	r0, [sp, #16] ;; struct.hw_flow = none
+ 800754e:	200c      	movs	r0, #12 ;; mode = TX|RX (0x0C)
+ 8007550:	f8ad 000e 	strh.w	r0, [sp, #14] ;; struct.mode = TX_RX
  8007554:	4c09      	ldr	r4, [pc, #36]	@ (0x800757c)                     ; = 0x40013800 (USART1)
  8007556:	a901      	add	r1, sp, #4
  8007558:	4620      	mov	r0, r4
- 800755a:	f01a ff57 	bl	0x802240c
+ 800755a:	f01a ff57 	bl	0x802240c ;; usart_config(USART1, {115200,8N1,TX_RX})
+;; --- Step 5: Enable USART1 interrupts (RDBF + IDLE) ---
  800755e:	2201      	movs	r2, #1
- 8007560:	f240 5125 	movw	r1, #1317	@ 0x525
+ 8007560:	f240 5125 	movw	r1, #1317	@ 0x525 ;; USART_INT_RDBF|USART_INT_IDLE
  8007564:	4620      	mov	r0, r4
- 8007566:	f01a ff35 	bl	0x80223d4
+ 8007566:	f01a ff35 	bl	0x80223d4 ;; usart_irq_config(USART1, RDBF|IDLE, enable)
+;; --- Step 6: Enable USART1 peripheral ---
  800756a:	2101      	movs	r1, #1
  800756c:	4620      	mov	r0, r4
- 800756e:	f01a fecb 	bl	0x8022308
+ 800756e:	f01a fecb 	bl	0x8022308 ;; usart_enable(USART1, 1) → now active
  8007572:	b006      	add	sp, #24
  8007574:	bd10      	pop	{r4, pc}
 
@@ -12593,12 +13419,33 @@
 ; ║  Called by: bk4829_power_table                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_full_redraw_seq  [DISPLAY] - Full redraw sequence - calls display_full_screen_draw
+; -- bk4829_power_table (ACTUALLY: rf_freq_apply) ------------------------
+; RF frequency/power apply dispatcher (88B). Reads the HAL config struct
+; and routes to the appropriate frequency programming function based on
+; modulation mode and frequency type.
+;
+; HAL config struct @ 0x20000C34:
+;   [4]  = frequency value (32-bit)
+;   [8]  = modulation mode (0=direct, 1=PLL, 2+=DDS)
+;   [24] = power level flag
+;
+; Dispatch paths:
+;   Mode 0 (direct): TAIL-CALL → 0x80076A0 (direct frequency set)
+;   Mode 1 (PLL):
+;     - If power flag != 0: freq=0x1F5 (501), call 0x80076A0
+;     - If power flag == 0: freq=0x227 (551), call 0x80076A0
+;   Mode >= 2:
+;     - Check bit 29 (0xA0000000 mask) of frequency:
+;       If set: extract [22:0] as raw freq, store to (RAM+0xD4)[12],
+;               call 0x800A7CC(mode, raw_freq, 1, 0)
+;       Else:   call 0x800A7CC(mode, freq, 0, power_flag)
+; ------------------------------------------------------------------------
  800790c:	b430      	push	{r4, r5}
- 800790e:	4815      	ldr	r0, [pc, #84]	@ (0x8007964)                     ; = 0x20000C34 (RAM+0xC34)
- 8007910:	7a04      	ldrb	r4, [r0, #8]
- 8007912:	7e01      	ldrb	r1, [r0, #24]
- 8007914:	6840      	ldr	r0, [r0, #4]
- 8007916:	2c01      	cmp	r4, #1
+ 800790e:	4815      	ldr	r0, [pc, #84]	@ (0x8007964 ;; HAL config @ 0x20000C34)                     ; = 0x20000C34 (RAM+0xC34)
+ 8007910:	7a04      	ldrb	r4, [r0, #8] ;; modulation mode
+ 8007912:	7e01      	ldrb	r1, [r0, #24] ;; power level flag
+ 8007914:	6840      	ldr	r0, [r0, #4] ;; frequency value
+ 8007916:	2c01      	cmp	r4, #1 ;; mode: 0=direct, 1=PLL, 2+=DDS
  8007918:	d913      	bls.n	0x8007942
  800791a:	f04f 4220 	mov.w	r2, #2684354560	@ 0xa0000000
  800791e:	4382      	bics	r2, r0
@@ -12607,9 +13454,9 @@
  8007924:	4621      	mov	r1, r4
  8007926:	bc30      	pop	{r4, r5}
  8007928:	2200      	movs	r2, #0
- 800792a:	f002 bf4f 	b.w	0x800a7cc
+ 800792a:	f002 bf4f 	b.w	0x800a7cc ;; frequency program (DDS path)
  800792e:	4a0e      	ldr	r2, [pc, #56]	@ (0x8007968)                     ; = 0x200000D4 (RAM+0xD4)
- 8007930:	f3c0 0116 	ubfx	r1, r0, #0, #23
+ 8007930:	f3c0 0116 	ubfx	r1, r0, #0, #23 ;; extract raw freq [22:0]
  8007934:	60d1      	str	r1, [r2, #12]
  8007936:	4621      	mov	r1, r4
  8007938:	2300      	movs	r3, #0
@@ -12622,11 +13469,11 @@
  800794a:	b129      	cbz	r1, 0x8007958
  800794c:	bc30      	pop	{r4, r5}
  800794e:	2101      	movs	r1, #1
- 8007950:	f240 10f5 	movw	r0, #501	@ 0x1f5
+ 8007950:	f240 10f5 	movw	r0, #501 ;; 0x1F5 = PLL freq with power	@ 0x1f5
  8007954:	f7ff bea4 	b.w	0x80076a0
  8007958:	bc30      	pop	{r4, r5}
  800795a:	2100      	movs	r1, #0
- 800795c:	f240 2027 	movw	r0, #551	@ 0x227
+ 800795c:	f240 2027 	movw	r0, #551 ;; 0x227 = PLL freq without power	@ 0x227
  8007960:	f7ff be9e 	b.w	0x80076a0
 
 ; --- DATA @ 0x08007964 --------------------------------------------
@@ -12640,16 +13487,43 @@
 ; ║  Calls: uart_dma_filter_block                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_full_redraw_b  [DISPLAY] - Full redraw variant B - calls full_redraw_dispatcher
+; -- bk4829_reg_dump (ACTUALLY: rf_freq_apply_secondary) -----------------
+; DISCOVERY: This is NOT a register dump! This is the secondary BK4829
+; frequency programmer (106B). Programs frequency on the second RF chip
+; (dual-VFO). Mirrors rf_freq_apply but uses secondary fields from
+; g_hal_config.
+;
+; g_hal_config @ 0x20000C34:
+;   [16] = secondary frequency (Hz)
+;   [20] = secondary mode (0=PLL_lo, 1=PLL_direct, ≥2=DDS)
+;   [25] = secondary power flag
+;
+; g_hal_dispatch @ 0x20000C28: BK4829 vtable
+;   [8] = freq_program function pointer
+;
+; Flow:
+;   1. bk4829_rssi_read(0) → disable RSSI polling (free SPI bus)
+;   2. Switch on mode2 ([20]):
+;      Mode 0 (PLL low):
+;        If power_flag → PLL freq = 501 (0x1F5), call pll_freq_set
+;        Else → vtable[2](0x51, 0) (chip-specific freq via vtable)
+;      Mode 1 (PLL direct):
+;        Load freq[16] + power_flag[25] → call pll_freq_set(freq, power)
+;      Mode ≥2 (DDS):
+;        Check bit pattern (mask 0xA0000000):
+;        If DDS marker set → extract [22:0] raw freq → call dds_freq_set
+;        Else → store freq[22:0] at chip_struct[12], call dds_freq_set
+; ------------------------------------------------------------------------
  800796c:	b510      	push	{r4, lr}
  800796e:	2000      	movs	r0, #0
  8007970:	f012 fd82 	bl	0x801a478
- 8007974:	4a18      	ldr	r2, [pc, #96]	@ (0x80079d8)                     ; = 0x20000C34 (RAM+0xC34)
- 8007976:	7d11      	ldrb	r1, [r2, #20]
+ 8007974:	4a18      	ldr	r2, [pc, #96]	@ (0x80079d8 ;; g_hal_config @ 0x20000C34)                     ; = 0x20000C34 (RAM+0xC34)
+ 8007976:	7d11      	ldrb	r1, [r2, #20] ;; secondary mode
  8007978:	b1e1      	cbz	r1, 0x80079b4
  800797a:	2901      	cmp	r1, #1
  800797c:	d914      	bls.n	0x80079a8
  800797e:	6910      	ldr	r0, [r2, #16]
- 8007980:	f04f 4320 	mov.w	r3, #2684354560	@ 0xa0000000
+ 8007980:	f04f 4320 	mov.w	r3, #2684354560 ;; DDS marker mask 0xA0000000	@ 0xa0000000
  8007984:	4383      	bics	r3, r0
  8007986:	d005      	beq.n	0x8007994
  8007988:	7e53      	ldrb	r3, [r2, #25]
@@ -12657,7 +13531,7 @@
  800798e:	2200      	movs	r2, #0
  8007990:	f002 bf1c 	b.w	0x800a7cc
  8007994:	4b11      	ldr	r3, [pc, #68]	@ (0x80079dc)                     ; = 0x200000D4 (RAM+0xD4)
- 8007996:	f3c0 0216 	ubfx	r2, r0, #0, #23
+ 8007996:	f3c0 0216 	ubfx	r2, r0, #0, #23 ;; extract [22:0] raw freq
  800799a:	60da      	str	r2, [r3, #12]
  800799c:	2300      	movs	r3, #0
  800799e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
@@ -12671,14 +13545,14 @@
  80079b6:	b130      	cbz	r0, 0x80079c6
  80079b8:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  80079bc:	2101      	movs	r1, #1
- 80079be:	f240 10f5 	movw	r0, #501	@ 0x1f5
+ 80079be:	f240 10f5 	movw	r0, #501 ;; PLL freq constant = 501	@ 0x1f5
  80079c2:	f7ff be6d 	b.w	0x80076a0
  80079c6:	4804      	ldr	r0, [pc, #16]	@ (0x80079d8)                     ; = 0x20000C34 (RAM+0xC34)
  80079c8:	2100      	movs	r1, #0
  80079ca:	380c      	subs	r0, #12
- 80079cc:	6882      	ldr	r2, [r0, #8]
+ 80079cc:	6882      	ldr	r2, [r0, #8] ;; vtable[2] = freq function
  80079ce:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 80079d2:	2051      	movs	r0, #81	@ 0x51
+ 80079d2:	2051      	movs	r0, #81 ;; cmd = 0x51 (chip-specific freq)	@ 0x51
  80079d4:	4710      	bx	r2
 
 ; --- DATA @ 0x080079D6 --------------------------------------------
@@ -13601,26 +14475,71 @@
 ; ║  Calls: channel_lookup_delayed, bk4829_reg_table_b, spi_flash_cs_ctrl, display_flash_rf_info, flash_display_flag_tail  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * flash_to_display [DISPLAY] - Flash to display pipeline (798B, 5 callers). Reads font/image data from SPI flash to display.
+; -- flash_to_display ----------------------------------------------------
+; Channel data to display config pipeline (798B). Reads channel parameters
+; from flash/EEPROM and populates the display config struct for rendering.
+;
+; r0 = VFO/channel index (0=VFO_A, 1=VFO_B, 2=secondary)
+; r1 = direct_mode flag (0=normal config lookup, non-0=direct frequency)
+; r2 = channel data pointer (for direct mode)
+;
+; Display config struct @ 0x2000A41C:
+;   Stride = 88 bytes per channel (index * (1 + 1*8) * 8 = 88B)
+;   Per-channel fields (relative to channel base):
+;     [0x110:4] = primary frequency (32-bit)
+;     [0x114]   = primary modulation type
+;     [0x118:4] = primary stored frequency
+;     [0x11C:4] = secondary frequency (for split/offset)
+;     [0x120]   = secondary modulation type
+;     [0x124:4] = secondary stored frequency
+;     [0x128:4] = pointer to primary freq display
+;     [0x12C:4] = pointer to secondary freq display
+;     [0x130]   = band index (from config bits [1:0])
+;     [0x131]   = flag block (23+ bytes of channel attributes)
+;     [0x133]   = modulation mode (bits [5:4] of config byte)
+;     [0x138]   = freq direction (0=same, 1=up, 2=down)
+;     [0x13C:4] = frequency offset value
+;     [0x140]   = update flag (cleared at entry)
+;     [0x144:4] = CTCSS/DCS tone code
+;
+; Normal mode (r1=0):
+;   1. channel_lookup_delayed(index) - validate channel exists
+;   2. Branch by VFO index: 0→bits[1:0], 1→bits[3:2], 2→bits[5:4]
+;      of (RAM+0xA8B0)[26] for band selection
+;   3. Read frequency config from channel data struct (stride 0x2D0..0x2EC)
+;   4. Parse modulation type, CTCSS/DCS, power level, bandwidth
+;   5. BCD frequency decode: 8 digits → 2 frequencies via multiply loop
+;      (digit * 100000000 accumulated for primary + secondary)
+;   6. Compare primary vs secondary → set direction flag (up/down/same)
+;
+; Direct mode (r1≠0):
+;   Uses (RAM+0xA8D0) frequency fields directly:
+;   [0x278:2] = primary freq, [0x27A:2] = secondary freq
+;   [0x27C..0x27F] = config flags (mod type, CTCSS, bandwidth, etc.)
+;   [0x280:4] = tone code
+;
+; Final: set display pointers [0x128]=&freq_primary, [0x12C]=&freq_secondary
+; ------------------------------------------------------------------------
  8008370:	e92d 5ffc 	stmdb	sp!, {r2, r3, r4, r5, r6, r7, r8, r9, sl, fp, ip, lr}
  8008374:	4605      	mov	r5, r0
  8008376:	468b      	mov	fp, r1
  8008378:	4692      	mov	sl, r2
  800837a:	eb05 0045 	add.w	r0, r5, r5, lsl #1
- 800837e:	4ec4      	ldr	r6, [pc, #784]	@ (0x8008690)                    ; = 0x2000A41C (RAM+0xA41C)
+ 800837e:	4ec4      	ldr	r6, [pc, #784]	@ (0x8008690 ;; display config base @ 0x2000A41C)                    ; = 0x2000A41C (RAM+0xA41C)
  8008380:	eb00 00c5 	add.w	r0, r0, r5, lsl #3
- 8008384:	eb06 04c0 	add.w	r4, r6, r0, lsl #3
+ 8008384:	eb06 04c0 	add.w	r4, r6, r0, lsl #3 ;; r4 = channel entry (88B stride)
  8008388:	2700      	movs	r7, #0
- 800838a:	f884 7140 	strb.w	r7, [r4, #320]	@ 0x140
+ 800838a:	f884 7140 	strb.w	r7, [r4, #320] ;; clear update flag [0x140]	@ 0x140
  800838e:	4628      	mov	r0, r5
- 8008390:	f000 ff76 	bl	0x8009280
+ 8008390:	f000 ff76 	bl	0x8009280 ;; channel_lookup_delayed(index)
  8008394:	f8df 82fc 	ldr.w	r8, [pc, #764]	@ 0x8008694                    ; = 0x2000A8B0 (RAM+0xA8B0)
  8008398:	b3f0      	cbz	r0, 0x8008418
- 800839a:	2d02      	cmp	r5, #2
+ 800839a:	2d02      	cmp	r5, #2 ;; VFO index == 2 → secondary
  800839c:	d051      	beq.n	0x8008442
- 800839e:	2d01      	cmp	r5, #1
+ 800839e:	2d01      	cmp	r5, #1 ;; VFO index == 1 → VFO_B
  80083a0:	d056      	beq.n	0x8008450
  80083a2:	f898 001a 	ldrb.w	r0, [r8, #26]
- 80083a6:	f000 0003 	and.w	r0, r0, #3
+ 80083a6:	f000 0003 	and.w	r0, r0, #3 ;; band = config[26] 80083a6:	f000 0003 	and.w	r0, r0, #3 0x03 (VFO_A)
  80083aa:	f886 0130 	strb.w	r0, [r6, #304]	@ 0x130
  80083ae:	4630      	mov	r0, r6
  80083b0:	f894 1130 	ldrb.w	r1, [r4, #304]	@ 0x130
@@ -13703,7 +14622,7 @@
  80084a6:	f81b 1000 	ldrb.w	r1, [fp, r0]
  80084aa:	f001 020f 	and.w	r2, r1, #15
  80084ae:	0909      	lsrs	r1, r1, #4
- 80084b0:	eb01 0181 	add.w	r1, r1, r1, lsl #2
+ 80084b0:	eb01 0181 	add.w	r1, r1, r1, lsl #2 ;; digit_hi * 10 (BCD decode)
  80084b4:	eb02 0141 	add.w	r1, r2, r1, lsl #1
  80084b8:	5419      	strb	r1, [r3, r0]
  80084ba:	1c40      	adds	r0, r0, #1
@@ -13866,10 +14785,28 @@
 ; ║  Calls: flash_to_display, rf_cal_state_update, uart_byte_send                     ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * flash_display_sync  [DISPLAY/SPI_FLASH] - Syncs flash data to display - calls flash_to_display
+; -- flash_display_sync (tick_delay_common) ------------------------------
+; Channel data sync to display (108B). Calls flash_to_display for all 3
+; VFO channels (VFO_A=0, VFO_B=1, secondary=2), then updates the active
+; band indicator and triggers display refresh.
+;
+; Config source @ 0x2000A516:
+;   [8:9]  = VFO_A channel number (halfword)
+;   [10:11]= VFO_B channel number (halfword)
+;   [12:13]= secondary channel number (halfword)
+;   [0xFA] = active VFO index → selects which channel's band to use
+;
+; After loading all 3 channels:
+;   1. Compute active VFO's display offset: idx*88 (stride calc)
+;   2. Copy band from display_config[idx*88 + 0x130] to RAM+0xA878
+;   3. Call rf_cal_state_update (0x8008714)
+;   4. Based on band: send LCD cmd 0x3C (band 0) or 0x3B (band 1)
+;   5. TAIL-CALL bk4829_spi_write_dispatch → refresh display
+; ------------------------------------------------------------------------
  800869c:	b510      	push	{r4, lr}
  800869e:	4c1a      	ldr	r4, [pc, #104]	@ (0x8008708)                    ; = 0x2000A516 (RAM+0xA516)
- 80086a0:	2101      	movs	r1, #1
- 80086a2:	2000      	movs	r0, #0
+ 80086a0:	2101      	movs	r1, #1 ;; direct_mode = 1
+ 80086a2:	2000      	movs	r0, #0 ;; flash_to_display(VFO_A=0, 1, chan[8])
  80086a4:	8922      	ldrh	r2, [r4, #8]
  80086a6:	f7ff fe63 	bl	0x8008370
  80086aa:	2101      	movs	r1, #1
@@ -13878,7 +14815,7 @@
  80086b0:	f7ff fe5e 	bl	0x8008370
  80086b4:	89a2      	ldrh	r2, [r4, #12]
  80086b6:	2101      	movs	r1, #1
- 80086b8:	2002      	movs	r0, #2
+ 80086b8:	2002      	movs	r0, #2 ;; flash_to_display(secondary=2, 1, chan[12])
  80086ba:	f7ff fe59 	bl	0x8008370
  80086be:	f814 09fa 	ldrb.w	r0, [r4], #-250
  80086c2:	eb04 0140 	add.w	r1, r4, r0, lsl #1
@@ -13894,7 +14831,7 @@
  80086e6:	7820      	ldrb	r0, [r4, #0]
  80086e8:	2801      	cmp	r0, #1
  80086ea:	d00b      	beq.n	0x8008704
- 80086ec:	203c      	movs	r0, #60	@ 0x3c
+ 80086ec:	203c      	movs	r0, #60 ;; LCD cmd 0x3C (band 0 indicator)	@ 0x3c
  80086ee:	4908      	ldr	r1, [pc, #32]	@ (0x8008710)                     ; = 0x2000A3B4 (g_rf_state)
  80086f0:	7849      	ldrb	r1, [r1, #1]
  80086f2:	2901      	cmp	r1, #1
@@ -13902,8 +14839,8 @@
  80086f6:	b2c0      	uxtb	r0, r0
  80086f8:	f01a fabc 	bl	0x8022c74
  80086fc:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 8008700:	f013 bd70 	b.w	0x801c1e4
- 8008704:	203b      	movs	r0, #59	@ 0x3b
+ 8008700:	f013 bd70 	b.w	0x801c1e4 ;; TAIL-CALL bk4829_spi_write_dispatch
+ 8008704:	203b      	movs	r0, #59 ;; LCD cmd 0x3B (band 1 indicator)	@ 0x3b
  8008706:	e7f2      	b.n	0x80086ee
 
 ; --- DATA @ 0x08008708 --------------------------------------------
@@ -13918,20 +14855,37 @@
 ; ║  Calls: memset                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * channel_data_memset  [APPLICATION] - Channel data memset - ←channel_data_refresh, ->memset
+; -- channel_data_memset -------------------------------------------------
+; Active channel snapshot + display refresh trigger (80B).
+; Copies 88 bytes of the active VFO's display config into a working
+; buffer, then conditionally triggers a display refresh.
+;
+; Flow:
+;   1. Read display_config[0xFA] → active VFO index
+;   2. Compute offset: index * 88 (stride = index*(1+1*8)*8 = 88B)
+;   3. memcpy(0x2000A858, &display_config[index*88 + 0x110], 88)
+;      → snapshot active channel's frequency/mode data to working buf
+;   4. If g_rf_state[0x65] == 1 (display refresh requested):
+;      → Copy comparison data from 0x2000A634 to working buf (88B)
+;      → Set g_rf_state[0x64] = 1 (display-pending)
+;      → Clear g_rf_state[0x65] (consume trigger)
+;      → Set g_rf_state[0x67] = 25 (refresh countdown)
+;   5. Else: clear g_rf_state[0x64], TAIL-CALL rf_channel_state_flags
+; ------------------------------------------------------------------------
  8008714:	b570      	push	{r4, r5, r6, lr}
  8008716:	4913      	ldr	r1, [pc, #76]	@ (0x8008764)                     ; = 0x2000A41C (RAM+0xA41C)
- 8008718:	f891 00fa 	ldrb.w	r0, [r1, #250]	@ 0xfa
+ 8008718:	f891 00fa 	ldrb.w	r0, [r1, #250] ;; active VFO index	@ 0xfa
  800871c:	eb00 0240 	add.w	r2, r0, r0, lsl #1
  8008720:	eb02 00c0 	add.w	r0, r2, r0, lsl #3
  8008724:	eb01 01c0 	add.w	r1, r1, r0, lsl #3
  8008728:	f501 7188 	add.w	r1, r1, #272	@ 0x110
- 800872c:	2258      	movs	r2, #88	@ 0x58
- 800872e:	480e      	ldr	r0, [pc, #56]	@ (0x8008768)                     ; = 0x2000A858 (RAM+0xA858)
+ 800872c:	2258      	movs	r2, #88 ;; copy 88 bytes (channel stride)	@ 0x58
+ 800872e:	480e      	ldr	r0, [pc, #56]	@ (0x8008768 ;; working buf @ 0x2000A858)                     ; = 0x2000A858 (RAM+0xA858)
  8008730:	f7f8 fc1d 	bl	0x8000f6e
  8008734:	4c0d      	ldr	r4, [pc, #52]	@ (0x800876c)                     ; = 0x2000A3B4 (g_rf_state)
  8008736:	2500      	movs	r5, #0
  8008738:	f894 0065 	ldrb.w	r0, [r4, #101]	@ 0x65
- 800873c:	2801      	cmp	r0, #1
+ 800873c:	2801      	cmp	r0, #1 ;; display refresh requested?
  800873e:	d005      	beq.n	0x800874c
  8008740:	f884 5064 	strb.w	r5, [r4, #100]	@ 0x64
  8008744:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
@@ -13941,10 +14895,10 @@
  8008750:	4805      	ldr	r0, [pc, #20]	@ (0x8008768)                     ; = 0x2000A858 (RAM+0xA858)
  8008752:	f7f8 fc0c 	bl	0x8000f6e
  8008756:	3464      	adds	r4, #100	@ 0x64
- 8008758:	7065      	strb	r5, [r4, #1]
+ 8008758:	7065      	strb	r5, [r4, #1] ;; clear trigger flag
  800875a:	2001      	movs	r0, #1
- 800875c:	7020      	strb	r0, [r4, #0]
- 800875e:	2019      	movs	r0, #25
+ 800875c:	7020      	strb	r0, [r4, #0] ;; set display-pending flag
+ 800875e:	2019      	movs	r0, #25 ;; refresh countdown = 25
  8008760:	70e0      	strb	r0, [r4, #3]
  8008762:	e7ef      	b.n	0x8008744
 
@@ -14895,28 +15849,47 @@
 ; ║  Calls: memcpy, crc16_update                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * keypad_crc_save  [INPUT] - Keypad CRC save - 120B, ←keypad_audio_handler, ->crc16_update, memcpy
+; -- crc16_update (keypad_crc_save) --------------------------------------
+; CRC16 validation + data frame copy for serial clone protocol (120B).
+; Called by keypad_audio_handler (clone protocol handler).
+;
+; g_flash_config @ 0x2000AF70:
+;   [16] = magic byte (must be 0xA5 for valid frame)
+;   [17] = frame length (2-132 range)
+;   [18] = frame type (5,6 → bulk transfer; else → CRC check)
+;   [0xA1] = frame type copy
+;   [0xA8:0xA9] = running offset (for bulk transfer)
+;   [0xAC:0xAF] = destination pointer (for bulk copy)
+;
+; Flow:
+;   if magic != 0xA5 → return 0
+;   if frame_type ∈ {5,6} → bulk memcpy (128B chunks, advance offset)
+;   else → crc16_update(data+18, length-2) → verify CRC match
+;          if CRC valid AND length > 5 → save trimmed data, return 1
+;          else → return 0
+; ------------------------------------------------------------------------
  8009008:	b570      	push	{r4, r5, r6, lr}
  800900a:	4d1d      	ldr	r5, [pc, #116]	@ (0x8009080)                    ; = 0x2000AF70 (RAM+0xAF70)
- 800900c:	7c28      	ldrb	r0, [r5, #16]
- 800900e:	28a5      	cmp	r0, #165	@ 0xa5
+ 800900c:	7c28      	ldrb	r0, [r5, #16] ;; magic byte
+ 800900e:	28a5      	cmp	r0, #165 ;; must be 0xA5	@ 0xa5
  8009010:	d001      	beq.n	0x8009016
  8009012:	2000      	movs	r0, #0
  8009014:	bd70      	pop	{r4, r5, r6, pc}
- 8009016:	7ca8      	ldrb	r0, [r5, #18]
+ 8009016:	7ca8      	ldrb	r0, [r5, #18] ;; frame type
  8009018:	f885 00a1 	strb.w	r0, [r5, #161]	@ 0xa1
- 800901c:	2805      	cmp	r0, #5
+ 800901c:	2805      	cmp	r0, #5 ;; type 5 → bulk transfer
  800901e:	d00a      	beq.n	0x8009036
- 8009020:	2806      	cmp	r0, #6
+ 8009020:	2806      	cmp	r0, #6 ;; type 6 → bulk transfer
  8009022:	d008      	beq.n	0x8009036
  8009024:	2600      	movs	r6, #0
  8009026:	f8a5 60a8 	strh.w	r6, [r5, #168]	@ 0xa8
  800902a:	7c6c      	ldrb	r4, [r5, #17]
  800902c:	1ea0      	subs	r0, r4, #2
- 800902e:	2884      	cmp	r0, #132	@ 0x84
+ 800902e:	2884      	cmp	r0, #132 ;; max frame length 132	@ 0x84
  8009030:	d30f      	bcc.n	0x8009052
  8009032:	2000      	movs	r0, #0
  8009034:	bd70      	pop	{r4, r5, r6, pc}
- 8009036:	35a8      	adds	r5, #168	@ 0xa8
+ 8009036:	35a8      	adds	r5, #168 ;; -- bulk: r5 = offset struct @ 0xAF70+0xA8	@ 0xa8
  8009038:	2280      	movs	r2, #128	@ 0x80
  800903a:	8829      	ldrh	r1, [r5, #0]
  800903c:	6868      	ldr	r0, [r5, #4]
@@ -14932,7 +15905,7 @@
  8009052:	b281      	uxth	r1, r0
  8009054:	480a      	ldr	r0, [pc, #40]	@ (0x8009080)                     ; = 0x2000AF70 (RAM+0xAF70)
  8009056:	3012      	adds	r0, #18
- 8009058:	f001 fa2e 	bl	0x800a4b8
+ 8009058:	f001 fa2e 	bl	0x800a4b8 ;; → crc16_update(data, length)
  800905c:	1929      	adds	r1, r5, r4
  800905e:	7c0a      	ldrb	r2, [r1, #16]
  8009060:	7c49      	ldrb	r1, [r1, #17]
@@ -16832,15 +17805,42 @@
 ; ║  Called by: main_task_dispatch                                              ║
 ; ║  Calls: memcpy, memset, dma_buffer_config, dac_dma_audio_engine, dac_dma_audio_engine (+2 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * dac_dma_audio_engine [AUDIO] - Large audio engine (11.7KB). Refs DAC + DMA1 + DMA2. Manages audio playback/DMA transfers. Refs g_di...
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: dac_dma_audio_engine(void)                           │
+; │                                                                     │
+; │ Main audio driver called EVERY frame by main_task_dispatch.        │
+; │ Manages DMA buffer refills and audio state transitions.            │
+; │                                                                     │
+; │   if (check_audio_active() != 0) {                                 │
+; │       audio_dma_dispatch();      // refill DMA buffers, swap ptrs  │
+; │       audio_post_process();      // post-playback cleanup          │
+; │   }                                                                 │
+; │                                                                     │
+; │ Sub-function at 0x800A32C - 10-state audio dispatcher:            │
+; │   switch (g_audio_ctrl[8]) {  // @ 0x2000A2F4                     │
+; │       case 0: → audio sub-engine A (0x8009D0C)                    │
+; │       case 1: → audio sub-engine B (0x8022D94)                    │
+; │       case 2: → ... (10 total states)                              │
+; │   }                                                                 │
+; │                                                                     │
+; │ This is the 11.7KB audio engine that includes:                     │
+; │   - DMA buffer management (double-buffering swap)                  │
+; │   - Audio state machine coordination                               │
+; │   - spk_unmute calls for mute/unmute transitions                  │
+; │   - Audio format conversion and mixing                            │
+; │                                                                     │
+; │ ALWAYS RUNS: Even when no audio is playing, this is polled to     │
+; │ detect new audio requests and manage DMA state.                    │
+; └---------------------------------------------------------------------┘
+; * dac_dma_audio_engine [AUDIO] - Main audio driver (11.7KB). DMA buffer management + state dispatch.
  800a314:	b510      	push	{r4, lr}
- 800a316:	f7fd fe0d 	bl	0x8007f34
- 800a31a:	2800      	cmp	r0, #0
+ 800a316:	f7fd fe0d 	bl	0x8007f34 ;; check DMA transfer complete flag
+ 800a31a:	2800      	cmp	r0, #0 ;; if no DMA event pending...
  800a31c:	d005      	beq.n	0x800a32a
- 800a31e:	f000 f84d 	bl	0x800a3bc
+ 800a31e:	f000 f84d 	bl	0x800a3bc ;; process_dma_buffer() - swap+fill next half
  800a322:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 800a326:	f7fd b92b 	b.w	0x8007580
- 800a32a:	bd10      	pop	{r4, pc}
+ 800a326:	f7fd b92b 	b.w	0x8007580 ;; tail-call audio_state_advance()
+ 800a32a:	bd10      	pop	{r4, pc} ;; ...return (no audio work this frame)
  800a32c:	b510      	push	{r4, lr}
  800a32e:	4822      	ldr	r0, [pc, #136]	@ (0x800a3b8)                    ; = 0x2000A2EC (RAM+0xA2EC)
  800a330:	6880      	ldr	r0, [r0, #8]
@@ -16890,75 +17890,121 @@
 ; ║  Called by: dac_dma_audio_engine                                              ║
 ; ║  Calls: lcd_bk4829_init_seq, printf_handler, memset, audio_dma_dispatch, dma2_clear_irq_flags (+121 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_dma_dispatch  [AUDIO/DMA] - Audio DMA state dispatcher - 134B, called by dac_dma_audio_engine
- 800a3bc:	b510      	push	{r4, lr}
- 800a3be:	4820      	ldr	r0, [pc, #128]	@ (0x800a440)                    ; = 0x2000A2EC (RAM+0xA2EC)
- 800a3c0:	6840      	ldr	r0, [r0, #4]
- 800a3c2:	280a      	cmp	r0, #10
- 800a3c4:	d237      	bcs.n	0x800a436
- 800a3c6:	e8df f000 	tbb	[pc, r0]
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_dma_dispatch(void)                             │
+; │                                                                     │
+; │ Central audio pipeline dispatcher - routes to 10+ handlers based   │
+; │ on audio state. Called by dac_dma_audio_engine every frame.        │
+; │                                                                     │
+; │   state = g_audio_ctrl[4];  // @ 0x2000A2EC + 4 (word at +4)     │
+; │   if (state >= 10) goto default_handler;                           │
+; │                                                                     │
+; │   switch (state) {  // tbb dispatch table                          │
+; │   case 0: audio_dma_rf_sync();           → RF audio sync          │
+; │           audio_dma_lcd_sub();           break;                    │
+; │   case 1: bk4829_spi_delay();            → BK4829 SPI timing      │
+; │           channel_field_dispatch();      break;                    │
+; │   case 2: audio_dma_display_update();    → display update          │
+; │           bk4829_af_path();             break;                    │
+; │   case 3: (gap handler)                  break;                    │
+; │   case 4: audio_usart1_codec();          → codec setup             │
+; │           sideport_detect_and_mute();   break; // ← CALLS MUTE!  │
+; │   case 5: audio_monitor_dispatch();     break;                    │
+; │   case 6: spk_unmute_check();            → UNMUTE CHECK           │
+; │           audio_state_review();         break;                    │
+; │   case 7: audio_dma_lcd_sync();         → LCD sync                │
+; │           lcd_audio_data();             break;                    │
+; │   case 8: (tail-call to 0x80039A4)     break;                    │
+; │   default: dac_dma_sub_engine();        break;                    │
+; │   }                                                                 │
+; │                                                                     │
+; │ KEY: State 6 calls spk_unmute which manages the beep mute/unmute  │
+; │ NOTE: The actual tbb byte table maps states as follows:            │
+; │   State 0: → dac_dma_audio_engine (default/catchall)              │
+; │   State 1: audio_dma_rf_sync → lcd_sub_dispatch                   │
+; │   State 2: → bk4829_spi_timing                                    │
+; │   State 3: audio_dma_display_update → bk4829_af_path              │
+; │   State 4: display_mode_check → sideport_detect_and_mute (MUTE)   │
+; │   State 5: lcd_color_fill → audio_monitor_dispatch                 │
+; │   State 6: null_stub → [conditional rf_sync] → rf_channel_config   │
+; │   State 7: audio_dma_lcd_sync → bt_protocol_handler                │
+; │   State 8: return (NOP)                                            │
+; │   State 9: → tail-call dispatch (0x80039A4)                        │
+; │   ≥ 10:   → dac_dma_audio_engine (same as state 0)                │
+; │ transition. This is how audio_dma_dispatch triggers spk_unmute.    │
+; │                                                                     │
+; │ There is a SECOND dispatcher at 0x0800A444 with similar structure  │
+; │ (g_audio_ctrl[12], also 10 cases) - handles sub-states.           │
+; └---------------------------------------------------------------------┘
+; * audio_dma_dispatch  [AUDIO/DMA] - Central audio pipeline dispatcher (10-state, tbb)
+ 800a3bc:	b510      	push	{r4, lr} ;; -- AUDIO_DMA_DISPATCH: central audio pipeline --
+ 800a3be:	4820      	ldr	r0, [pc, #128]	@ (0x800a440)                    ; = 0x2000A2EC (RAM+0xA2EC) ;; r0 = g_audio_ctrl @ 0x2000A2EC
+ 800a3c0:	6840      	ldr	r0, [r0, #4] ;; r0 = g_audio_ctrl[4] (pipeline state)
+ 800a3c2:	280a      	cmp	r0, #10 ;; if state >= 10 → default
+ 800a3c4:	d237      	bcs.n	0x800a436 ;; state >= 10 → dac_dma_audio_engine (mid-entry)
+ 800a3c6:	e8df f000 	tbb	[pc, r0] ;; -- TBB DISPATCH: 10 pipeline states --
  800a3ca:	0536      	lsls	r6, r6, #20
  800a3cc:	0f0b      	lsrs	r3, r1, #28
  800a3ce:	1b15      	subs	r5, r2, r4
  800a3d0:	2c21      	cmp	r4, #33	@ 0x21
  800a3d2:	323a      	adds	r2, #58	@ 0x3a
- 800a3d4:	f014 fae6 	bl	0x801e9a4
+ 800a3d4:	f014 fae6 	bl	0x801e9a4 ;; -- STATE 1: audio_dma_rf_sync() --
  800a3d8:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a3dc:	f017 be12 	b.w	0x8022004
- 800a3e0:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
+ 800a3e0:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- STATE 2: bk4829_spi_timing --
  800a3e4:	f00f bb86 	b.w	0x8019af4
- 800a3e8:	f017 fde2 	bl	0x8021fb0
+ 800a3e8:	f017 fde2 	bl	0x8021fb0 ;; -- STATE 3: audio_dma_display_update() --
  800a3ec:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a3f0:	f010 be10 	b.w	0x801b014
- 800a3f4:	f009 fff4 	bl	0x80143e0
+ 800a3f4:	f009 fff4 	bl	0x80143e0 ;; -- STATE 4: display_mode_check() --
  800a3f8:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 800a3fc:	f003 b948 	b.w	0x800d690                                       ; -> sideport_detect_and_mute
- 800a400:	f006 f926 	bl	0x8010650
+ 800a3fc:	f003 b948 	b.w	0x800d690                                       ; -> sideport_detect_and_mute ;; tail-call sideport_detect_and_mute() ← MUTE TRIGGER
+ 800a400:	f006 f926 	bl	0x8010650 ;; -- STATE 5: lcd_color_fill() --
  800a404:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a408:	f007 bd7c 	b.w	0x8011f04
- 800a40c:	f7fe f9e2 	bl	0x80087d4
+ 800a40c:	f7fe f9e2 	bl	0x80087d4 ;; -- STATE 6: null_stub() - conditional RF sync --
  800a410:	b108      	cbz	r0, 0x800a416
- 800a412:	f014 fac7 	bl	0x801e9a4
- 800a416:	f7fc f86f 	bl	0x80064f8
+ 800a412:	f014 fac7 	bl	0x801e9a4 ;; if non-zero: audio_dma_rf_sync()
+ 800a416:	f7fc f86f 	bl	0x80064f8 ;; rf_channel_config()
  800a41a:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a41e:	f7fe bcb1 	b.w	0x8008d84
- 800a422:	f017 fe0f 	bl	0x8022044
+ 800a422:	f017 fe0f 	bl	0x8022044 ;; -- STATE 7: audio_dma_lcd_sync() --
  800a426:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 800a42a:	f017 bf4d 	b.w	0x80222c8
- 800a42e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
+ 800a42a:	f017 bf4d 	b.w	0x80222c8 ;; tail-call bt_protocol_handler()
+ 800a42e:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- STATE 9: tail-call dispatch --
  800a432:	f7f9 bab7 	b.w	0x80039a4
- 800a436:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 800a43a:	f7ff bf77 	b.w	0x800a32c
- 800a43e:	bd10      	pop	{r4, pc}
+ 800a436:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- STATE 0 + DEFAULT (≥10): dac engine --
+ 800a43a:	f7ff bf77 	b.w	0x800a32c ;; tail-call dac_dma_audio_engine+0x18
+ 800a43e:	bd10      	pop	{r4, pc} ;; -- STATE 8: return (NOP) --
  800a440:	a2ec      	add	r2, pc, #944	@ (adr r2, 0x800a7f4)
  800a442:	2000      	movs	r0, #0
- 800a444:	b510      	push	{r4, lr}
+ 800a444:	b510      	push	{r4, lr} ;; -- AUDIO_DMA_DISPATCH_2: sub-state pipeline --
  800a446:	481b      	ldr	r0, [pc, #108]	@ (0x800a4b4)                    ; = 0x2000A2EC (RAM+0xA2EC)
- 800a448:	68c0      	ldr	r0, [r0, #12]
- 800a44a:	280a      	cmp	r0, #10
+ 800a448:	68c0      	ldr	r0, [r0, #12] ;; r0 = g_audio_ctrl[12] (sub-state)
+ 800a44a:	280a      	cmp	r0, #10 ;; if sub-state >= 10 → return
  800a44c:	d231      	bcs.n	0x800a4b2
- 800a44e:	e8df f000 	tbb	[pc, r0]
+ 800a44e:	e8df f000 	tbb	[pc, r0] ;; -- TBB: 10-entry sub-state dispatch --
  800a452:	0530      	lsls	r0, r6, #20
  800a454:	130b      	asrs	r3, r1, #12
  800a456:	1730      	asrs	r0, r6, #28
  800a458:	211b      	movs	r1, #27
  800a45a:	2a26      	cmp	r2, #38	@ 0x26
- 800a45c:	f7fc fbd6 	bl	0x8006c0c
+ 800a45c:	f7fc fbd6 	bl	0x8006c0c ;; -- SUB-STATE 1: rf_cal_init() --
  800a460:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a464:	f7ff babe 	b.w	0x80099e4
- 800a468:	20a3      	movs	r0, #163	@ 0xa3
+ 800a468:	20a3      	movs	r0, #163	@ 0xa3 ;; -- SUB-STATE 2: BK4829 cmd(0xA3) --
  800a46a:	f00f fc02 	bl	0x8019c72
  800a46e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a472:	20a1      	movs	r0, #161	@ 0xa1
  800a474:	f00f bbfd 	b.w	0x8019c72
- 800a478:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
+ 800a478:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- SUB-STATE 3: RF timing dispatch --
  800a47c:	f7fd babc 	b.w	0x80079f8
- 800a480:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
+ 800a480:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- SUB-STATE 5: channel update --
  800a484:	f002 bd0c 	b.w	0x800cea0
- 800a488:	f7fc fbc0 	bl	0x8006c0c
+ 800a488:	f7fc fbc0 	bl	0x8006c0c ;; -- SUB-STATE 6: rf_cal_init() (repeat) --
  800a48c:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a490:	f7ff baa8 	b.w	0x80099e4
- 800a494:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
+ 800a494:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- SUB-STATE 7: BK4829 cmd(0xA1) --
  800a498:	20a1      	movs	r0, #161	@ 0xa1
  800a49a:	f00f bbea 	b.w	0x8019c72
  800a49e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
@@ -16966,7 +18012,7 @@
  800a4a6:	f002 fcfb 	bl	0x800cea0
  800a4aa:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800a4ae:	f017 bd6b 	b.w	0x8021f88
- 800a4b2:	bd10      	pop	{r4, pc}
+ 800a4b2:	bd10      	pop	{r4, pc} ;; -- STATES 0,4,≥10: return (NOP) --
  800a4b4:	a2ec      	add	r2, pc, #944	@ (adr r2, 0x800a868)
  800a4b6:	2000      	movs	r0, #0
 ; ╔══════════════════════════════════════════════════════════════════════╗
@@ -17001,6 +18047,18 @@
  800a4f0:	428b      	cmp	r3, r1
  800a4f2:	d3ea      	bcc.n	0x800a4ca
  800a4f4:	bdf0      	pop	{r4, r5, r6, r7, pc}
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: dac_init(void)                                         │
+; │   Called once at boot by hw_init_main.                              │
+; │                                                                     │
+; │   struct dac_cfg cfg = {0,0,0,0};  // zero 4 words on stack        │
+; │   dma_init_helper(&cfg);           // @ 0x0800A584                  │
+; │   dac_enable(bit=16, enable=1);    // DAC_CTRL |= (1<<16) = EN2    │
+; │                                                                     │
+; │   NOTE: Only enables DAC Channel 2 (PA5). Channel 1 (PA4) is       │
+; │   enabled later by beep_play → dac_enable(0, 1).                    │
+; │   EN2 is NEVER disabled - stays on forever in OEM firmware.         │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  dac_init                                                        ║
 ; ║  0x0800A4F6  size=18                                            ║
@@ -17008,13 +18066,26 @@
 ; ║  Called by: hw_init_main                                              ║
 ; ║  Calls: dac_enable, tim6_dac_dma_init                                     ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
- 800a4f6:	b51f      	push	{r0, r1, r2, r3, r4, lr}
- 800a4f8:	4668      	mov	r0, sp
- 800a4fa:	f000 f843 	bl	0x800a584
+ 800a4f6:	b51f      	push	{r0, r1, r2, r3, r4, lr} ;; push 4 words → zero-init stack space
+ 800a4f8:	4668      	mov	r0, sp ;; r0 = ptr to zero-init dac_cfg struct
+ 800a4fa:	f000 f843 	bl	0x800a584 ;; dma_init_helper(&zero_cfg) - DMA2 for DAC
  800a4fe:	2101      	movs	r1, #1
- 800a500:	2010      	movs	r0, #16
- 800a502:	f000 f801 	bl	0x800a508                                        ; dac_enable
- 800a506:	bd1f      	pop	{r0, r1, r2, r3, r4, pc}
+ 800a500:	2010      	movs	r0, #16 ;; bit_pos = 16 = DAC_CR.EN2 (Channel 2, PA5)
+ 800a502:	f000 f801 	bl	0x800a508                                        ; dac_enable ;; dac_enable(16, 1) → DAC_CR |= (1<<16) = enable CH2
+ 800a506:	bd1f      	pop	{r0, r1, r2, r3, r4, pc} ;; CH2 now active on PA5 (RF audio output)
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: dac_enable(uint8_t bit_pos, uint8_t enable)            │
+; │   Generic read-modify-write on DAC_CTRL (0x40007400).              │
+; │                                                                     │
+; │   mask = 1 << bit_pos;                                              │
+; │   if (enable)                                                       │
+; │       DAC_CTRL |= mask;    // Set bit                               │
+; │   else                                                              │
+; │       DAC_CTRL &= ~mask;   // Clear bit                             │
+; │                                                                     │
+; │   Called with: (0,1) = set EN1,  (0,0) = clear EN1                 │
+; │               (16,1) = set EN2, (16,0) = clear EN2                 │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  dac_enable                                                          ║
 ; ║  0x0800A508  size=26                                            ║
@@ -17040,6 +18111,17 @@
   0x0800A520: 70 47 00 00 00 74 00 40 06 4B 9A 14 82 40 00 29  |pG...t.@.K...@.)| [+4] 0x40007400=DAC
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: dac_dma_enable(uint8_t channel, uint8_t enable)        │
+; │   Enables/disables DMA for a DAC channel.                           │
+; │                                                                     │
+; │   // Clever bit trick: 0x40007400 >> 18 = 0x1000 (bit 12)         │
+; │   mask = 0x1000 << channel;  // ch0→bit12(DMAEN1), ch1→bit28      │
+; │   if (enable)                                                       │
+; │       DAC_CTRL |= mask;                                             │
+; │   else                                                              │
+; │       DAC_CTRL &= ~mask;                                            │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  dac_dma_enable                                                      ║
 ; ║  0x0800A528  size=26                                            ║
@@ -17065,6 +18147,20 @@
   0x0800A540: 70 47 00 00 00 74 00 40 30 B5 08 4C 23 68 40 F6  |pG...t.@0..L#h@.| [+4] 0x40007400=DAC
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: dac_dma_timer_config(uint8_t channel, uint32_t cfg[4]) │
+; │   Configures DAC_CTRL bits [11:1] for a channel.                    │
+; │                                                                     │
+; │   mask = 0xFFE << channel;   // bits 1-11 for ch0                  │
+; │   old = DAC_CTRL & ~mask;    // preserve EN, DMAEN, EN2            │
+; │   new_bits = cfg[0] | cfg[1] | cfg[2] | cfg[3];                   │
+; │   DAC_CTRL = old | (new_bits << channel);                          │
+; │                                                                     │
+; │   Called by tim6_dac_dma_init with cfg = {4, 0, 0, 2}:             │
+; │     4|0|0|2 = 6 = BOFF1(bit1) + TEN1(bit2)                        │
+; │     TSEL1 = 000 = TIM6 TRGO trigger (bits 3-5 = 0)                │
+; │   Result: DAC_CTRL bits[11:1] = 0x006 = BOFF1+TEN1+TIM6_TRGO     │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  tim6_dac_dma_init                                                        ║
 ; ║  0x0800A548  size=36                                            ║
@@ -17144,13 +18240,13 @@
 ; ║  Called by: beep_play, display_tx_status                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * dma_irq_clear  [DMA] - DMA interrupt flag clear - 16B, refs DMA1+DMA2
- 800a614:	00c1      	lsls	r1, r0, #3
- 800a616:	d502      	bpl.n	0x800a61e
- 800a618:	4902      	ldr	r1, [pc, #8]	@ (0x800a624)                      ; = 0x40020404
- 800a61a:	6008      	str	r0, [r1, #0]
+ 800a614:	00c1      	lsls	r1, r0, #3 ;; -- DMA_IRQ_CLEAR: r1=r0<<3, test bit 28 for DMA1 vs DMA2 --
+ 800a616:	d502      	bpl.n	0x800a61e ;; if bit 28 clear → DMA1 path
+ 800a618:	4902      	ldr	r1, [pc, #8]	@ (0x800a624)                      ; = 0x40020404 ;; DMA2_CLR register @ 0x40020404
+ 800a61a:	6008      	str	r0, [r1, #0] ;; DMA2->CLR = flag_bits (clear DMA2 IRQ flags)
  800a61c:	4770      	bx	lr
- 800a61e:	4902      	ldr	r1, [pc, #8]	@ (0x800a628)                      ; = 0x40020000 (DMA1)
- 800a620:	6048      	str	r0, [r1, #4]
+ 800a61e:	4902      	ldr	r1, [pc, #8]	@ (0x800a628)                      ; = 0x40020000 (DMA1) ;; DMA1 base @ 0x40020000
+ 800a620:	6048      	str	r0, [r1, #4] ;; DMA1->CLR (offset +4) = flag_bits
  800a622:	4770      	bx	lr
 
 ; --- DATA @ 0x0800A624 --------------------------------------------
@@ -17163,12 +18259,12 @@
 ; ║  * dma2_clear_irq_flags  [DMA]                                          ║
 ; ║  Called by: dma2_clear_irq_flags                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
- 800a62c:	00c1      	lsls	r1, r0, #3
+ 800a62c:	00c1      	lsls	r1, r0, #3 ;; -- DMA2_CLEAR_IRQ_FLAGS: same logic as above, used during init --
  800a62e:	d502      	bpl.n	0x800a636
- 800a630:	4902      	ldr	r1, [pc, #8]	@ (0x800a63c)                      ; = 0x40020404
+ 800a630:	4902      	ldr	r1, [pc, #8]	@ (0x800a63c)                      ; = 0x40020404 ;; DMA2->CLR @ 0x40020404
  800a632:	6008      	str	r0, [r1, #0]
  800a634:	4770      	bx	lr
- 800a636:	4902      	ldr	r1, [pc, #8]	@ (0x800a640)                      ; = 0x40020000 (DMA1)
+ 800a636:	4902      	ldr	r1, [pc, #8]	@ (0x800a640)                      ; = 0x40020000 (DMA1) ;; DMA1 base @ 0x40020000
  800a638:	6048      	str	r0, [r1, #4]
  800a63a:	4770      	bx	lr
 
@@ -17183,11 +18279,11 @@
 ; ║  * dma_channel_enable  [DMA]                                          ║
 ; ║  Called by: peripheral_init, tim6_dac_dma_init                                ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
- 800a644:	2100      	movs	r1, #0
- 800a646:	6001      	str	r1, [r0, #0]
- 800a648:	6041      	str	r1, [r0, #4]
- 800a64a:	6081      	str	r1, [r0, #8]
- 800a64c:	60c1      	str	r1, [r0, #12]
+ 800a644:	2100      	movs	r1, #0 ;; -- DMA_CHANNEL_ENABLE: zero-init all DMA channel registers --
+ 800a646:	6001      	str	r1, [r0, #0] ;; DMA_CHx->CTRL = 0 (disable channel)
+ 800a648:	6041      	str	r1, [r0, #4] ;; DMA_CHx->DTCNT = 0 (transfer count)
+ 800a64a:	6081      	str	r1, [r0, #8] ;; DMA_CHx->PADDR = 0 (peripheral addr)
+ 800a64c:	60c1      	str	r1, [r0, #12] ;; DMA_CHx->MADDR = 0 (memory addr)
  800a64e:	6101      	str	r1, [r0, #16]
  800a650:	6141      	str	r1, [r0, #20]
  800a652:	6181      	str	r1, [r0, #24]
@@ -17195,7 +18291,7 @@
  800a656:	6201      	str	r1, [r0, #32]
  800a658:	6241      	str	r1, [r0, #36]	@ 0x24
  800a65a:	6281      	str	r1, [r0, #40]	@ 0x28
- 800a65c:	4770      	bx	lr
+ 800a65c:	4770      	bx	lr ;; return - channel fully reset
 
 ; --- DATA @ 0x0800A65E --------------------------------------------
   0x0800A650: 41 61 81 61 C1 61 01 62 41 62 81 62 70 47 00 00  |Aa.a.a.bAb.bpG..|
@@ -17206,14 +18302,14 @@
 ; ║  0x0800A660  size=26                                            ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * dma_status_read  [DMA] - DMA status register read - 26B, refs DMA1+DMA2
- 800a660:	4602      	mov	r2, r0
- 800a662:	2000      	movs	r0, #0
- 800a664:	00d1      	lsls	r1, r2, #3
- 800a666:	d502      	bpl.n	0x800a66e
- 800a668:	4904      	ldr	r1, [pc, #16]	@ (0x800a67c)                     ; = 0x40020400 (DMA2)
+ 800a660:	4602      	mov	r2, r0 ;; -- DMA_STATUS_READ: check if DMA flag is set --
+ 800a662:	2000      	movs	r0, #0 ;; default return = 0 (not set)
+ 800a664:	00d1      	lsls	r1, r2, #3 ;; test bit 28 for DMA1 vs DMA2 select
+ 800a666:	d502      	bpl.n	0x800a66e ;; bit 28 clear → DMA1
+ 800a668:	4904      	ldr	r1, [pc, #16]	@ (0x800a67c)                     ; = 0x40020400 (DMA2) ;; DMA2 STS register @ 0x40020400
  800a66a:	6809      	ldr	r1, [r1, #0]
  800a66c:	e001      	b.n	0x800a672
- 800a66e:	4904      	ldr	r1, [pc, #16]	@ (0x800a680)                     ; = 0x40020000 (DMA1)
+ 800a66e:	4904      	ldr	r1, [pc, #16]	@ (0x800a680)                     ; = 0x40020000 (DMA1) ;; DMA1 STS register @ 0x40020000
  800a670:	6809      	ldr	r1, [r1, #0]
  800a672:	4211      	tst	r1, r2
  800a674:	d000      	beq.n	0x800a678
@@ -17230,7 +18326,25 @@
 ; ║  0x0800A684  size=20                                            ║
 ; ║  Called by: peripheral_init, beep_play, tim6_dac_dma_init, display_tx_status       ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * reg_bit_set [UTIL] - Register bit set (20B, 4 callers). Atomic bit-set on memory-mapped register.
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: reg_bit_modify(volatile uint32_t *reg,               │
+; │                              uint32_t mask, uint8_t set)           │
+; │                                                                     │
+; │   if (set != 0) { *reg |= mask; }   // set bits                   │
+; │   else           { *reg &= ~mask; }  // clear bits                 │
+; │                                                                     │
+; │ AUDIO USAGE - called by tim6_dac_dma_init with:                    │
+; │   reg_bit_modify(&DMA2_CH3->CCR, 0x02, 1)                         │
+; │   = DMA2_CH3_CCR |= 2  → sets bit 1 = TCIE                       │
+; │   TCIE = Transfer Complete Interrupt Enable                        │
+; │   This enables DMA TC interrupt for double-buffer swap in ISR.     │
+; │                                                                     │
+; │ NOTE: On AT32F403A, DMA2_CH3 is shared between:                   │
+; │   UART4_RX, TIM6_UP, DAC_CH1, TIM8_CH1                            │
+; │   No explicit MUX/flex select seen - hardware routes based on      │
+; │   which peripheral's DMA request is active.                        │
+; └---------------------------------------------------------------------┘
+; * reg_bit_modify [UTIL] - Conditional bit set/clear on memory-mapped register
  800a684:	2a00      	cmp	r2, #0
  800a686:	d003      	beq.n	0x800a690
  800a688:	6802      	ldr	r2, [r0, #0]
@@ -20534,24 +21648,52 @@
 ; ║  Calls: rf_info_display, freq_string_format, rf_freq_string_compare, display_text_render, display_get_params (+2 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * freq_format_display [DISPLAY] - Frequency format/display (750B, 13 callers). Formats and renders frequency values.
+; -- freq_format_display -------------------------------------------------
+; Frequency format and display renderer (750B, 13 callers). Formats
+; frequency values from channel data and renders them to the LCD screen
+; with proper digit grouping, decimal point, and unit indicators.
+;
+; r0 = VFO index (0=A, 1=B, 2=secondary)
+; r1 = mode (0=normal freq display, non-0=alternate display)
+;
+; Y-position calculation by VFO and mode:
+;   g_rf_state[0x51] != 0 (dual-VFO display):
+;     VFO_A (r7=0): y=0, VFO_B (r7=1): y=90 (0x5A), else: y=180 (0xB4)
+;   g_rf_state[0x51] == 0 (single-VFO display):
+;     VFO_A: y=0, VFO_B: y=89 (0x59), else: y=178 (0xB2)
+;
+; Display layout (per VFO, at y offset r4):
+;   1. Clear background rectangle (240×49 pixels, bg color from display_get_params)
+;   2. Call freq_string_format(vfo, mode) → format digits
+;   3. Read display_config[vfo*88 + 0x131] → flag for special display
+;   4. If flag set and param==0x105: render "scanning" text from flash 0x0803B0FA
+;      else: render frequency string from flash 0x0803B034
+;   5. Render modulation type indicator (FM/AM/SSB)
+;   6. Render CTCSS/DCS tone value
+;   7. Render signal strength bar
+;   8. Render channel number / memory label
+;
+; Coordinate constants: LCD is 240 pixels wide, text at y+28, y+49
+; Font: 11px tall numeric, 9px wide per digit
+; ------------------------------------------------------------------------
  800c774:	e92d 47ff 	stmdb	sp!, {r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, sl, lr}
  800c778:	4607      	mov	r7, r0
  800c77a:	460e      	mov	r6, r1
  800c77c:	4638      	mov	r0, r7
  800c77e:	f007 f8a3 	bl	0x80138c8
  800c782:	4605      	mov	r5, r0
- 800c784:	f8df 92dc 	ldr.w	r9, [pc, #732]	@ 0x800ca64                    ; = 0x2000A3B4 (g_rf_state)
- 800c788:	f899 0051 	ldrb.w	r0, [r9, #81]	@ 0x51
+ 800c784:	f8df 92dc 	ldr.w	r9, [pc, #732]	@ 0x800ca64 ;; g_rf_state @ 0x2000A3B4                    ; = 0x2000A3B4 (g_rf_state)
+ 800c788:	f899 0051 	ldrb.w	r0, [r9, #81] ;; g_rf_state[0x51] = dual-VFO flag	@ 0x51
  800c78c:	b148      	cbz	r0, 0x800c7a2
  800c78e:	b926      	cbnz	r6, 0x800c79a
  800c790:	b11f      	cbz	r7, 0x800c79a
  800c792:	2f01      	cmp	r7, #1
  800c794:	d003      	beq.n	0x800c79e
- 800c796:	24b4      	movs	r4, #180	@ 0xb4
+ 800c796:	24b4      	movs	r4, #180 ;; y = 180 (VFO 2, dual mode)	@ 0xb4
  800c798:	e008      	b.n	0x800c7ac
  800c79a:	2400      	movs	r4, #0
  800c79c:	e006      	b.n	0x800c7ac
- 800c79e:	245a      	movs	r4, #90	@ 0x5a
+ 800c79e:	245a      	movs	r4, #90 ;; y = 90 (VFO_B, dual mode)	@ 0x5a
  800c7a0:	e004      	b.n	0x800c7ac
  800c7a2:	bb5e      	cbnz	r6, 0x800c7fc
  800c7a4:	b357      	cbz	r7, 0x800c7fc
@@ -20562,7 +21704,7 @@
  800c7ae:	e9cd 0500 	strd	r0, r5, [sp]
  800c7b2:	f104 0331 	add.w	r3, r4, #49	@ 0x31
  800c7b6:	f104 021c 	add.w	r2, r4, #28
- 800c7ba:	21f0      	movs	r1, #240	@ 0xf0
+ 800c7ba:	21f0      	movs	r1, #240 ;; width = 240px (full LCD width)	@ 0xf0
  800c7bc:	2000      	movs	r0, #0
  800c7be:	f008 fbab 	bl	0x8014f18
  800c7c2:	2200      	movs	r2, #0
@@ -20572,13 +21714,13 @@
  800c7cc:	eb07 0047 	add.w	r0, r7, r7, lsl #1
  800c7d0:	eb00 01c7 	add.w	r1, r0, r7, lsl #3
  800c7d4:	48a4      	ldr	r0, [pc, #656]	@ (0x800ca68)                    ; = 0x2000A41C (RAM+0xA41C)
- 800c7d6:	f240 1805 	movw	r8, #261	@ 0x105
+ 800c7d6:	f240 1805 	movw	r8, #261 ;; 0x105 = scanning mode flag	@ 0x105
  800c7da:	eb00 06c1 	add.w	r6, r0, r1, lsl #3
  800c7de:	f896 0131 	ldrb.w	r0, [r6, #305]	@ 0x131
  800c7e2:	b1c0      	cbz	r0, 0x800c816
  800c7e4:	4545      	cmp	r5, r8
  800c7e6:	d10d      	bne.n	0x800c804
- 800c7e8:	48a0      	ldr	r0, [pc, #640]	@ (0x800ca6c)                    ; = 0x0803B0FA (flash+0x3B0FA)
+ 800c7e8:	48a0      	ldr	r0, [pc, #640]	@ (0x800ca6c ;; "scanning" text @ flash 0x0803B0FA)                    ; = 0x0803B0FA (flash+0x3B0FA)
  800c7ea:	9000      	str	r0, [sp, #0]
  800c7ec:	230b      	movs	r3, #11
  800c7ee:	2209      	movs	r2, #9
@@ -20590,7 +21732,7 @@
  800c7fe:	e7d5      	b.n	0x800c7ac
  800c800:	2459      	movs	r4, #89	@ 0x59
  800c802:	e7d3      	b.n	0x800c7ac
- 800c804:	489a      	ldr	r0, [pc, #616]	@ (0x800ca70)                    ; = 0x0803B034 (flash+0x3B034)
+ 800c804:	489a      	ldr	r0, [pc, #616]	@ (0x800ca70 ;; freq string @ flash 0x0803B034)                    ; = 0x0803B034 (flash+0x3B034)
  800c806:	9000      	str	r0, [sp, #0]
  800c808:	230b      	movs	r3, #11
  800c80a:	2209      	movs	r2, #9
@@ -21516,31 +22658,48 @@
 ; ║  Called by: main_task_dispatch                                              ║
 ; ║  Calls: tick_delay_check, radio_main_handler                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * radio_main_handler [APPLICATION] - Massive radio control handler (28.4KB). Refs ALL GPIO ports + ALL RAM structs. Core radio state mach...
- 800d1a4:	b510      	push	{r4, lr}
- 800d1a6:	6841      	ldr	r1, [r0, #4]
- 800d1a8:	2913      	cmp	r1, #19
+; * radio_main_handler [APPLICATION] - Radio sub-mode dispatcher (28.4KB total, dispatcher is ~164B).
+;; RADIO_MAIN_HANDLER - Sub-mode router for main_task_dispatch mode 7
+;;
+;; Dispatches on sp[4] (sub-mode within radio mode 7):
+;;   sub  8: lcd_status_refresh()        - refresh LCD status
+;;   sub 16: display_cmd(sp[0])          - display command from stack
+;;   sub 17: display_cmd(0x41)           - display command 0x41
+;;   sub 18: display_cmd(0x44)           - display command 0x44
+;;   sub 19: display_cmd(0x42)           - display command 0x42
+;;   sub 21: display_cmd(0x43)           - display command 0x43
+;;   sub 23: display_cmd(0x2A)           - display command 0x2A
+;;   sub 24: display_cmd(0x23)           - display command 0x23
+;;   sub 105 (0x69): data_display_copy() + tick_delay_check(3)
+;;   default: return (no action)
+;;
+;; Most sub-modes tail-call display_cmd @ 0x08014064 (embedded in data blob)
+;; with different command codes. The display_cmd function appears to handle
+;; SPI2-based LCD/display commands for the radio UI.
+ 800d1a4:	b510      	push	{r4, lr} ;; -- RADIO SUB-MODE DISPATCHER --
+ 800d1a6:	6841      	ldr	r1, [r0, #4] ;; r1 = sp[4] (sub-mode code)
+ 800d1a8:	2913      	cmp	r1, #19 ;; sub-mode 19?
  800d1aa:	d03a      	beq.n	0x800d222
  800d1ac:	dc0c      	bgt.n	0x800d1c8
- 800d1ae:	2908      	cmp	r1, #8
+ 800d1ae:	2908      	cmp	r1, #8 ;; sub-mode 8? → lcd_status_refresh
  800d1b0:	d045      	beq.n	0x800d23e
- 800d1b2:	2910      	cmp	r1, #16
+ 800d1b2:	2910      	cmp	r1, #16 ;; sub-mode 16? → display_cmd(sp[0])
  800d1b4:	d021      	beq.n	0x800d1fa
- 800d1b6:	2911      	cmp	r1, #17
+ 800d1b6:	2911      	cmp	r1, #17 ;; sub-mode 17? → display_cmd(0x41)
  800d1b8:	d02e      	beq.n	0x800d218
- 800d1ba:	2912      	cmp	r1, #18
+ 800d1ba:	2912      	cmp	r1, #18 ;; sub-mode 18? → display_cmd(0x44)
  800d1bc:	d143      	bne.n	0x800d246
  800d1be:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800d1c2:	2044      	movs	r0, #68	@ 0x44
- 800d1c4:	f006 bf4e 	b.w	0x8014064
- 800d1c8:	2915      	cmp	r1, #21
+ 800d1c4:	f006 bf4e 	b.w	0x8014064 ;; TAIL: display_cmd(0x44)
+ 800d1c8:	2915      	cmp	r1, #21 ;; sub-mode 21? → display_cmd(0x43)
  800d1ca:	d02f      	beq.n	0x800d22c
- 800d1cc:	2917      	cmp	r1, #23
+ 800d1cc:	2917      	cmp	r1, #23 ;; sub-mode 23? → display_cmd(0x2A)
  800d1ce:	d019      	beq.n	0x800d204
- 800d1d0:	2918      	cmp	r1, #24
+ 800d1d0:	2918      	cmp	r1, #24 ;; sub-mode 24? → display_cmd(0x23)
  800d1d2:	d01c      	beq.n	0x800d20e
- 800d1d4:	2969      	cmp	r1, #105	@ 0x69
- 800d1d6:	d136      	bne.n	0x800d246
+ 800d1d4:	2969      	cmp	r1, #105	@ 0x69 ;; sub-mode 105 (0x69)? → data copy + delay
+ 800d1d6:	d136      	bne.n	0x800d246 ;; default: return (no action)
  800d1d8:	491b      	ldr	r1, [pc, #108]	@ (0x800d248)                    ; = 0x2000A360 (RAM+0xA360)
  800d1da:	6848      	ldr	r0, [r1, #4]
  800d1dc:	b358      	cbz	r0, 0x800d236
@@ -21551,10 +22710,10 @@
  800d1e6:	3112      	adds	r1, #18
  800d1e8:	2200      	movs	r2, #0
  800d1ea:	5442      	strb	r2, [r0, r1]
- 800d1ec:	f7fe fa74 	bl	0x800b6d8
+ 800d1ec:	f7fe fa74 	bl	0x800b6d8 ;; data_display_copy()
  800d1f0:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 800d1f4:	2003      	movs	r0, #3
- 800d1f6:	f7f9 bf63 	b.w	0x80070c0
+ 800d1f4:	2003      	movs	r0, #3 ;; r0 = 3 (delay ticks)
+ 800d1f6:	f7f9 bf63 	b.w	0x80070c0 ;; TAIL: tick_delay_check(3)
  800d1fa:	7800      	ldrb	r0, [r0, #0]
  800d1fc:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800d200:	f006 bf30 	b.w	0x8014064
@@ -21575,9 +22734,9 @@
  800d232:	f006 bf17 	b.w	0x8014064
  800d236:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  800d23a:	f001 b941 	b.w	0x800e4c0
- 800d23e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 800d242:	f001 b93d 	b.w	0x800e4c0
- 800d246:	bd10      	pop	{r4, pc}
+ 800d23e:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; sub-mode 8 path
+ 800d242:	f001 b93d 	b.w	0x800e4c0 ;; TAIL: lcd_status_refresh()
+ 800d246:	bd10      	pop	{r4, pc} ;; default: return
  800d248:	a360      	add	r3, pc, #384	@ (adr r3, 0x800d3cc)
  800d24a:	2000      	movs	r0, #0
 ; ╔══════════════════════════════════════════════════════════════════════╗
@@ -21700,42 +22859,60 @@
 ; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  bk4829_spi_delay                                                        ║
+; ║  bk4829_filter_setup                                                         ║
 ; ║  0x0800D3EC  size=86                                            ║
 ; ║  Called by: uart_dma_init                                              ║
-; ║  Calls: delay_us_maybe, bk4829_filter_table, bk4829_reg_table_c, peripheral_bus_select, spi_bitbang_timing (+1 more)  ║
+; ║  Calls: delay_us_maybe, bk4829_filter_table, bk4829_reg_table_c, peripheral_bus_select, bk4829_af_path_config (+1 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_filter_setup  [BK4829] - Configures BK4829 IF filter chain via SPI bitbang
+; * bk4829_filter_setup  [BK4829] - Configures BK4829 IF filter chain
+;   Temporarily sets AF path to mode 0xF1 during filter writes, restores mode 0 at exit.
+; -- bk4829_filter_setup -------------------------------------------------
+; BK4829 IF filter chain configuration (86B).
+; Writes IF filter coefficients from flash lookup table to BK4829.
+;
+; Flow:
+;   1. Enable chip select (bk4829_cs_enable(1))
+;   2. Set mode 9 (pre-filter state)
+;   3. peripheral_bus_select(4) → CAL mode (REG 0x30 = 0xC3FA)
+;   4. bk4829_af_path_config(0xF1) → AM path for filter writes
+;   5. Loop: write filter table entries [17..16] from flash @ 0x0802F92C
+;      Each entry is 4 bytes: [reg_addr:2, value:2]
+;      Writes reg_addr=value with 80-cycle delay between each
+;   6. Set mode 10 (post-filter)
+;   7. Clear filter regs (reg_write(0, 0))
+;   8. Disable chip select (bk4829_cs_enable(0))
+;   9. TAIL-CALL bk4829_af_path_config(0) → restore FM RX default
+; ------------------------------------------------------------------------
  800d3ec:	b570      	push	{r4, r5, r6, lr}
- 800d3ee:	2001      	movs	r0, #1
+ 800d3ee:	2001      	movs	r0, #1 ;; enable chip select
  800d3f0:	f00d f83a 	bl	0x801a468
- 800d3f4:	2009      	movs	r0, #9
+ 800d3f4:	2009      	movs	r0, #9 ;; set mode 9 (pre-filter)
  800d3f6:	f012 fd21 	bl	0x801fe3c
- 800d3fa:	2004      	movs	r0, #4
+ 800d3fa:	2004      	movs	r0, #4 ;; peripheral_bus_select(4) → CAL
  800d3fc:	f00e fae6 	bl	0x801b9cc
- 800d400:	20f1      	movs	r0, #241	@ 0xf1
- 800d402:	f00e fc13 	bl	0x801bc2c
- 800d406:	2411      	movs	r4, #17
- 800d408:	4d0e      	ldr	r5, [pc, #56]	@ (0x800d444)                     ; = 0x0802F92C (flash+0x2F92C)
+ 800d400:	20f1      	movs	r0, #241 ;; AF path mode 0xF1 (AM, for filter writes)	@ 0xf1
+ 800d402:	f00e fc13 	bl	0x801bc2c                                        ; bk4829_af_path_config(mode=0xF1) → REG_47=0xFBD6, REG_48=0xB0A3
+ 800d406:	2411      	movs	r4, #17 ;; loop counter = 17 (downward to 16)
+ 800d408:	4d0e      	ldr	r5, [pc, #56]	@ (0x800d444 ;; r5 = filter table @ flash 0x0802F92C)                     ; = 0x0802F92C (flash+0x2F92C)
  800d40a:	eb05 0084 	add.w	r0, r5, r4, lsl #2
  800d40e:	8841      	ldrh	r1, [r0, #2]
  800d410:	f835 0024 	ldrh.w	r0, [r5, r4, lsl #2]
  800d414:	f00d f86d 	bl	0x801a4f2
- 800d418:	2050      	movs	r0, #80	@ 0x50
+ 800d418:	2050      	movs	r0, #80 ;; delay_us(80) between writes	@ 0x50
  800d41a:	f7fd fa94 	bl	0x800a946                                        ; delay_us_maybe
  800d41e:	1e64      	subs	r4, r4, #1
- 800d420:	2c0f      	cmp	r4, #15
+ 800d420:	2c0f      	cmp	r4, #15 ;; loop until entry 15 (2 entries total)
  800d422:	d8f2      	bhi.n	0x800d40a
- 800d424:	200a      	movs	r0, #10
+ 800d424:	200a      	movs	r0, #10 ;; set mode 10 (post-filter)
  800d426:	f012 fd09 	bl	0x801fe3c
  800d42a:	2100      	movs	r1, #0
  800d42c:	4608      	mov	r0, r1
  800d42e:	f00d f860 	bl	0x801a4f2
- 800d432:	2000      	movs	r0, #0
+ 800d432:	2000      	movs	r0, #0 ;; disable chip select
  800d434:	f00d f818 	bl	0x801a468
  800d438:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  800d43c:	2000      	movs	r0, #0
- 800d43e:	f00e bbf5 	b.w	0x801bc2c
+ 800d43e:	f00e bbf5 	b.w	0x801bc2c                                        ; TAIL-CALL bk4829_af_path_config(mode=0) → restore FM RX default
 
 ; --- DATA @ 0x0800D442 --------------------------------------------
   0x0800D440: F5 BB 00 00 2C F9 02 08 2D E9 FE 43 37 48 D0 E9  |....,...-..C7H..| [+4] 0x0802F92C=flash+0x2F92C
@@ -21746,20 +22923,52 @@
 ; ║  subsystem_poll                                                        ║
 ; ║  0x0800D448  size=228                                           ║
 ; ║  Called by: main_task_dispatch                                              ║
-; ║  Calls: bk4829_filter_table, bk4829_reg_table_c, peripheral_bus_select, spi_bitbang_timing, bk4829_reg_write_multi (+1 more)  ║
+; ║  Calls: bk4829_filter_table, bk4829_reg_table_c, peripheral_bus_select, bk4829_af_path_config, bk4829_reg_write_multi (+1 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * subsystem_poll [APPLICATION] - Small polling module (228B, 6 subcalls). Called from dispatch.
+; -- subsystem_poll ------------------------------------------------------
+; BK4829 register table writer with sequenced timing (228B).
+; Called from main_task_dispatch to apply queued BK4829 register
+; sequences loaded from flash table @ 0x0802F928.
+;
+; State struct @ 0x2000B05C+10 (ctrl = r4 = RAM+0xB066):
+;   [0..15] = register sequence table (up to 16 entries, 0xFF=end)
+;   [17] = phase (0=idle, 1=start, 2=writing, 3=finalize)
+;   [18] = sequence index (current entry position)
+;   [19] = current register value from table
+;   [20] = write_done flag
+;   [22:23] = delay timer (halfword, from timing LUT)
+;
+; Timing LUT (from flash+0x60..0x68, 5 entries on stack):
+;   Index comes from g_rf_state[8] (clamped to 0..4)
+;   Sets inter-register write delay
+;
+; Phase 1 (START):
+;   - Enable chip select, load first register from sequence
+;   - Check bit 1 of (RAM+0xA8B0)[9]: if set → CAL mode + AF path 1
+;   - Set mode 9 → transition to phase 2
+;
+; Phase 2 (WRITING):
+;   - If write_done: clear regs, load timing from LUT, advance index
+;   - If index hits 0xFF or >= 16: → phase 3 (finalize)
+;   - Else: write current register pair from flash table
+;   - Load timing delay for next register write
+;
+; Phase 3 (FINALIZE):
+;   - Set mode 10, apply multi-register block, restore AF path 0
+;   - Disable chip select → return to phase 0 (idle)
+; ------------------------------------------------------------------------
  800d448:	e92d 43fe 	stmdb	sp!, {r1, r2, r3, r4, r5, r6, r7, r8, r9, lr}
- 800d44c:	4837      	ldr	r0, [pc, #220]	@ (0x800d52c)                    ; = 0x0802F928 (flash+0x2F928)
- 800d44e:	e9d0 1218 	ldrd	r1, r2, [r0, #96]	@ 0x60
+ 800d44c:	4837      	ldr	r0, [pc, #220]	@ (0x800d52c ;; flash table base @ 0x0802F928)                    ; = 0x0802F928 (flash+0x2F928)
+ 800d44e:	e9d0 1218 	ldrd	r1, r2, [r0, #96] ;; copy timing LUT (flash+0x60..0x68) to stack	@ 0x60
  800d452:	6e80      	ldr	r0, [r0, #104]	@ 0x68
  800d454:	e9cd 1200 	strd	r1, r2, [sp]
  800d458:	9002      	str	r0, [sp, #8]
- 800d45a:	4e35      	ldr	r6, [pc, #212]	@ (0x800d530)                    ; = 0x2000B05C (RAM+0xB05C)
+ 800d45a:	4e35      	ldr	r6, [pc, #212]	@ (0x800d530 ;; r6 = state base @ 0x2000B05C)                    ; = 0x2000B05C (RAM+0xB05C)
  800d45c:	2704      	movs	r7, #4
  800d45e:	46e8      	mov	r8, sp
  800d460:	2500      	movs	r5, #0
- 800d462:	f106 040a 	add.w	r4, r6, #10
+ 800d462:	f106 040a 	add.w	r4, r6, #10 ;; r4 = ctrl struct @ 0x2000B066
  800d466:	e007      	b.n	0x800d478
  800d468:	8ae1      	ldrh	r1, [r4, #22]
  800d46a:	b929      	cbnz	r1, 0x800d478
@@ -21769,28 +22978,28 @@
  800d472:	d01d      	beq.n	0x800d4b0
  800d474:	7465      	strb	r5, [r4, #17]
  800d476:	7525      	strb	r5, [r4, #20]
- 800d478:	7c60      	ldrb	r0, [r4, #17]
+ 800d478:	7c60      	ldrb	r0, [r4, #17] ;; read phase
  800d47a:	2800      	cmp	r0, #0
  800d47c:	d1f4      	bne.n	0x800d468
  800d47e:	e8bd 83fe 	ldmia.w	sp!, {r1, r2, r3, r4, r5, r6, r7, r8, r9, pc}
  800d482:	7525      	strb	r5, [r4, #20]
  800d484:	74a5      	strb	r5, [r4, #18]
- 800d486:	2001      	movs	r0, #1
+ 800d486:	2001      	movs	r0, #1 ;; bk4829_cs_enable(1)
  800d488:	f00c ffee 	bl	0x801a468
- 800d48c:	7ca0      	ldrb	r0, [r4, #18]
+ 800d48c:	7ca0      	ldrb	r0, [r4, #18] ;; sequence index
  800d48e:	5c20      	ldrb	r0, [r4, r0]
  800d490:	74e0      	strb	r0, [r4, #19]
  800d492:	4828      	ldr	r0, [pc, #160]	@ (0x800d534)                    ; = 0x2000A8B0 (RAM+0xA8B0)
- 800d494:	7a40      	ldrb	r0, [r0, #9]
- 800d496:	0780      	lsls	r0, r0, #30
+ 800d494:	7a40      	ldrb	r0, [r0, #9] ;; check RF config flags
+ 800d496:	0780      	lsls	r0, r0, #30 ;; test bit 1
  800d498:	d508      	bpl.n	0x800d4ac
- 800d49a:	2004      	movs	r0, #4
+ 800d49a:	2004      	movs	r0, #4 ;; peripheral_bus_select(4) → CAL mode
  800d49c:	f00e fa96 	bl	0x801b9cc
- 800d4a0:	2001      	movs	r0, #1
+ 800d4a0:	2001      	movs	r0, #1 ;; bk4829_af_path_config(1) → FM chip1
  800d4a2:	f00e fbc3 	bl	0x801bc2c
- 800d4a6:	2009      	movs	r0, #9
+ 800d4a6:	2009      	movs	r0, #9 ;; set BK4829 mode 9 (pre-filter)
  800d4a8:	f012 fcc8 	bl	0x801fe3c
- 800d4ac:	2002      	movs	r0, #2
+ 800d4ac:	2002      	movs	r0, #2 ;; phase = 2 (writing)
  800d4ae:	7460      	strb	r0, [r4, #17]
  800d4b0:	7d20      	ldrb	r0, [r4, #20]
  800d4b2:	b330      	cbz	r0, 0x800d502
@@ -21811,20 +23020,20 @@
  800d4d4:	74a0      	strb	r0, [r4, #18]
  800d4d6:	5c21      	ldrb	r1, [r4, r0]
  800d4d8:	74e1      	strb	r1, [r4, #19]
- 800d4da:	29ff      	cmp	r1, #255	@ 0xff
+ 800d4da:	29ff      	cmp	r1, #255 ;; 0xFF = end-of-sequence marker	@ 0xff
  800d4dc:	d001      	beq.n	0x800d4e2
- 800d4de:	2810      	cmp	r0, #16
+ 800d4de:	2810      	cmp	r0, #16 ;; max 16 entries
  800d4e0:	d3ca      	bcc.n	0x800d478
- 800d4e2:	2003      	movs	r0, #3
+ 800d4e2:	2003      	movs	r0, #3 ;; phase = 3 (finalize)
  800d4e4:	7460      	strb	r0, [r4, #17]
  800d4e6:	74a5      	strb	r5, [r4, #18]
- 800d4e8:	200a      	movs	r0, #10
+ 800d4e8:	200a      	movs	r0, #10 ;; set mode 10 (post-filter)
  800d4ea:	82e0      	strh	r0, [r4, #22]
  800d4ec:	f012 fca6 	bl	0x801fe3c
  800d4f0:	f00e fd2c 	bl	0x801bf4c
- 800d4f4:	2000      	movs	r0, #0
+ 800d4f4:	2000      	movs	r0, #0 ;; bk4829_af_path_config(0) → restore FM RX
  800d4f6:	f00e fb99 	bl	0x801bc2c
- 800d4fa:	2000      	movs	r0, #0
+ 800d4fa:	2000      	movs	r0, #0 ;; bk4829_cs_enable(0) → disable CS
  800d4fc:	f00c ffb4 	bl	0x801a468
  800d500:	e7ba      	b.n	0x800d478
  800d502:	4a0a      	ldr	r2, [pc, #40]	@ (0x800d52c)                     ; = 0x0802F928 (flash+0x2F928)
@@ -22099,17 +23308,17 @@
 ; ║  Calls: gpio_input_data_bit_read                                     ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * subsystem_init_a [SYSTEM] - Small init (28B). Called from oem_main before dispatch loop.
- 800d85c:	b570      	push	{r4, r5, r6, lr}
+ 800d85c:	b570      	push	{r4, r5, r6, lr} ;; save context
  800d85e:	4d06      	ldr	r5, [pc, #24]	@ (0x800d878)                     ; = 0x40010C00 (GPIOB)
- 800d860:	2110      	movs	r1, #16
+ 800d860:	2110      	movs	r1, #16 ;; pin = 0x10 = GPIO_PIN_4 (PB4/ENC_A)
  800d862:	4628      	mov	r0, r5
  800d864:	f004 fe99 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOB -> PB4/ENC_A
- 800d868:	4c04      	ldr	r4, [pc, #16]	@ (0x800d87c)                     ; = 0x200001DE (g_state_flags)
- 800d86a:	7020      	strb	r0, [r4, #0]
- 800d86c:	2120      	movs	r1, #32
+ 800d868:	4c04      	ldr	r4, [pc, #16]	@ (0x800d87c)                     ; = 0x200001DE (g_state_flags) ;; r4 = g_state_flags (0x200001DE)
+ 800d86a:	7020      	strb	r0, [r4, #0] ;; g_state_flags[0] = PB4 encoder A state
+ 800d86c:	2120      	movs	r1, #32 ;; pin = 0x20 = GPIO_PIN_5 (PB5/ENC_B)
  800d86e:	4628      	mov	r0, r5
  800d870:	f004 fe93 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOB -> PB5/ENC_B
- 800d874:	7060      	strb	r0, [r4, #1]
+ 800d874:	7060      	strb	r0, [r4, #1] ;; g_state_flags[1] = PB5 encoder B state
  800d876:	bd70      	pop	{r4, r5, r6, pc}
 
 ; --- DATA @ 0x0800D878 --------------------------------------------
@@ -22123,18 +23332,30 @@
 ; ║  Calls: display_draw_helper, lcd_write_wrapper                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * module_init_dispatch [SYSTEM] - Compact dispatcher (32B, 17 subcalls!). Initializes or dispatches to all sub-modules.
+; -- module_init_dispatch ------------------------------------------------
+; LCD draw trigger + animation timer setup (32B).
+; Called from main_task_dispatch as part of always-run subsystem init.
+;
+; Flow:
+;   1. display_draw_helper(1) → trigger LCD redraw
+;   2. lcd_write_wrapper(0x49, 6) → write cmd 0x49 (SET_BRIGHTNESS) with param 6
+;   3. Init animation timer @ 0x200001FA:
+;      [0] = 1 (enabled)
+;      [1] = 0 (counter reset)
+;      [2:3] = 150 (0x96) = animation interval (ms)
+; ------------------------------------------------------------------------
  800d880:	b510      	push	{r4, lr}
  800d882:	2001      	movs	r0, #1
- 800d884:	f000 fe62 	bl	0x800e54c
+ 800d884:	f000 fe62 	bl	0x800e54c ;; display_draw_helper(1) → LCD redraw
  800d888:	2106      	movs	r1, #6
  800d88a:	2049      	movs	r0, #73	@ 0x49
- 800d88c:	f015 fa24 	bl	0x8022cd8
- 800d890:	4803      	ldr	r0, [pc, #12]	@ (0x800d8a0)                     ; = 0x200001FA (RAM+0x1FA)
+ 800d88c:	f015 fa24 	bl	0x8022cd8 ;; lcd_write_wrapper(0x49, 6) → SET_BRIGHTNESS
+ 800d890:	4803      	ldr	r0, [pc, #12]	@ (0x800d8a0 ;; timer ctrl @ 0x200001FA)                     ; = 0x200001FA (RAM+0x1FA)
  800d892:	2101      	movs	r1, #1
  800d894:	7001      	strb	r1, [r0, #0]
  800d896:	2100      	movs	r1, #0
  800d898:	7041      	strb	r1, [r0, #1]
- 800d89a:	2196      	movs	r1, #150	@ 0x96
+ 800d89a:	2196      	movs	r1, #150 ;; animation interval = 150ms	@ 0x96
  800d89c:	8041      	strh	r1, [r0, #2]
  800d89e:	bd10      	pop	{r4, pc}
 
@@ -22172,11 +23393,34 @@
 ; ║  Calls: dma_buffer_config, dac_rf_config_nop, flash_spi_addr_set, flash_rf_config_save, lcd_ctrl_pin_set (+3 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_config_apply [RF] - RF configuration apply (176B). Refs g_config + g_rf. Updates RF params from config.
+; -- rf_config_apply -----------------------------------------------------
+; Mode 13 dispatch handler (176B). RF configuration apply loop.
+; Runs the flash→hardware config pipeline with retry/state machine.
+;
+; State struct @ 0x2000AF70 (g_flash_config):
+;   [0] = phase (0=idle, 1=pending, 2=done, 3=retry)
+;   [1] = retry counter (max 3)
+;   [3] = trigger flag (set by timeout)
+;   [4:5] = cleared on completion
+;   [6:7] = countdown timer (halfword)
+;   [8] = secondary countdown (byte)
+;   [12] = DMA buffer pointer (set to 0x20000C50)
+;
+; Control loop (infinite until phase == 2):
+;   1. Poll flash_spi_ready() - if not ready, decrement counters
+;   2. If countdown[6:7] expires → phase = 2 (done)
+;   3. If countdown[8] expires → trigger = 1
+;   4. When trigger fires: validate flash data → apply or retry
+;      - phase 0 + status == 2: phase = 1, start DMA write (89 bytes)
+;      - phase 1: finalize flash write
+;      - phase 3: increment retry, if retry >= 3 → phase = 2
+;   5. When phase == 2: reset, exit loop
+; ------------------------------------------------------------------------
  800da1c:	4d28      	ldr	r5, [pc, #160]	@ (0x800dac0)                    ; = 0x2000AF70 (RAM+0xAF70)
  800da1e:	2400      	movs	r4, #0
- 800da20:	702c      	strb	r4, [r5, #0]
+ 800da20:	702c      	strb	r4, [r5, #0] ;; phase = 0 (idle)
  800da22:	4928      	ldr	r1, [pc, #160]	@ (0x800dac4)                    ; = 0x2000A3B4 (g_rf_state)
- 800da24:	200d      	movs	r0, #13
+ 800da24:	200d      	movs	r0, #13 ;; set dispatch mode = 13
  800da26:	7048      	strb	r0, [r1, #1]
  800da28:	722c      	strb	r4, [r5, #8]
  800da2a:	80ec      	strh	r4, [r5, #6]
@@ -22186,7 +23430,7 @@
  800da36:	60e8      	str	r0, [r5, #12]
  800da38:	2601      	movs	r6, #1
  800da3a:	2702      	movs	r7, #2
- 800da3c:	f7fa fa7a 	bl	0x8007f34
+ 800da3c:	f7fa fa7a 	bl	0x8007f34 ;; flash_spi_ready() - poll SPI
  800da40:	b178      	cbz	r0, 0x800da62
  800da42:	88e8      	ldrh	r0, [r5, #6]
  800da44:	b120      	cbz	r0, 0x800da50
@@ -22203,20 +23447,20 @@
  800da5a:	b900      	cbnz	r0, 0x800da5e
  800da5c:	70ee      	strb	r6, [r5, #3]
  800da5e:	f7fb fd03 	bl	0x8009468
- 800da62:	78e8      	ldrb	r0, [r5, #3]
+ 800da62:	78e8      	ldrb	r0, [r5, #3] ;; check trigger flag
  800da64:	b1a8      	cbz	r0, 0x800da92
  800da66:	70ec      	strb	r4, [r5, #3]
  800da68:	f7fb ff30 	bl	0x80098cc
  800da6c:	b978      	cbnz	r0, 0x800da8e
- 800da6e:	7828      	ldrb	r0, [r5, #0]
+ 800da6e:	7828      	ldrb	r0, [r5, #0] ;; check current phase
  800da70:	b110      	cbz	r0, 0x800da78
  800da72:	2801      	cmp	r0, #1
  800da74:	d10b      	bne.n	0x800da8e
  800da76:	e008      	b.n	0x800da8a
- 800da78:	f898 0000 	ldrb.w	r0, [r8]
- 800da7c:	2802      	cmp	r0, #2
+ 800da78:	f898 0000 	ldrb.w	r0, [r8] ;; check flash status
+ 800da7c:	2802      	cmp	r0, #2 ;; status == 2 → start DMA write
  800da7e:	d106      	bne.n	0x800da8e
- 800da80:	702e      	strb	r6, [r5, #0]
+ 800da80:	702e      	strb	r6, [r5, #0] ;; phase = 1 (pending write)
  800da82:	2159      	movs	r1, #89	@ 0x59
  800da84:	f013 fc12 	bl	0x80212ac
  800da88:	e001      	b.n	0x800da8e
@@ -22224,21 +23468,21 @@
  800da8e:	80ac      	strh	r4, [r5, #4]
  800da90:	e7d4      	b.n	0x800da3c
  800da92:	7828      	ldrb	r0, [r5, #0]
- 800da94:	2803      	cmp	r0, #3
+ 800da94:	2803      	cmp	r0, #3 ;; -- phase 3: retry logic
  800da96:	d107      	bne.n	0x800daa8
  800da98:	702c      	strb	r4, [r5, #0]
  800da9a:	7868      	ldrb	r0, [r5, #1]
  800da9c:	1c40      	adds	r0, r0, #1
  800da9e:	b2c0      	uxtb	r0, r0
  800daa0:	7068      	strb	r0, [r5, #1]
- 800daa2:	2803      	cmp	r0, #3
+ 800daa2:	2803      	cmp	r0, #3 ;; retry >= 3 → phase 2 (give up)
  800daa4:	d300      	bcc.n	0x800daa8
  800daa6:	702f      	strb	r7, [r5, #0]
  800daa8:	7828      	ldrb	r0, [r5, #0]
- 800daaa:	2802      	cmp	r0, #2
+ 800daaa:	2802      	cmp	r0, #2 ;; -- phase 2 check: done → exit loop
  800daac:	d1c6      	bne.n	0x800da3c
  800daae:	2000      	movs	r0, #0
- 800dab0:	f007 fc14 	bl	0x80152dc
+ 800dab0:	f007 fc14 	bl	0x80152dc ;; finalize config + reset display
  800dab4:	2000      	movs	r0, #0
  800dab6:	f007 fbef 	bl	0x8015298
  800daba:	80ac      	strh	r4, [r5, #4]
@@ -22463,15 +23707,15 @@
 ; ║  Calls: memset_zero_r2                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_display_flag_reset  [SYSTEM] - Set g_rf flags, zero 0x2000E630 - 20B
- 800dcd0:	b510      	push	{r4, lr}
- 800dcd2:	4805      	ldr	r0, [pc, #20]	@ (0x800dce8)                     ; = 0x2000A3B4 (g_rf_state)
- 800dcd4:	2101      	movs	r1, #1
- 800dcd6:	7081      	strb	r1, [r0, #2]
- 800dcd8:	70c1      	strb	r1, [r0, #3]
- 800dcda:	2117      	movs	r1, #23
- 800dcdc:	4803      	ldr	r0, [pc, #12]	@ (0x800dcec)                     ; = 0x2000E630 (RAM+0xE630)
- 800dcde:	f7f3 f99a 	bl	0x8001016
- 800dce2:	2000      	movs	r0, #0
+ 800dcd0:	b510      	push	{r4, lr} ;; save context
+ 800dcd2:	4805      	ldr	r0, [pc, #20]	@ (0x800dce8)                     ; = 0x2000A3B4 (g_rf_state) ;; r0 = g_rf_state (0x2000A3B4)
+ 800dcd4:	2101      	movs	r1, #1 ;; value = 1
+ 800dcd6:	7081      	strb	r1, [r0, #2] ;; g_rf_state[2] = 1 (RF subsystem needs refresh)
+ 800dcd8:	70c1      	strb	r1, [r0, #3] ;; g_rf_state[3] = 1 (display needs refresh)
+ 800dcda:	2117      	movs	r1, #23 ;; length = 23 bytes
+ 800dcdc:	4803      	ldr	r0, [pc, #12]	@ (0x800dcec)                     ; = 0x2000E630 (RAM+0xE630) ;; r0 = 0x2000E630 (display state buffer)
+ 800dcde:	f7f3 f99a 	bl	0x8001016 ;; memset_zero(display_buf, 23) - clear display flags
+ 800dce2:	2000      	movs	r0, #0 ;; return 0
  800dce4:	bd10      	pop	{r4, pc}
 
 ; --- DATA @ 0x0800DCE6 --------------------------------------------
@@ -22529,39 +23773,67 @@
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  radio_audio_mixer                                                        ║
-; ║  0x0800DD68  size=9506                                          ║
+; ║  0x0800DD68  size=84                                            ║
 ; ║  Called by: audio_dma_dispatch                                              ║
-; ║  Calls: rf_state_flag_set, bt_state_sync, display_get_params, display_set_position, lcd_ctrl_pin_set (+7 more)  ║
+; ║  Calls: rf_mode_reset, state_check, audio_bk4829_config, bk4829_reg_write, rf_state_flag_set, bt_state_sync (+5 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * radio_audio_mixer [AUDIO] - Large audio/radio mixer (9.5KB). Refs GPIOA+GPIOC, g_audio+g_config+g_display+g_rf+g_settings. Coord...
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: radio_audio_mixer(void)                              │
+; │                                                                     │
+; │ Audio/RF mode initialization on receive start. Sets up RF state,   │
+; │ configures BK4829 audio, and syncs Bluetooth.                      │
+; │                                                                     │
+; │   rf_mode_reset(0, 1);            // reset RF mode to RX           │
+; │   g_rf_state[31] = 1;             // mark audio mixer active       │
+; │   g_rf_state[1]  = 5;             // mode = 5 (RX active)         │
+; │                                                                     │
+; │   if (state_check() == 1) {       // dual-VFO or special mode?    │
+; │       nop_return(1);              // placeholder/stub               │
+; │       lcd_ctrl_pin_set(1);        // update LCD state               │
+; │       bus_write_bit(1);           // SPI bus config                 │
+; │       lcd_parallel_write(5);      // display update                 │
+; │       g_rf_state[20] = 5;         // store sub-mode                │
+; │   } else {                                                          │
+; │       audio_bk4829_config(0);     // BK4829 → RX audio mode       │
+; │       bk4829_reg_write();         // flush register config          │
+; │       rf_state_flag_set();        // set RF flags for RX            │
+; │   }                                                                 │
+; │   bt_state_sync();                // sync BT audio state           │
+; │                                                                     │
+; │ SIZE: 84 bytes (0x0800DD68→0x0800DDBC). NOT 9.5KB.                │
+; │ Next function: keypad_audio_handler @ 0x0800DDBC.                  │
+; └---------------------------------------------------------------------┘
+; * radio_audio_mixer [AUDIO] - Audio/RF mode init on RX start (84B)
  800dd68:	b570      	push	{r4, r5, r6, lr}
- 800dd6a:	2101      	movs	r1, #1
- 800dd6c:	2000      	movs	r0, #0
- 800dd6e:	f000 fb53 	bl	0x800e418
- 800dd72:	4c11      	ldr	r4, [pc, #68]	@ (0x800ddb8)                     ; = 0x2000A3B4 (g_rf_state)
+ 800dd6a:	2101      	movs	r1, #1                                           ; mode = 1 (enable)
+ 800dd6c:	2000      	movs	r0, #0                                           ; channel = 0
+ 800dd6e:	f000 fb53 	bl	0x800e418                                        ; rf_mode_reset(0, 1) - reset RF to RX mode
+ 800dd72:	4c11      	ldr	r4, [pc, #68]	@ (0x800ddb8)                     ; r4 = 0x2000A3B4 (g_rf_state)
  800dd74:	2001      	movs	r0, #1
- 800dd76:	77e0      	strb	r0, [r4, #31]
+ 800dd76:	77e0      	strb	r0, [r4, #31]                                    ; g_rf_state[31] = 1 (mixer active flag)
  800dd78:	2505      	movs	r5, #5
- 800dd7a:	7065      	strb	r5, [r4, #1]
- 800dd7c:	f00c fa30 	bl	0x801a1e0
- 800dd80:	2801      	cmp	r0, #1
- 800dd82:	d00a      	beq.n	0x800dd9a
- 800dd84:	2000      	movs	r0, #0
- 800dd86:	f00c fbde 	bl	0x801a546
- 800dd8a:	f00c fc47 	bl	0x801a61c
- 800dd8e:	f7ff fc59 	bl	0x800d644
+ 800dd7a:	7065      	strb	r5, [r4, #1]                                     ; g_rf_state[1] = 5 (mode = RX_ACTIVE)
+ 800dd7c:	f00c fa30 	bl	0x801a1e0                                        ; state_check() - check dual-VFO state
+ 800dd80:	2801      	cmp	r0, #1                                           ; dual/special mode?
+ 800dd82:	d00a      	beq.n	0x800dd9a                                       ; → alt path (display + bus config)
+;; ---- Normal path: configure BK4829 for RX audio ----
+ 800dd84:	2000      	movs	r0, #0                                           ; enter_beep = 0 (RX mode)
+ 800dd86:	f00c fbde 	bl	0x801a546                                        ; bk4829_audio_mode_switch(0) - R37=0x9D1F on both chips
+ 800dd8a:	f00c fc47 	bl	0x801a61c                                        ; bk4829_reg_write() - flush config
+ 800dd8e:	f7ff fc59 	bl	0x800d644                                        ; rf_state_flag_set() - mark RX flags
  800dd92:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 800dd96:	f7fd bd7d 	b.w	0x800b894
+ 800dd96:	f7fd bd7d 	b.w	0x800b894                                       ; → bt_state_sync() (tail call in data region)
+;; ---- Alt path: dual-VFO or special mode ----
  800dd9a:	2001      	movs	r0, #1
- 800dd9c:	f00c fbab 	bl	0x801a4f6
+ 800dd9c:	f00c fbab 	bl	0x801a4f6                                        ; nop_return(1)
  800dda0:	2001      	movs	r0, #1
- 800dda2:	f007 fa79 	bl	0x8015298
+ 800dda2:	f007 fa79 	bl	0x8015298                                        ; lcd_ctrl_pin_set(1) - update display
  800dda6:	2001      	movs	r0, #1
- 800dda8:	f00c fbf3 	bl	0x801a592
+ 800dda8:	f00c fbf3 	bl	0x801a592                                        ; bus_write_bit(1) - SPI bus config
  800ddac:	2005      	movs	r0, #5
- 800ddae:	f012 f845 	bl	0x801fe3c
- 800ddb2:	7525      	strb	r5, [r4, #20]
- 800ddb4:	e7ed      	b.n	0x800dd92
+ 800ddae:	f012 f845 	bl	0x801fe3c                                        ; lcd_parallel_write(5) - display command
+ 800ddb2:	7525      	strb	r5, [r4, #20]                                    ; g_rf_state[20] = 5 (sub-mode)
+ 800ddb4:	e7ed      	b.n	0x800dd92                                        ; → common exit (pop + bt_state_sync)
  800ddb6:	0000      	movs	r0, r0
  800ddb8:	a3b4      	add	r3, pc, #720	@ (adr r3, 0x800e08c)
  800ddba:	2000      	movs	r0, #0
@@ -22572,29 +23844,66 @@
 ; ║  Calls: memcmp, strlen, rf_audio_gate_ctrl, eeprom_block_copy, flash_data_load (+21 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * keypad_audio_handler [INPUT] - Keypad processing with audio feedback (632B). Refs GPIOC (keypad cols), g_config, g_rf. Calls gpio_i...
- 800ddbc:	e92d 5ffc 	stmdb	sp!, {r2, r3, r4, r5, r6, r7, r8, r9, sl, fp, ip, lr}
- 800ddc0:	2100      	movs	r1, #0
+; -- keypad_audio_handler (ACTUALLY: serial clone/programming protocol handler) --
+; This function processes serial programming commands over GPIOC/USART.
+; Called from main_task_dispatch when RAM[0x2000AF72] != 0 (clone mode active).
+;
+; PROTOCOL: Single ASCII command bytes with data payloads:
+;   'F' (0x46) = Frequency command     → bk4829 freq set, transition to state 6
+;   'U' (0x55) = Upload/program        → 6-byte header match against flash table @0x0802F747
+;                                         then eeprom_block_copy + flash_data_load
+;   'D' (0x44) = Download/read request → set mode=13, clear counters, return
+;   'M' (0x4D) = Memory/config mode    → load config from flash @0x080037E0, state=5
+;   'R' (0x52) = Read EEPROM           → 4-byte header, read + send data block
+;   'W' (0x57) = Write EEPROM          → 132-byte payload (0x84), write data block
+;   'T' (0x54) = Transmit/read (alt)   → same as 'R' but different flash func
+;   'X' (0x58) = eXecute/write (alt)   → same as 'W' but different flash func
+;   'E' (0x45) = End session           → set state=8, cleanup
+;   'S' (0x53) = Start/sync            → 25-byte timeout, verify, state=2
+;
+; STATE MACHINE (r5[0] = state, dispatch via tbb @ 0x800DE42):
+;   State 0: Parse first command byte ('F','U','D', or check extended cmds)
+;   State 1: Parse 'M' command (memory/config mode)
+;   State 2: Parse data commands ('R','W','T','X','E')
+;   State 3: Verify handshake
+;   State 4: Check device type match
+;   State 5: Idle/wait state (loops back immediately)
+;   State 6: Execute frequency change
+;   State 7: Retry counter (increments, wraps at 3 → state 8)
+;   State ≥8: Cleanup → set g_rf_state[1]=0, clear BT flag, return
+;
+; r5 = RAM[0x2000AF70] base pointer for clone state:
+;   r5[0]    = current state (0-8+)
+;   r5[1]    = retry counter
+;   r5[2]    = sub-state
+;   r5[3]    = command pending flag
+;   r5[4-5]  = byte counter (16-bit)
+;   r5[16..] = receive buffer
+;   r5[0xA0] = last command type ('R'=0x52 or 'W'=0x57)
+; ------------------------------------------------------------------------
+ 800ddbc:	e92d 5ffc 	stmdb	sp!, {r2, r3, r4, r5, r6, r7, r8, r9, sl, fp, ip, lr} ;; -- CLONE PROTOCOL HANDLER ENTRY --
+ 800ddc0:	2100      	movs	r1, #0 ;; clear params
  800ddc2:	4608      	mov	r0, r1
- 800ddc4:	f000 fb28 	bl	0x800e418
+ 800ddc4:	f000 fb28 	bl	0x800e418 ;; init_clone_session(0, 0)
  800ddc8:	f8df 9250 	ldr.w	r9, [pc, #592]	@ 0x800e01c                    ; = 0x2000A3B4 (g_rf_state)
- 800ddcc:	2008      	movs	r0, #8
+ 800ddcc:	2008      	movs	r0, #8 ;; g_rf_state[1] = 8 (clone mode active)
  800ddce:	f889 0001 	strb.w	r0, [r9, #1]
- 800ddd2:	f7fa fcff 	bl	0x80087d4
+ 800ddd2:	f7fa fcff 	bl	0x80087d4 ;; subsystem_poll() - check if busy
  800ddd6:	b110      	cbz	r0, 0x800ddde
- 800ddd8:	2000      	movs	r0, #0
+ 800ddd8:	2000      	movs	r0, #0 ;; if busy: stop_audio(0)
  800ddda:	f7f5 fe0d 	bl	0x80039f8
- 800ddde:	f00d f8d5 	bl	0x801af8c
- 800dde2:	f7fd fe35 	bl	0x800ba50
- 800dde6:	f899 0047 	ldrb.w	r0, [r9, #71]	@ 0x47
+ 800ddde:	f00d f8d5 	bl	0x801af8c ;; rf_frontend_standby()
+ 800dde2:	f7fd fe35 	bl	0x800ba50 ;; audio_path_reset()
+ 800dde6:	f899 0047 	ldrb.w	r0, [r9, #71]	@ 0x47 ;; r0 = g_rf_state[0x47] (BT connection flag)
  800ddea:	2400      	movs	r4, #0
  800ddec:	4d8c      	ldr	r5, [pc, #560]	@ (0x800e020)                    ; = 0x2000AF70 (RAM+0xAF70)
  800ddee:	f04f 0b01 	mov.w	fp, #1
- 800ddf2:	2801      	cmp	r0, #1
- 800ddf4:	d02c      	beq.n	0x800de50
+ 800ddf2:	2801      	cmp	r0, #1 ;; BT connected?
+ 800ddf4:	d02c      	beq.n	0x800de50 ;; if BT → set clone_state=1 (BT clone)
  800ddf6:	702c      	strb	r4, [r5, #0]
  800ddf8:	4668      	mov	r0, sp
  800ddfa:	f004 fbdc 	bl	0x80125b6
- 800ddfe:	f44f 6080 	mov.w	r0, #1024	@ 0x400
+ 800ddfe:	f44f 6080 	mov.w	r0, #1024	@ 0x400 ;; pins = 0x400 = PC10
  800de02:	f8ad 0000 	strh.w	r0, [sp]
  800de06:	f04f 0a02 	mov.w	sl, #2
  800de0a:	f88d a002 	strb.w	sl, [sp, #2]
@@ -22602,23 +23911,23 @@
  800de10:	f88d 0003 	strb.w	r0, [sp, #3]
  800de14:	4669      	mov	r1, sp
  800de16:	4883      	ldr	r0, [pc, #524]	@ (0x800e024)                    ; = 0x40011000 (GPIOC)
- 800de18:	f004 f942 	bl	0x80120a0
+ 800de18:	f004 f942 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOC, {PC10, AF-OD}) → clone UART
  800de1c:	f105 0010 	add.w	r0, r5, #16
  800de20:	2652      	movs	r6, #82	@ 0x52
  800de22:	2757      	movs	r7, #87	@ 0x57
  800de24:	f04f 0804 	mov.w	r8, #4
  800de28:	9001      	str	r0, [sp, #4]
- 800de2a:	f7fa f883 	bl	0x8007f34
+ 800de2a:	f7fa f883 	bl	0x8007f34 ;; -- MAIN LOOP: check for incoming serial data --
  800de2e:	b108      	cbz	r0, 0x800de34
- 800de30:	f7fb fbc6 	bl	0x80095c0
- 800de34:	78e8      	ldrb	r0, [r5, #3]
- 800de36:	2800      	cmp	r0, #0
- 800de38:	d071      	beq.n	0x800df1e
+ 800de30:	f7fb fbc6 	bl	0x80095c0 ;; process_incoming_byte()
+ 800de34:	78e8      	ldrb	r0, [r5, #3] ;; r5[3] = command pending flag
+ 800de36:	2800      	cmp	r0, #0 ;; any command pending?
+ 800de38:	d071      	beq.n	0x800df1e ;; if no → check state timeout
  800de3a:	70ec      	strb	r4, [r5, #3]
  800de3c:	7828      	ldrb	r0, [r5, #0]
  800de3e:	2808      	cmp	r0, #8
  800de40:	d26e      	bcs.n	0x800df20
- 800de42:	e8df f000 	tbb	[pc, r0]
+ 800de42:	e8df f000 	tbb	[pc, r0] ;; -- STATE DISPATCH TABLE (states 0-7) --
  800de46:	08bd      	lsrs	r5, r7, #2
  800de48:	b660      	cpsie
  800de4a:	4c04      	ldr	r4, [pc, #16]	@ (0x800de5c)                     ; = 0xD00D2855
@@ -22626,12 +23935,12 @@
  800de4e:	e7ec      	b.n	0x800de2a
  800de50:	f885 b000 	strb.w	fp, [r5]
  800de54:	e7d0      	b.n	0x800ddf8
- 800de56:	7c28      	ldrb	r0, [r5, #16]
- 800de58:	2846      	cmp	r0, #70	@ 0x46
+ 800de56:	7c28      	ldrb	r0, [r5, #16] ;; -- STATE 0: parse first command byte from buffer --
+ 800de58:	2846      	cmp	r0, #70	@ 0x46 ;; cmd == "F" (0x46)?
  800de5a:	d009      	beq.n	0x800de70
- 800de5c:	2855      	cmp	r0, #85	@ 0x55
+ 800de5c:	2855      	cmp	r0, #85	@ 0x55 ;; cmd == "U" (0x55)?
  800de5e:	d00d      	beq.n	0x800de7c
- 800de60:	2844      	cmp	r0, #68	@ 0x44
+ 800de60:	2844      	cmp	r0, #68	@ 0x44 ;; cmd == "D" (0x44)?
  800de62:	d01e      	beq.n	0x800dea2
  800de64:	f895 00a1 	ldrb.w	r0, [r5, #161]	@ 0xa1
  800de68:	2810      	cmp	r0, #16
@@ -22662,15 +23971,15 @@
  800dea8:	70ac      	strb	r4, [r5, #2]
  800deaa:	80ac      	strh	r4, [r5, #4]
  800deac:	80ec      	strh	r4, [r5, #6]
- 800deae:	e8bd 9ffc 	ldmia.w	sp!, {r2, r3, r4, r5, r6, r7, r8, r9, sl, fp, ip, pc}
+ 800deae:	e8bd 9ffc 	ldmia.w	sp!, {r2, r3, r4, r5, r6, r7, r8, r9, sl, fp, ip, pc} ;; return from clone handler
  800deb2:	f00b fb67 	bl	0x8019584
  800deb6:	485d      	ldr	r0, [pc, #372]	@ (0x800e02c)                    ; = 0x20000C50 (RAM+0xC50)
  800deb8:	f8c5 00ac 	str.w	r0, [r5, #172]	@ 0xac
  800debc:	2003      	movs	r0, #3
  800debe:	7028      	strb	r0, [r5, #0]
  800dec0:	e7b3      	b.n	0x800de2a
- 800dec2:	7c28      	ldrb	r0, [r5, #16]
- 800dec4:	284d      	cmp	r0, #77	@ 0x4d
+ 800dec2:	7c28      	ldrb	r0, [r5, #16] ;; -- STATE 1: check for "M" memory command --
+ 800dec4:	284d      	cmp	r0, #77	@ 0x4d ;; cmd == "M" (0x4D)?
  800dec6:	d1b0      	bne.n	0x800de2a
  800dec8:	4859      	ldr	r0, [pc, #356]	@ (0x800e030)                    ; = 0x080037E0 (flash+0x37E0)
  800deca:	f7f2 ffec 	bl	0x8000ea6
@@ -22698,16 +24007,16 @@
  800defc:	f00b fb42 	bl	0x8019584
  800df00:	f885 a000 	strb.w	sl, [r5]
  800df04:	e791      	b.n	0x800de2a
- 800df06:	7c28      	ldrb	r0, [r5, #16]
- 800df08:	2852      	cmp	r0, #82	@ 0x52
+ 800df06:	7c28      	ldrb	r0, [r5, #16] ;; -- STATE 2: data transfer commands --
+ 800df08:	2852      	cmp	r0, #82	@ 0x52 ;; cmd == "R" (0x52)? → read EEPROM
  800df0a:	d00a      	beq.n	0x800df22
- 800df0c:	2857      	cmp	r0, #87	@ 0x57
+ 800df0c:	2857      	cmp	r0, #87	@ 0x57 ;; cmd == "W" (0x57)? → write EEPROM
  800df0e:	d01b      	beq.n	0x800df48
- 800df10:	2854      	cmp	r0, #84	@ 0x54
+ 800df10:	2854      	cmp	r0, #84	@ 0x54 ;; cmd == "T" (0x54)? → alt read
  800df12:	d027      	beq.n	0x800df64
- 800df14:	2858      	cmp	r0, #88	@ 0x58
+ 800df14:	2858      	cmp	r0, #88	@ 0x58 ;; cmd == "X" (0x58)? → alt write
  800df16:	d038      	beq.n	0x800df8a
- 800df18:	2845      	cmp	r0, #69	@ 0x45
+ 800df18:	2845      	cmp	r0, #69	@ 0x45 ;; cmd == "E" (0x45)? → end session
  800df1a:	d044      	beq.n	0x800dfa6
  800df1c:	e047      	b.n	0x800dfae
  800df1e:	e058      	b.n	0x800dfd2
@@ -22762,7 +24071,7 @@
  800df9e:	2002      	movs	r0, #2
  800dfa0:	f007 f97a 	bl	0x8015298
  800dfa4:	e741      	b.n	0x800de2a
- 800dfa6:	f885 8000 	strb.w	r8, [r5]
+ 800dfa6:	f885 8000 	strb.w	r8, [r5] ;; cmd "E": set state=8 (end session)
  800dfaa:	f00b faeb 	bl	0x8019584
  800dfae:	80ac      	strh	r4, [r5, #4]
  800dfb0:	e73b      	b.n	0x800de2a
@@ -22859,20 +24168,86 @@
 ; ║  Called by: tx_modulation_setup                                              ║
 ; ║  Calls: buffer_init, debug_format_info, audio_playback_settings, rf_state_quick_clear       ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_playback_handler [AUDIO] - Audio playback handler (150B). String format + DAC DMA audio engine interaction.
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_playback_handler(void)                         │
+; │                                                                     │
+; │ Manages multi-step audio playback from indexed tone/string data.   │
+; │ Uses state variable at 0x2000B12C to track playback progress.      │
+; │ Called by tx_modulation_setup for DTMF/tone sequences.             │
+; │                                                                     │
+; │   struct playback_ctrl *pb = (struct playback_ctrl*)0x2000B12C;   │
+; │   struct rf_cursor *cur = (struct rf_cursor*)0x2000A360;          │
+; │   uint8_t state = pb->state;  // offset +1                        │
+; │                                                                     │
+; │   if (state == 0) {                                                │
+; │       pb->state = 1;          // start playback                    │
+; │       goto finish;                                                  │
+; │   }                                                                 │
+; │                                                                     │
+; │   // Compute data pointer: table[slot_idx * 3 + 8] + char_idx     │
+; │   uint8_t slot = pb->slot_idx;   // +5                             │
+; │   uint8_t chr = pb->char_idx;    // +3                             │
+; │   uint32_t *table = pb->table_ptr; // +10                          │
+; │   uint32_t *entry = table + slot * 3 + 8;                         │
+; │                                                                     │
+; │   if (state == 1) {                                                │
+; │       if (cur->pos_a >= cur->pos_b - 1) goto done_7;              │
+; │       char c = ((char*)*entry)[chr];                               │
+; │       audio_output_char(c);   // @ 0x08014134                      │
+; │       char c2 = ((char*)*entry)[chr + 1];                          │
+; │       audio_output_char(c2);                                       │
+; │   } else {                                                         │
+; │       if (cur->pos_a >= cur->pos_b) goto done_7;                  │
+; │       char c = ((char*)*entry)[chr];                               │
+; │       audio_output_char(c);                                        │
+; │   }                                                                 │
+; │                                                                     │
+; │ done_7:                                                             │
+; │   audio_state_trigger(7);     // signal completion                 │
+; │ finish:                                                             │
+; │   rf_state_quick_clear(0);                                         │
+; │   tail-call → keypad_audio_trigger();                              │
+; └---------------------------------------------------------------------┘
+; * audio_playback_handler [AUDIO] - Multi-step tone/DTMF sequence playback controller
+; -- audio_playback_handler ----------------------------------------------
+; Multi-step tone/DTMF sequence playback controller (150B).
+; Reads tone descriptors from flash-loaded sequence table and feeds
+; them to the audio pipeline one step at a time.
+;
+; State struct @ 0x2000B12C:
+;   [1] = phase (0=start, 1=first note, 2=sustain)
+;   [3] = byte offset within current entry
+;   [5] = sequence index (entry number)
+;   [10:13] = pointer to tone sequence table
+;
+; Timing ref @ 0x2000A360:
+;   [4:7] = elapsed ticks, [8:11] = total ticks
+;   Compare elapsed vs total for note duration
+;
+; Flow:
+;   phase 0 (start): set phase=1, clear state, call rf_state_manager
+;   phase 1 (first note):
+;     - entry = table[index*12 + 8]  (12B stride per tone descriptor)
+;     - if elapsed >= (total - 1): play note[offset], play next note
+;     - else: play note[offset] only
+;   phase 2 (sustain):
+;     - if elapsed >= total: call audio_engine(7) → advance to next
+;     - else: play note[offset]
+;   finish: rf_state_quick_clear(0), TAIL-CALL rf_state_manager
+; ------------------------------------------------------------------------
  800e118:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
- 800e11c:	4d24      	ldr	r5, [pc, #144]	@ (0x800e1b0)                    ; = 0x2000B12C (RAM+0xB12C)
- 800e11e:	786c      	ldrb	r4, [r5, #1]
+ 800e11c:	4d24      	ldr	r5, [pc, #144]	@ (0x800e1b0 ;; state @ 0x2000B12C)                    ; = 0x2000B12C (RAM+0xB12C)
+ 800e11e:	786c      	ldrb	r4, [r5, #1] ;; phase
  800e120:	2c00      	cmp	r4, #0
  800e122:	d016      	beq.n	0x800e152
  800e124:	462b      	mov	r3, r5
- 800e126:	4823      	ldr	r0, [pc, #140]	@ (0x800e1b4)                    ; = 0x2000A360 (RAM+0xA360)
+ 800e126:	4823      	ldr	r0, [pc, #140]	@ (0x800e1b4 ;; timing ref @ 0x2000A360)                    ; = 0x2000A360 (RAM+0xA360)
  800e128:	795a      	ldrb	r2, [r3, #5]
  800e12a:	2608      	movs	r6, #8
- 800e12c:	e9d0 1001 	ldrd	r1, r0, [r0, #4]
- 800e130:	f8d3 700a 	ldr.w	r7, [r3, #10]
- 800e134:	eb02 0242 	add.w	r2, r2, r2, lsl #1
- 800e138:	eb06 0282 	add.w	r2, r6, r2, lsl #2
+ 800e12c:	e9d0 1001 	ldrd	r1, r0, [r0, #4] ;; r1=elapsed, r0=total ticks
+ 800e130:	f8d3 700a 	ldr.w	r7, [r3, #10] ;; r7 = tone sequence table ptr
+ 800e134:	eb02 0242 	add.w	r2, r2, r2, lsl #1 ;; r2 = index * 3
+ 800e138:	eb06 0282 	add.w	r2, r6, r2, lsl #2 ;; r2 = 8 + index*12 (12B stride)
  800e13c:	78db      	ldrb	r3, [r3, #3]
  800e13e:	443a      	add	r2, r7
  800e140:	2c01      	cmp	r4, #1
@@ -22880,9 +24255,9 @@
  800e144:	4281      	cmp	r1, r0
  800e146:	d322      	bcc.n	0x800e18e
  800e148:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 800e14c:	2007      	movs	r0, #7
+ 800e14c:	2007      	movs	r0, #7 ;; audio_engine_call(7) → advance note
  800e14e:	f7f8 bfb7 	b.w	0x80070c0
- 800e152:	2001      	movs	r0, #1
+ 800e152:	2001      	movs	r0, #1 ;; phase = 1 (first note)
  800e154:	7068      	strb	r0, [r5, #1]
  800e156:	e023      	b.n	0x800e1a0
  800e158:	1e40      	subs	r0, r0, #1
@@ -22909,12 +24284,12 @@
  800e190:	5cc0      	ldrb	r0, [r0, r3]
  800e192:	f005 ffcf 	bl	0x8014134
  800e196:	f7fb fe0f 	bl	0x8009db8
- 800e19a:	2002      	movs	r0, #2
+ 800e19a:	2002      	movs	r0, #2 ;; phase = 2 (sustain)
  800e19c:	f011 fbfc 	bl	0x801f998
  800e1a0:	2000      	movs	r0, #0
  800e1a2:	f7fd fed9 	bl	0x800bf58
  800e1a6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 800e1aa:	f008 beb7 	b.w	0x8016f1c
+ 800e1aa:	f008 beb7 	b.w	0x8016f1c ;; TAIL-CALL rf_state_manager
 
 ; --- DATA @ 0x0800E1AE --------------------------------------------
   0x0800E1A0: 00 20 FD F7 D9 FE BD E8 F0 41 08 F0 B7 BE 00 00  |. .......A......|
@@ -23593,30 +24968,60 @@
 ; ║  Called by: tx_power_calibrate                                              ║
 ; ║  Calls: delay_us_maybe, display_scroll_pos, gpio_bits_reset, gpio_bits_set, display_color_set (+2 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * lcd_bar_draw [LCD] - LCD bar drawing (84B). Draws signal/power bar on LCD.
+; * si4732_init_and_mode_select  [SI4732] - SI4732 reset + mode select (84B)
+;
+;   ⚠ WARNING: This function resets the SI4732 chip every time it is called!
+;   Originally labeled lcd_bar_draw - actually SI4732 initialization/mode switch.
+;
+;   C pseudocode:
+;     void si4732_init_and_mode_select(void) {
+;       gpio_clear(GPIOC, 0x10);          // CLR PC4 (BAND_RELAY) - side effect
+;       // --- SI4732 RESET PULSE ---
+;       gpio_clear(GPIOA, 0x40);          // PA6 FM_RESET LOW (assert reset)
+;       delay_us(10);                      // hold reset 10 microseconds
+;       gpio_set(GPIOA, 0x40);            // PA6 FM_RESET HIGH (release reset)
+;       // --- MODE SELECT ---
+;       uint8_t mode = g_config[0x43];     // broadcast mode byte
+;       i2c_buffer[0] = mode;
+;       if (mode >= 2)
+;         si4732_power_up_ssb_wb();        // SSB (0x31) or WB (0x13) power-up
+;       else
+;         si4732_power_up_fm_am();         // FM (0x10) or AM (0x11) power-up
+;       delay_us(500);                     // post-power-up settling
+;       display_scroll_pos(1);             // update display
+;     }
+;
+;   SI4732 mode byte (g_config[0x43]):
+;     0 = FM  → power-up [0x01, 0x10, 0x05]
+;     1 = AM  → power-up [0x01, 0x11, 0x05]
+;     2 = SSB → power-up [0x01, 0x31, 0x05] (requires 15.8KB flash patch)
+;     3 = WB  → power-up [0x01, 0x13, 0x05]
+;   Audio: byte 2 = 0x05 = analog output (no digital audio capture)
+;
+;   DISCOVERY: was lcd_bar_draw - actually SI4732 reset + broadcast mode init
  800e8bc:	b510      	push	{r4, lr}
  800e8be:	2110      	movs	r1, #16
  800e8c0:	4813      	ldr	r0, [pc, #76]	@ (0x800e910)                     ; = 0x40011000 (GPIOC)
- 800e8c2:	f003 fe74 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOC -> PC4/BAND_RELAY(!)
+ 800e8c2:	f003 fe74 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR PC4 (BAND_RELAY off) - side effect of SI4732 init
  800e8c6:	4c13      	ldr	r4, [pc, #76]	@ (0x800e914)                     ; = 0x40010800 (GPIOA)
  800e8c8:	2140      	movs	r1, #64	@ 0x40
  800e8ca:	4620      	mov	r0, r4
- 800e8cc:	f003 fe6f 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOA -> PA6
+ 800e8cc:	f003 fe6f 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR PA6 (FM_RESET LOW → assert SI4732 reset)
  800e8d0:	200a      	movs	r0, #10
- 800e8d2:	f7fc f838 	bl	0x800a946                                        ; delay_us_maybe
+ 800e8d2:	f7fc f838 	bl	0x800a946                                        ; delay_us_maybe  ; 10µs reset hold time
  800e8d6:	2140      	movs	r1, #64	@ 0x40
  800e8d8:	4620      	mov	r0, r4
- 800e8da:	f003 fe6a 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOA -> PA6
+ 800e8da:	f003 fe6a 	bl	0x80125b2                                        ; gpio_bits_set ;; SET PA6 (FM_RESET HIGH → release SI4732 reset)
  800e8de:	480e      	ldr	r0, [pc, #56]	@ (0x800e918)                     ; = 0x2000A8F9 (RAM+0xA8F9)
  800e8e0:	490e      	ldr	r1, [pc, #56]	@ (0x800e91c)                     ; = 0x2000019C (RAM+0x19C)
- 800e8e2:	f890 0043 	ldrb.w	r0, [r0, #67]	@ 0x43
+ 800e8e2:	f890 0043 	ldrb.w	r0, [r0, #67]	@ 0x43          ; r0 = broadcast mode (0=FM,1=AM,2=SSB,3=WB)
  800e8e6:	7008      	strb	r0, [r1, #0]
- 800e8e8:	2802      	cmp	r0, #2
+ 800e8e8:	2802      	cmp	r0, #2							     ; mode >= 2 → SSB/WB path
  800e8ea:	d302      	bcc.n	0x800e8f2
- 800e8ec:	f017 fd7a 	bl	0x80263e4
+ 800e8ec:	f017 fd7a 	bl	0x80263e4					     ; si4732_power_up_ssb_wb()
  800e8f0:	e001      	b.n	0x800e8f6
- 800e8f2:	f017 fdb5 	bl	0x8026460
- 800e8f6:	f44f 70fa 	mov.w	r0, #500	@ 0x1f4
+ 800e8f2:	f017 fdb5 	bl	0x8026460					     ; si4732_power_up_fm_am()
+ 800e8f6:	f44f 70fa 	mov.w	r0, #500					     ; 500µs post-power-up settle
  800e8fa:	f7fc f824 	bl	0x800a946                                        ; delay_us_maybe
  800e8fe:	2001      	movs	r0, #1
  800e900:	f000 f80e 	bl	0x800e920
@@ -27253,6 +28658,27 @@
 ; ║  Calls: printf_handler, data_compare_sort, display_get_params, display_set_position, display_list_item_draw (+1 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_list_draw [DISPLAY] - Display list drawing (888B, 4 callers, 6 subcalls). Renders scrollable list UI.
+; -- display_list_draw ---------------------------------------------------
+; Scrollable list UI renderer (888B, 4 callers). Draws a multi-section
+; list screen on the 240×320 LCD with navigation controls.
+;
+; r0 = page mode (0=show navigation header, 1+=skip header)
+; r1 = context parameter (passed to rendering callbacks)
+;
+; Screen layout (240px wide, regions from top to bottom):
+;   Y=0xAF (175): base Y position for sections
+;   Header (when page==0): rect(53,63,73,99) with title @ flash 0x080499B4
+;   Section A: Y=0xB0(176), label @ flash 0x080487CC, bar Y=0x3C(60)
+;   Section B: Y=0xB0(176), label @ flash 0x080481CC, bar Y=0x72(114)
+;   Section C: Y=0xB0(176), label @ flash 0x08047C5C, bar Y=0xA8(168)
+;   Section D: Y=0xB0(176), label @ flash 0x08047674, bar Y=0xBD(189)
+;
+; Each section: draws label text (12px font) then a selection bar
+; (full width 0xD3=211px, color 0xFFFF=white).
+;
+; Navigation: uses cursor state @ 0x20000AE4 and display config
+; @ 0x2000A8F9 to track selected item and scroll position.
+; ------------------------------------------------------------------------
  8010d10:	e92d 4ff0 	stmdb	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, lr}
  8010d14:	b087      	sub	sp, #28
  8010d16:	4605      	mov	r5, r0
@@ -28376,59 +29802,82 @@
 ; ║  Calls: byte_to_word_pattern, bt_flash_comms, memset_aligned, memset_zero_r2, tick_delay_check (+31 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * settings_menu_engine [MENU] - Settings/menu engine (17.7KB). Refs g_config + g_display + g_rf + g_settings. Calls beep for feedbac...
- 8011ac4:	b570      	push	{r4, r5, r6, lr}
- 8011ac6:	4d7d      	ldr	r5, [pc, #500]	@ (0x8011cbc)                    ; = 0x2000A340 (RAM+0xA340)
- 8011ac8:	4c7d      	ldr	r4, [pc, #500]	@ (0x8011cc0)                    ; = 0x20000215 (RAM+0x215)
- 8011aca:	6841      	ldr	r1, [r0, #4]
- 8011acc:	2601      	movs	r6, #1
- 8011ace:	7822      	ldrb	r2, [r4, #0]
- 8011ad0:	7f6b      	ldrb	r3, [r5, #29]
- 8011ad2:	2914      	cmp	r1, #20
- 8011ad4:	d055      	beq.n	0x8011b82
- 8011ad6:	dc12      	bgt.n	0x8011afe
- 8011ad8:	2910      	cmp	r1, #16
- 8011ada:	d07d      	beq.n	0x8011bd8
+; -- settings_menu_engine ------------------------------------------------
+; Mode 2 dispatch handler. Handles all settings/menu UI interactions.
+; Uses binary search cascade on sp[4] to dispatch to 20+ sub-handlers.
+;
+; r5 = RAM[0x2000A340] (menu state struct: current item, scroll pos, etc.)
+; r4 = RAM[0x20000215] (settings change flag)
+; r1 = sp[4] (sub-command from main_task_dispatch)
+; r2 = r4[0] (settings dirty flag)
+; r3 = r5[29] (menu item index)
+;
+; Sub-command dispatch table (binary search tree):
+;   sub  2: menu_item_action_a          sub  3: menu_item_action_b
+;   sub  5: menu_item_action_c          sub  7: menu_scroll_handler
+;   sub 16: menu_display_refresh        sub 17: lcd_write(12) + draw + tail-call
+;   sub 18: menu_edit_char_handler      sub 19: menu_confirm_handler
+;   sub 20: menu_enter_handler          sub 21: menu_save_and_exit
+;   sub 22: menu_nav_handler            sub 23: menu_back_handler
+;   sub 24: menu_special_handler        sub 28: menu_channel_handler
+;   sub 31: menu_reset_handler          sub 36: menu_aux_a
+;   sub 37: menu_aux_b
+;   sub ≥160: return (cleanup)
+;   default: tick_delay_check(0)
+; ------------------------------------------------------------------------
+ 8011ac4:	b570      	push	{r4, r5, r6, lr} ;; -- SETTINGS_MENU_ENGINE: mode 2 handler --
+ 8011ac6:	4d7d      	ldr	r5, [pc, #500]	@ (0x8011cbc)                    ; = 0x2000A340 (RAM+0xA340) ;; r5 = menu_state @ 0x2000A340
+ 8011ac8:	4c7d      	ldr	r4, [pc, #500]	@ (0x8011cc0)                    ; = 0x20000215 (RAM+0x215) ;; r4 = settings_dirty @ 0x20000215
+ 8011aca:	6841      	ldr	r1, [r0, #4] ;; r1 = sp[4] (sub-command)
+ 8011acc:	2601      	movs	r6, #1 ;; r6 = 1 (constant for flag sets)
+ 8011ace:	7822      	ldrb	r2, [r4, #0] ;; r2 = settings dirty flag
+ 8011ad0:	7f6b      	ldrb	r3, [r5, #29] ;; r3 = menu item index
+ 8011ad2:	2914      	cmp	r1, #20 ;; -- BINARY SEARCH DISPATCH on sub-cmd --
+ 8011ad4:	d055      	beq.n	0x8011b82 ;; sub 20 → menu_enter_handler
+ 8011ad6:	dc12      	bgt.n	0x8011afe ;; sub > 20 → check 21-37
+ 8011ad8:	2910      	cmp	r1, #16 ;; sub 16?
+ 8011ada:	d07d      	beq.n	0x8011bd8 ;; sub 16 → menu_display_refresh
  8011adc:	dc08      	bgt.n	0x8011af0
- 8011ade:	2902      	cmp	r1, #2
- 8011ae0:	d07b      	beq.n	0x8011bda
- 8011ae2:	2903      	cmp	r1, #3
- 8011ae4:	d07a      	beq.n	0x8011bdc
- 8011ae6:	2905      	cmp	r1, #5
- 8011ae8:	d079      	beq.n	0x8011bde
- 8011aea:	2907      	cmp	r1, #7
- 8011aec:	d119      	bne.n	0x8011b22
- 8011aee:	e0c7      	b.n	0x8011c80
- 8011af0:	2911      	cmp	r1, #17
- 8011af2:	d01d      	beq.n	0x8011b30
- 8011af4:	2912      	cmp	r1, #18
- 8011af6:	d025      	beq.n	0x8011b44
- 8011af8:	2913      	cmp	r1, #19
- 8011afa:	d112      	bne.n	0x8011b22
- 8011afc:	e053      	b.n	0x8011ba6
- 8011afe:	291c      	cmp	r1, #28
- 8011b00:	d06e      	beq.n	0x8011be0
+ 8011ade:	2902      	cmp	r1, #2 ;; sub 2?
+ 8011ae0:	d07b      	beq.n	0x8011bda ;; sub 2 → menu_item_action_a
+ 8011ae2:	2903      	cmp	r1, #3 ;; sub 3?
+ 8011ae4:	d07a      	beq.n	0x8011bdc ;; sub 3 → menu_item_action_b
+ 8011ae6:	2905      	cmp	r1, #5 ;; sub 5?
+ 8011ae8:	d079      	beq.n	0x8011bde ;; sub 5 → menu_item_action_c
+ 8011aea:	2907      	cmp	r1, #7 ;; sub 7?
+ 8011aec:	d119      	bne.n	0x8011b22 ;; sub != 7 → default
+ 8011aee:	e0c7      	b.n	0x8011c80 ;; sub 7 → menu_scroll_handler
+ 8011af0:	2911      	cmp	r1, #17 ;; sub 17?
+ 8011af2:	d01d      	beq.n	0x8011b30 ;; sub 17 → lcd_write(12) + menu_draw
+ 8011af4:	2912      	cmp	r1, #18 ;; sub 18?
+ 8011af6:	d025      	beq.n	0x8011b44 ;; sub 18 → menu_edit_char_handler
+ 8011af8:	2913      	cmp	r1, #19 ;; sub 19?
+ 8011afa:	d112      	bne.n	0x8011b22 ;; sub != 19 → default
+ 8011afc:	e053      	b.n	0x8011ba6 ;; sub 19 → menu_confirm_handler
+ 8011afe:	291c      	cmp	r1, #28 ;; sub 28?
+ 8011b00:	d06e      	beq.n	0x8011be0 ;; sub 28 → menu_channel_handler
  8011b02:	dc08      	bgt.n	0x8011b16
- 8011b04:	2915      	cmp	r1, #21
- 8011b06:	d07b      	beq.n	0x8011c00
- 8011b08:	2916      	cmp	r1, #22
- 8011b0a:	d05e      	beq.n	0x8011bca
- 8011b0c:	2917      	cmp	r1, #23
- 8011b0e:	d069      	beq.n	0x8011be4
- 8011b10:	2918      	cmp	r1, #24
- 8011b12:	d106      	bne.n	0x8011b22
- 8011b14:	e09e      	b.n	0x8011c54
- 8011b16:	291f      	cmp	r1, #31
- 8011b18:	d065      	beq.n	0x8011be6
+ 8011b04:	2915      	cmp	r1, #21 ;; sub 21?
+ 8011b06:	d07b      	beq.n	0x8011c00 ;; sub 21 → menu_save_and_exit
+ 8011b08:	2916      	cmp	r1, #22 ;; sub 22?
+ 8011b0a:	d05e      	beq.n	0x8011bca ;; sub 22 → menu_nav_handler
+ 8011b0c:	2917      	cmp	r1, #23 ;; sub 23?
+ 8011b0e:	d069      	beq.n	0x8011be4 ;; sub 23 → menu_back_handler
+ 8011b10:	2918      	cmp	r1, #24 ;; sub 24?
+ 8011b12:	d106      	bne.n	0x8011b22 ;; sub != 24 → check 31+
+ 8011b14:	e09e      	b.n	0x8011c54 ;; sub 24 → menu_special_handler
+ 8011b16:	291f      	cmp	r1, #31 ;; sub 31?
+ 8011b18:	d065      	beq.n	0x8011be6 ;; sub 31 → menu_reset_handler
  8011b1a:	2924      	cmp	r1, #36	@ 0x24
- 8011b1c:	d07e      	beq.n	0x8011c1c
+ 8011b1c:	d07e      	beq.n	0x8011c1c ;; sub 36 → menu_aux_a
  8011b1e:	2925      	cmp	r1, #37	@ 0x25
- 8011b20:	d07d      	beq.n	0x8011c1e
- 8011b22:	29a0      	cmp	r1, #160	@ 0xa0
- 8011b24:	d27c      	bcs.n	0x8011c20
- 8011b26:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+ 8011b20:	d07d      	beq.n	0x8011c1e ;; sub 37 → menu_aux_b
+ 8011b22:	29a0      	cmp	r1, #160	@ 0xa0 ;; sub >= 160?
+ 8011b24:	d27c      	bcs.n	0x8011c20 ;; sub >= 160 → cleanup and return
+ 8011b26:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- DEFAULT: unknown sub-cmd --
  8011b2a:	2000      	movs	r0, #0
- 8011b2c:	f7f5 bac8 	b.w	0x80070c0
- 8011b30:	200c      	movs	r0, #12
+ 8011b2c:	f7f5 bac8 	b.w	0x80070c0 ;; tail-call tick_delay_check(0)
+ 8011b30:	200c      	movs	r0, #12 ;; -- SUB 17: lcd_write(12) + rf_channel_init(1) --
  8011b32:	f00e f983 	bl	0x801fe3c
  8011b36:	2001      	movs	r0, #1
  8011b38:	f7fc fef2 	bl	0x800e920
@@ -30237,8 +31686,24 @@
 ; * gpio_output_control [KEYPAD] - Keypad scanner (184B, 4 callers).
 ; *   Reads PE5/PA12 side buttons directly, then 5-column matrix scan on PC0-3/PD4-7.
 ; *   Key codes from flash table @ 0x0802F706. See C pseudocode in header section 8.
+; -- gpio_output_control (keypad scanner) --------------------------------
+; Matrix keypad scanner (184B). Returns key code or 0xFF if no key.
+;
+; Scan order:
+;   1. Check PE5 (TOP_PROG side button) → key code from table
+;   2. Check PA12 (BOT_PROG side button) → key code from table
+;   3. Matrix scan: 5 columns (PC0-3) × 4 rows (PD4-7)
+;      - Clear all columns, read rows → if all 0xF → no key
+;      - Walk columns one at a time, read row nibble PD[7:4]
+;      - Row decode: 0x70→row0, 0xB0→row1, 0xD0→row2, 0xE0→row3
+;      - Key code = flash_table[0x0802F706 + col*4 + row]
+;
+; Matrix layout (5 cols × 4 rows):
+;   Col 0-4 driven via GPIOC PC0-3 (with column masks from flash)
+;   Rows read from GPIOD PD4-7 (upper nibble of port input, bits [7:4])
+; ------------------------------------------------------------------------
  8012ff8:	e92d 47f0 	stmdb	sp!, {r4, r5, r6, r7, r8, r9, sl, lr}
- 8012ffc:	2400      	movs	r4, #0
+ 8012ffc:	2400      	movs	r4, #0 ;; column counter = 0
  8012ffe:	2120      	movs	r1, #32
  8013000:	482b      	ldr	r0, [pc, #172]	@ (0x80130b0)                    ; = 0x40011800 (GPIOE)
  8013002:	f7ff faca 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOE -> PE5/TOP_PROG
@@ -30250,16 +31715,16 @@
  8013014:	4e28      	ldr	r6, [pc, #160]	@ (0x80130b8)                    ; = 0x40011000 (GPIOC)
  8013016:	210f      	movs	r1, #15
  8013018:	4630      	mov	r0, r6
- 801301a:	f7ff fac8 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOC -> PC0-3/KBD_COLS
+ 801301a:	f7ff fac8 	bl	0x80125ae                                        ; gpio_bits_reset ;; clear all columns ;; CLR GPIOC -> PC0-3/KBD_COLS
  801301e:	200a      	movs	r0, #10
  8013020:	f7f7 fc9f 	bl	0x800a962                                        ; delay_short
  8013024:	f8df 9094 	ldr.w	r9, [pc, #148]	@ 0x80130bc                    ; = 0x40011400 (GPIOD)
  8013028:	4648      	mov	r0, r9
  801302a:	f7ff fab3 	bl	0x8012594
- 801302e:	f3c0 1003 	ubfx	r0, r0, #4, #4
- 8013032:	280f      	cmp	r0, #15
+ 801302e:	f3c0 1003 	ubfx	r0, r0, #4, #4 ;; extract row nibble PD[7:4]
+ 8013032:	280f      	cmp	r0, #15 ;; 0xF = no row pressed
  8013034:	d02b      	beq.n	0x801308e
- 8013036:	4d22      	ldr	r5, [pc, #136]	@ (0x80130c0)                    ; = 0x0802F706 (flash+0x2F706)
+ 8013036:	4d22      	ldr	r5, [pc, #136]	@ (0x80130c0 ;; r5 = key lookup table @ flash)                    ; = 0x0802F706 (flash+0x2F706)
  8013038:	f1a5 0714 	sub.w	r7, r5, #20
  801303c:	f1a5 080a 	sub.w	r8, r5, #10
  8013040:	f837 1014 	ldrh.w	r1, [r7, r4, lsl #1]
@@ -30273,19 +31738,19 @@
  801305a:	4648      	mov	r0, r9
  801305c:	f7ff fa9a 	bl	0x8012594
  8013060:	f000 01f0 	and.w	r1, r0, #240	@ 0xf0
- 8013064:	2970      	cmp	r1, #112	@ 0x70
+ 8013064:	2970      	cmp	r1, #112 ;; 0x70 → row 0 (PD7 low)	@ 0x70
  8013066:	d014      	beq.n	0x8013092
- 8013068:	29b0      	cmp	r1, #176	@ 0xb0
+ 8013068:	29b0      	cmp	r1, #176 ;; 0xB0 → row 1 (PD6 low)	@ 0xb0
  801306a:	d015      	beq.n	0x8013098
- 801306c:	29d0      	cmp	r1, #208	@ 0xd0
+ 801306c:	29d0      	cmp	r1, #208 ;; 0xD0 → row 2 (PD5 low)	@ 0xd0
  801306e:	d017      	beq.n	0x80130a0
- 8013070:	29e0      	cmp	r1, #224	@ 0xe0
+ 8013070:	29e0      	cmp	r1, #224 ;; 0xE0 → row 3 (PD4 low)	@ 0xe0
  8013072:	d019      	beq.n	0x80130a8
  8013074:	1c64      	adds	r4, r4, #1
  8013076:	b2e4      	uxtb	r4, r4
- 8013078:	2c05      	cmp	r4, #5
+ 8013078:	2c05      	cmp	r4, #5 ;; 5 columns total
  801307a:	d3e1      	bcc.n	0x8013040
- 801307c:	20ff      	movs	r0, #255	@ 0xff
+ 801307c:	20ff      	movs	r0, #255 ;; 0xFF = no key pressed	@ 0xff
  801307e:	e8bd 87f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, pc}
  8013082:	e000      	b.n	0x8013086
  8013084:	e001      	b.n	0x801308a
@@ -30318,7 +31783,46 @@
 ; ║  Called by: display_subsystem_flag                                              ║
 ; ║  Calls: gpio_output_control                                                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_dma_gpio_ctrl  [AUDIO] - Audio DMA GPIO control - 168B, ←audio_dma_rf_sync, ->gpio_output_control
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_dma_gpio_ctrl(uint32_t *out_cmd)               │
+; │                                                                     │
+; │ GPIO debounce/change detector for audio DMA synchronization.       │
+; │ Reads GPIO pin states, compares 3 consecutive samples for          │
+; │ stability, then generates output commands for state changes.        │
+; │                                                                     │
+; │   // Shift history buffer (3 samples deep)                         │
+; │   g_gpio_history[2] = g_gpio_history[1];  // @ 0x2000A2C8         │
+; │   g_gpio_history[1] = g_gpio_history[0];                          │
+; │   g_gpio_history[0] = read_current_gpio_state();                   │
+; │                                                                     │
+; │   // Check all 3 samples match (debounce)                         │
+; │   if (!all_three_equal(g_gpio_history)) return 0;                  │
+; │                                                                     │
+; │   // State change detection with counter @ 0x200001B8              │
+; │   counter = g_state[8];                                            │
+; │   if (current == 0xFF) {     // no signal                         │
+; │       if (prev != 0xFF) { output release cmd; return 1; }         │
+; │       return 0;                                                     │
+; │   }                                                                 │
+; │   if (prev == 0xFF) { store new; return 0; }  // first detect     │
+; │   if (current == prev) {                                            │
+; │       counter++;                                                    │
+; │       if (counter == 100) { out_cmd = {0x20, current}; return 1; }│
+; │       if (counter >= 150) { counter = 140; repeat cmd; return 1; }│
+; │   } else { store new; reset counter; }                             │
+; │                                                                     │
+; │ RAM STATE:                                                          │
+; │   0x2000A2C8: GPIO sample history (3 × 4 bytes)                   │
+; │   0x200001B8: Debounce state {prev_value[4], counter[8]}          │
+; │                                                                     │
+; │ OUTPUT: Writes command to [out_cmd]: [0]=cmd_type, [4]=gpio_value │
+; │   cmd 0x20 = stable press (after 100 samples)                     │
+; │   cmd 0x80 = release event                                         │
+; │                                                                     │
+; │ NOTE: This is likely keypad/button detection through GPIO polling, │
+; │ with audio-synchronized timing for debounce. Not direct audio HW.  │
+; └---------------------------------------------------------------------┘
+; * audio_dma_gpio_ctrl  [AUDIO/GPIO] - GPIO debounce/change detector with 3-sample history
  80130c4:	b570      	push	{r4, r5, r6, lr}
  80130c6:	4604      	mov	r4, r0
  80130c8:	2102      	movs	r1, #2
@@ -30759,31 +32263,33 @@
 ; ║  Calls: adc2_channel_init, adc2_channel_init, adc2_channel_init, adc2_convert_read, default_irq_handler  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ;; ═══════════════════════════════════════════════════════════════════
-;; FLASH SPI INIT - Initializes SPI2 for W25Q16 flash communication
-;; SPI2: PB13(SCLK), PB14(MISO), PB15(MOSI), PB12(CS)
-;; Flash holds calibration, channels, settings, firmware backup
+;; PERIPH_INIT_FLASH_ADC - ADC2 single conversion + data extract
+;; Configures ADC2 ch1, triggers conversion, reads 8-bit result
+;; ubfx extracts bits 4-11 from 12-bit result (8-bit scaled value)
 ;; ═══════════════════════════════════════════════════════════════════
  8013820:	b510      	push	{r4, lr}
- 8013822:	4c0d      	ldr	r4, [pc, #52]	@ (0x8013858)                     ; = 0x40012800 (ADC2)
- 8013824:	2201      	movs	r2, #1
- 8013826:	2307      	movs	r3, #7
- 8013828:	4611      	mov	r1, r2
+;; --- Configure ADC2 channel 1 + trigger conversion ---
+ 8013822:	4c0d      	ldr	r4, [pc, #52]	@ (0x8013858)                     ; = 0x40012800 (ADC2) ;; r4 = 0x40012800 = ADC2
+ 8013824:	2201      	movs	r2, #1 ;; rank = 1
+ 8013826:	2307      	movs	r3, #7 ;; sample_time = 7 (239.5 cycles, slowest)
+ 8013828:	4611      	mov	r1, r2 ;; channel = 1
  801382a:	4620      	mov	r0, r4
- 801382c:	f7ef fd06 	bl	0x800323c
- 8013830:	2101      	movs	r1, #1
+ 801382c:	f7ef fd06 	bl	0x800323c ;; adc_regular_ch_config(ADC2, ch1, rank1, slow)
+ 8013830:	2101      	movs	r1, #1 ;; enable = 1
  8013832:	4620      	mov	r0, r4
- 8013834:	f7ef fd41 	bl	0x80032ba
- 8013838:	2102      	movs	r1, #2
+ 8013834:	f7ef fd41 	bl	0x80032ba ;; adc_sw_trigger_enable(ADC2, 1) → start conv
+ 8013838:	2102      	movs	r1, #2 ;; flag = 2 = EOC
  801383a:	4620      	mov	r0, r4
- 801383c:	f7ef fccc 	bl	0x80031d8
- 8013840:	2800      	cmp	r0, #0
- 8013842:	d0f9      	beq.n	0x8013838
- 8013844:	2102      	movs	r1, #2
+ 801383c:	f7ef fccc 	bl	0x80031d8 ;; adc_flag_get(ADC2, EOC)
+ 8013840:	2800      	cmp	r0, #0 ;; conversion done?
+ 8013842:	d0f9      	beq.n	0x8013838 ;; loop until EOC set
+;; --- Clear EOC flag and read result ---
+ 8013844:	2102      	movs	r1, #2 ;; flag = 2 = EOC
  8013846:	4620      	mov	r0, r4
- 8013848:	f7ef fc95 	bl	0x8003176
+ 8013848:	f7ef fc95 	bl	0x8003176 ;; adc_flag_clear(ADC2, EOC)
  801384c:	4620      	mov	r0, r4
- 801384e:	f7ef fcc0 	bl	0x80031d2
- 8013852:	f3c0 1007 	ubfx	r0, r0, #4, #8
+ 801384e:	f7ef fcc0 	bl	0x80031d2 ;; adc_data_read(ADC2) → 12-bit result
+ 8013852:	f3c0 1007 	ubfx	r0, r0, #4, #8 ;; extract bits[4:11] → 8-bit value (div16)
  8013856:	bd10      	pop	{r4, pc}
 
 ; --- DATA @ 0x08013858 --------------------------------------------
@@ -30886,49 +32392,147 @@
 ; ║  Called by: hw_init_main                                              ║
 ; ║  Calls: gpio_af_config, gpio_pin_config_table, gpio_bits_reset, gpio_bits_set, gpio_init_struct (+4 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
- 801391c:	e92d 43f8 	stmdb	sp!, {r3, r4, r5, r6, r7, r8, r9, lr}
- 8013920:	2101      	movs	r1, #1
- 8013922:	207d      	movs	r0, #125	@ 0x7d
- 8013924:	f006 faf6 	bl	0x8019f14
- 8013928:	2101      	movs	r1, #1
- 801392a:	4872      	ldr	r0, [pc, #456]	@ (0x8013af4)                    ; = 0x380C4010
- 801392c:	f006 fad6 	bl	0x8019edc
- 8013930:	2101      	movs	r1, #1
- 8013932:	2003      	movs	r0, #3
- 8013934:	f006 fac4 	bl	0x8019ec0
- 8013938:	2101      	movs	r1, #1
- 801393a:	0648      	lsls	r0, r1, #25
- 801393c:	f7fe fc04 	bl	0x8012148
- 8013940:	4668      	mov	r0, sp
- 8013942:	f7fe fe38 	bl	0x80125b6
- 8013946:	f648 50c8 	movw	r0, #36296	@ 0x8dc8
+; -- gpio_modes_init -----------------------------------------------------
+; Configures ALL GPIO pins on the AT32F403A for the RT-950 Pro.
+; Called once from hw_init_main during boot. Uses HAL gpio_pin_config_table()
+; with struct { uint16_t pins; uint8_t drive_strength; uint8_t mode_type; }
+;
+; COMPLETE PIN MAP (decoded from init register writes):
+; ┌--------------------------------------------------------------------┐
+; │ PORT A (0x40010800)                                               │
+; │  PA0  = ADC_BAT      analog input (battery voltage ADC ch0)      │
+; │  PA1  = ADC_PWR      analog input (power level ADC ch1)          │
+; │  PA2  = ADC_RSSI     analog input (RSSI ADC ch2)                 │
+; │  PA3  = output OD    (unknown - configured output open-drain)    │
+; │  PA4  = DAC_CH1      analog output (speaker audio via DMA)       │
+; │  PA5  = DAC_CH2      analog output (DC bias for amp circuit)     │
+; │  PA6  = FM_RESET     output OD (SI4732 FM chip reset, init HIGH) │
+; │  PA7  = output OD    (unknown GPIO, init HIGH→PA11?)             │
+; │  PA8  = GPS_PWR      output OD (GPS module power enable)         │
+; │  PA9  = USART1_TX    AF push-pull (BT module TX, configured in   │
+; │  PA10 = USART1_RX    usart1_hw_init, NOT configured here)        │
+; │  PA11 = USB_DM       output OD (USB, init SET high)              │
+; │  PA12 = USB_DP       input pull-up (USB D+)                      │
+; │  PA15 = output OD    (init SET high)                             │
+; │                                                                   │
+; │ PORT B (0x40010C00)                                               │
+; │  PB0  = RF_RELAY_A   output OD (RF front-end relay A)            │
+; │  PB1  = RF_RELAY_B   output OD (RF front-end relay B)            │
+; │  PB2  = BOOT1        output OD (BOOT1 pin, driven low)           │
+; │  PB3  = LCD_BL2      output OD (LCD backlight 2)                 │
+; │  PB4  = ENC_A        input pull-up (rotary encoder channel A)    │
+; │  PB5  = ENC_B        input pull-up (rotary encoder channel B)    │
+; │  PB6  = I2C1_SCL     output OD (SI4732 FM chip I2C clock)        │
+; │  PB7  = I2C1_SDA     output OD (SI4732 FM chip I2C data)         │
+; │  PB8  = AMP_EN       output OD (audio amp enable, init LOW)      │
+; │  PB9  = STATUS_LED   output OD (front panel status LED)          │
+; │  PB11 = output OD    (unknown, configured output)                │
+; │  PB12 = SPI2_CS      output OD (W25Q flash chip select)          │
+; │  PB13 = SPI2_SCK     AF open-drain (SPI2 clock)                  │
+; │  PB14 = SPI2_MISO    input floating (SPI2 data in)               │
+; │  PB15 = SPI2_MOSI    AF open-drain (SPI2 data out)               │
+; │                                                                   │
+; │ PORT C (0x40011000)                                               │
+; │  PC0  = LCD_D0       output OD (LCD 8-bit data bus lower)        │
+; │  PC1  = LCD_D1       output OD                                   │
+; │  PC2  = LCD_D2       output OD                                   │
+; │  PC3  = LCD_D3       output OD                                   │
+; │  PC4  = BAND_RELAY   output OD (RF band select, init LOW)        │
+; │  PC5  = LCD_D5       output OD                                   │
+; │  PC6  = LCD_BL1      output OD (LCD backlight 1, init LOW)       │
+; │  PC7  = input PU     (unknown - input pull-up)                   │
+; │  PC8  = input PU     (unknown - input pull-up)                   │
+; │  PC9  = LCD_D4       output OD                                   │
+; │  PC10 = LCD_D6       output OD (init SET high)                   │
+; │  PC11 = LCD_D7       output OD                                   │
+; │  PC12 = BEEP_SW      output OD (audio mux: see polarity note §13)  │
+; │  PC13 = output OD    (unknown GPIO)                              │
+; │  PC14 = output OD    (unknown - likely OSC32 shared)             │
+; │  PC15 = input PU     (unknown - input pull-up)                   │
+; │                                                                   │
+; │ PORT D (0x40011400)                                               │
+; │  PD0  = LCD_WR       output OD (LCD write strobe)                │
+; │  PD1  = LCD_CS       output OD (LCD chip select)                 │
+; │  PD2  = LCD_RST      output OD (LCD reset)                       │
+; │  PD3  = LCD_DC       output OD (LCD data/command select)         │
+; │  PD4  = KBD_ROW0     input pull-up (keypad matrix row 0)         │
+; │  PD5  = KBD_ROW1     input pull-up (keypad matrix row 1)         │
+; │  PD6  = KBD_ROW2     input pull-up (keypad matrix row 2)         │
+; │  PD7  = KBD_ROW3     input pull-up (keypad matrix row 3)         │
+; │  PD8  = LCD_D8       output OD (LCD data bus upper byte)         │
+; │  PD9  = LCD_D9       output OD                                   │
+; │  PD10 = LCD_D10      output OD                                   │
+; │  PD11 = LCD_D11      output OD                                   │
+; │  PD12 = LCD_D12      output OD                                   │
+; │  PD13 = LCD_D13      output OD                                   │
+; │  PD14 = LCD_D14      output OD                                   │
+; │  PD15 = LCD_D15      output OD                                   │
+; │                                                                   │
+; │ PORT E (0x40011800)                                               │
+; │  PE0  = input PU     (unknown - input pull-up)                   │
+; │  PE1  = SPK_MUTE     output OD (speaker mute: H=muted, L=open)  │
+; │  PE2  = PTT2         input pull-up (side PTT button 2)           │
+; │  PE3  = PTT1         input pull-up (main PTT button)             │
+; │  PE4  = AMP_PWR      output OD (audio amplifier power rail, V12 verified) │
+; │  PE5  = input PU     (unknown - input pull-up)                   │
+; │  PE6  = input PU     (unknown - input pull-up)                   │
+; │  PE7  = RF_RELAY_C   output OD (RF relay bank C)                 │
+; │  PE8  = BK4829_CS1   output OD (BK4829 #1 chip select, init LO) │
+; │  PE9  = BK4829_SCK   output OD (BK4829 SPI clock)               │
+; │  PE10 = BK4829_MOSI  output OD (BK4829 SPI data out, init LO)   │
+; │  PE11 = BK4829_MISO  output OD (BK4829 SPI data in, init LO)    │
+; │  PE12 = RF_RELAY_D   output OD (RF relay bank D)                 │
+; │  PE13 = output OD    (RF control, init HIGH)                     │
+; │  PE14 = output OD    (RF control, init HIGH)                     │
+; │  PE15 = BK4829_CS2   output OD (BK4829 #2 chip select, init LO) │
+; └--------------------------------------------------------------------┘
+;
+; Init sequence: enable AFIO remap → for each port {config pins, set/clr defaults}
+; Registers used: r7=1, r4=0x10, r5=0x48, r6=2, r8=0x1000, r9=port base
+; ------------------------------------------------------------------------
+ 801391c:	e92d 43f8 	stmdb	sp!, {r3, r4, r5, r6, r7, r8, r9, lr} ;; -- GPIO_MODES_INIT: Configure all MCU pins --
+ 8013920:	2101      	movs	r1, #1 ;; -- STEP 1: Enable AFIO remap --
+ 8013922:	207d      	movs	r0, #125	@ 0x7d ;; AFIO_REMAP peripheral ID
+ 8013924:	f006 faf6 	bl	0x8019f14 ;; crm_periph_clock_enable(AFIO)
+ 8013928:	2101      	movs	r1, #1 ;; remap=1
+ 801392a:	4872      	ldr	r0, [pc, #456]	@ (0x8013af4)                    ; = 0x380C4010 ;; AFIO JTAG remap register
+ 801392c:	f006 fad6 	bl	0x8019edc ;; gpio_pin_remap_config(SWJ_JTAG_DISABLE)
+ 8013930:	2101      	movs	r1, #1 ;; enable
+ 8013932:	2003      	movs	r0, #3 ;; remap type 3
+ 8013934:	f006 fac4 	bl	0x8019ec0 ;; gpio_pin_remap_config(remap_type_3)
+ 8013938:	2101      	movs	r1, #1 ;; enable=1
+ 801393a:	0648      	lsls	r0, r1, #25 ;; r0 = 1<<25 = 0x02000000 (GPIOA clock?)
+ 801393c:	f7fe fc04 	bl	0x8012148 ;; crm_periph_clock_enable(all GPIO ports)
+ 8013940:	4668      	mov	r0, sp ;; -- STEP 2: PORT A (0x40010800) --
+ 8013942:	f7fe fe38 	bl	0x80125b6 ;; gpio_init_struct_default(sp)
+ 8013946:	f648 50c8 	movw	r0, #36296	@ 0x8dc8 ;; pins = 0x8DC8 = PA3,6,7,8,10,11,15
  801394a:	f8ad 0000 	strh.w	r0, [sp]
- 801394e:	2701      	movs	r7, #1
+ 801394e:	2701      	movs	r7, #1 ;; r7=1 (drive=low speed), used throughout
  8013950:	f88d 7002 	strb.w	r7, [sp, #2]
- 8013954:	2410      	movs	r4, #16
+ 8013954:	2410      	movs	r4, #16 ;; r4=0x10 (open-drain mode), used throughout
  8013956:	f88d 4003 	strb.w	r4, [sp, #3]
- 801395a:	f8df 919c 	ldr.w	r9, [pc, #412]	@ 0x8013af8                    ; = 0x40010800 (GPIOA)
+ 801395a:	f8df 919c 	ldr.w	r9, [pc, #412]	@ 0x8013af8                    ; = 0x40010800 (GPIOA) ;; r9 = GPIOA base
  801395e:	4669      	mov	r1, sp
  8013960:	4648      	mov	r0, r9
  8013962:	f7fe fb9d 	bl	0x80120a0
- 8013966:	02e1      	lsls	r1, r4, #11
+ 8013966:	02e1      	lsls	r1, r4, #11 ;; r1 = 0x8000 = bit 15
  8013968:	4648      	mov	r0, r9
- 801396a:	f7fe fe22 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOA -> PA0
- 801396e:	01e1      	lsls	r1, r4, #7
+ 801396a:	f7fe fe22 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOA -> PA0 → SET PA15 HIGH
+ 801396e:	01e1      	lsls	r1, r4, #7 ;; r1 = 0x0800 = bit 11
  8013970:	4648      	mov	r0, r9
- 8013972:	f7fe fe1e 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOA -> PA0
- 8013976:	0121      	lsls	r1, r4, #4
+ 8013972:	f7fe fe1e 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOA -> PA0 → SET PA11 HIGH (USB_DM)
+ 8013976:	0121      	lsls	r1, r4, #4 ;; r1 = 0x0100 = bit 8
  8013978:	4648      	mov	r0, r9
- 801397a:	f7fe fe1a 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOA -> PA0
- 801397e:	f44f 5880 	mov.w	r8, #4096	@ 0x1000
+ 801397a:	f7fe fe1a 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOA -> PA0 → SET PA8 HIGH (GPS_PWR on)
+ 801397e:	f44f 5880 	mov.w	r8, #4096	@ 0x1000 ;; r8=0x1000, used as pin constant throughout
  8013982:	f8ad 8000 	strh.w	r8, [sp]
  8013986:	f88d 7002 	strb.w	r7, [sp, #2]
  801398a:	2548      	movs	r5, #72	@ 0x48
  801398c:	f88d 5003 	strb.w	r5, [sp, #3]
  8013990:	4669      	mov	r1, sp
  8013992:	4648      	mov	r0, r9
- 8013994:	f7fe fb84 	bl	0x80120a0
- 8013998:	2037      	movs	r0, #55	@ 0x37
+ 8013994:	f7fe fb84 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOA, {PA12, input PU}) → USB_DP
+ 8013998:	2037      	movs	r0, #55	@ 0x37 ;; pins = 0x0037 = PA0,1,2,4,5
  801399a:	f8ad 0000 	strh.w	r0, [sp]
  801399e:	2602      	movs	r6, #2
  80139a0:	f88d 6002 	strb.w	r6, [sp, #2]
@@ -30936,53 +32540,53 @@
  80139a6:	f88d 0003 	strb.w	r0, [sp, #3]
  80139aa:	4669      	mov	r1, sp
  80139ac:	4648      	mov	r0, r9
- 80139ae:	f7fe fb77 	bl	0x80120a0
- 80139b2:	4668      	mov	r0, sp
- 80139b4:	f7fe fdff 	bl	0x80125b6
- 80139b8:	f641 30cf 	movw	r0, #7119	@ 0x1bcf
+ 80139ae:	f7fe fb77 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOA, {PA0-2,4,5, analog}) → ADC+DAC
+ 80139b2:	4668      	mov	r0, sp ;; -- STEP 3: PORT B (0x40010C00) --
+ 80139b4:	f7fe fdff 	bl	0x80125b6 ;; gpio_init_struct_default(sp)
+ 80139b8:	f641 30cf 	movw	r0, #7119	@ 0x1bcf ;; pins = 0x1BCF = PB0-3,6-9,11,12
  80139bc:	f8ad 0000 	strh.w	r0, [sp]
  80139c0:	f88d 6002 	strb.w	r6, [sp, #2]
  80139c4:	f88d 4003 	strb.w	r4, [sp, #3]
- 80139c8:	f8df 9130 	ldr.w	r9, [pc, #304]	@ 0x8013afc                    ; = 0x40010C00 (GPIOB)
+ 80139c8:	f8df 9130 	ldr.w	r9, [pc, #304]	@ 0x8013afc                    ; = 0x40010C00 (GPIOB) ;; r9 = GPIOB base
  80139cc:	4669      	mov	r1, sp
  80139ce:	4648      	mov	r0, r9
- 80139d0:	f7fe fb66 	bl	0x80120a0
- 80139d4:	f44f 518d 	mov.w	r1, #4512	@ 0x11a0
+ 80139d0:	f7fe fb66 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOB, {0x1BCF, out-OD}) → RF,I2C,AMP,LED,Flash
+ 80139d4:	f44f 518d 	mov.w	r1, #4512	@ 0x11a0 ;; r1 = 0x11A0 = bits 5,7,8,12
  80139d8:	4648      	mov	r0, r9
- 80139da:	f7fe fdf4 	bl	0x80125c6
- 80139de:	2030      	movs	r0, #48	@ 0x30
+ 80139da:	f7fe fdf4 	bl	0x80125c6 ;; gpio_pin_read_fast → CLR PB5(ENC_B),PB7(I2C_SDA),PB8(AMP_EN),PB12(SPI2_CS)
+ 80139de:	2030      	movs	r0, #48	@ 0x30 ;; pins = 0x0030 = PB4,PB5
  80139e0:	f8ad 0000 	strh.w	r0, [sp]
  80139e4:	f88d 7002 	strb.w	r7, [sp, #2]
  80139e8:	f88d 5003 	strb.w	r5, [sp, #3]
  80139ec:	4669      	mov	r1, sp
  80139ee:	4648      	mov	r0, r9
- 80139f0:	f7fe fb56 	bl	0x80120a0
- 80139f4:	f44f 4020 	mov.w	r0, #40960	@ 0xa000
+ 80139f0:	f7fe fb56 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOB, {PB4-5, input PU}) → rotary encoder
+ 80139f4:	f44f 4020 	mov.w	r0, #40960	@ 0xa000 ;; pins = 0xA000 = PB13,PB15
  80139f8:	f8ad 0000 	strh.w	r0, [sp]
  80139fc:	f88d 6002 	strb.w	r6, [sp, #2]
- 8013a00:	2018      	movs	r0, #24
+ 8013a00:	2018      	movs	r0, #24 ;; mode = 0x18 (AF open-drain)
  8013a02:	f88d 0003 	strb.w	r0, [sp, #3]
  8013a06:	4669      	mov	r1, sp
  8013a08:	4648      	mov	r0, r9
  8013a0a:	f7fe fb49 	bl	0x80120a0
- 8013a0e:	02a0      	lsls	r0, r4, #10
+ 8013a0e:	02a0      	lsls	r0, r4, #10 ;; r0 = 0x4000 = PB14
  8013a10:	f8ad 0000 	strh.w	r0, [sp]
- 8013a14:	2004      	movs	r0, #4
+ 8013a14:	2004      	movs	r0, #4 ;; mode = 0x04 (input floating)
  8013a16:	f88d 0003 	strb.w	r0, [sp, #3]
  8013a1a:	4669      	mov	r1, sp
  8013a1c:	4648      	mov	r0, r9
- 8013a1e:	f7fe fb3f 	bl	0x80120a0
- 8013a22:	4668      	mov	r0, sp
- 8013a24:	f7fe fdc7 	bl	0x80125b6
- 8013a28:	f647 607f 	movw	r0, #32383	@ 0x7e7f
+ 8013a1e:	f7fe fb3f 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOB, {PB14, input-float}) → SPI2 MISO
+ 8013a22:	4668      	mov	r0, sp ;; -- STEP 4: PORT C (0x40011000) --
+ 8013a24:	f7fe fdc7 	bl	0x80125b6 ;; gpio_init_struct_default(sp)
+ 8013a28:	f647 607f 	movw	r0, #32383	@ 0x7e7f ;; pins = 0x7E7F = PC0-6,9-14
  8013a2c:	f8ad 0000 	strh.w	r0, [sp]
  8013a30:	f88d 6002 	strb.w	r6, [sp, #2]
  8013a34:	f88d 4003 	strb.w	r4, [sp, #3]
- 8013a38:	f8df 90c4 	ldr.w	r9, [pc, #196]	@ 0x8013b00                    ; = 0x40011000 (GPIOC)
+ 8013a38:	f8df 90c4 	ldr.w	r9, [pc, #196]	@ 0x8013b00                    ; = 0x40011000 (GPIOC) ;; r9 = GPIOC base
  8013a3c:	4669      	mov	r1, sp
  8013a3e:	4648      	mov	r0, r9
- 8013a40:	f7fe fb2e 	bl	0x80120a0
- 8013a44:	2110      	movs	r1, #16
+ 8013a40:	f7fe fb2e 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOC, {0x7E7F, out-OD}) → LCD data+ctrl
+ 8013a44:	2110      	movs	r1, #16 ;; r1 = 0x10 = bit 4
  8013a46:	4648      	mov	r0, r9
  8013a48:	f7fe fdb1 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOC -> PC4/BAND_RELAY(!)
  8013a4c:	2140      	movs	r1, #64	@ 0x40
@@ -30991,54 +32595,54 @@
  8013a54:	4641      	mov	r1, r8
  8013a56:	4648      	mov	r0, r9
  8013a58:	f7fe fda9 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOC -> PC12/BEEP_SW
- 8013a5c:	01a1      	lsls	r1, r4, #6
+ 8013a5c:	01a1      	lsls	r1, r4, #6 ;; r1 = 0x400 = bit 10
  8013a5e:	4648      	mov	r0, r9
- 8013a60:	f7fe fda7 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOC -> PC12/BEEP_SW
- 8013a64:	f248 1180 	movw	r1, #33152	@ 0x8180
+ 8013a60:	f7fe fda7 	bl	0x80125b2                                        ; gpio_bits_set ;; SET PC10 (LCD_D6) HIGH
+ 8013a64:	f248 1180 	movw	r1, #33152	@ 0x8180 ;; pins = 0x8180 = PC7,PC8,PC15
  8013a68:	f8ad 1000 	strh.w	r1, [sp]
  8013a6c:	f88d 5003 	strb.w	r5, [sp, #3]
  8013a70:	4669      	mov	r1, sp
  8013a72:	4648      	mov	r0, r9
- 8013a74:	f7fe fb14 	bl	0x80120a0
- 8013a78:	4668      	mov	r0, sp
- 8013a7a:	f7fe fd9c 	bl	0x80125b6
- 8013a7e:	f64f 780f 	movw	r8, #65295	@ 0xff0f
+ 8013a74:	f7fe fb14 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOC, {PC7+8+15, input PU})
+ 8013a78:	4668      	mov	r0, sp ;; -- STEP 5: PORT D (0x40011400) --
+ 8013a7a:	f7fe fd9c 	bl	0x80125b6 ;; gpio_init_struct_default(sp)
+ 8013a7e:	f64f 780f 	movw	r8, #65295	@ 0xff0f ;; pins = 0xFF0F = PD0-3,PD8-15
  8013a82:	f8ad 8000 	strh.w	r8, [sp]
  8013a86:	f88d 6002 	strb.w	r6, [sp, #2]
  8013a8a:	f88d 4003 	strb.w	r4, [sp, #3]
- 8013a8e:	4e1d      	ldr	r6, [pc, #116]	@ (0x8013b04)                    ; = 0x40011400 (GPIOD)
+ 8013a8e:	4e1d      	ldr	r6, [pc, #116]	@ (0x8013b04)                    ; = 0x40011400 (GPIOD) ;; r6 = GPIOD base
  8013a90:	4669      	mov	r1, sp
  8013a92:	4630      	mov	r0, r6
- 8013a94:	f7fe fb04 	bl	0x80120a0
- 8013a98:	4641      	mov	r1, r8
+ 8013a94:	f7fe fb04 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOD, {0xFF0F, out-OD}) → LCD ctrl+data
+ 8013a98:	4641      	mov	r1, r8 ;; r1 = 0xFF0F (all configured D pins)
  8013a9a:	4630      	mov	r0, r6
- 8013a9c:	f7fe fd93 	bl	0x80125c6
- 8013aa0:	21f0      	movs	r1, #240	@ 0xf0
+ 8013a9c:	f7fe fd93 	bl	0x80125c6 ;; CLR PD0-3(LCD WR,CS,RST,DC) + PD8-15(LCD data upper)
+ 8013aa0:	21f0      	movs	r1, #240	@ 0xf0 ;; pins = 0xF0 = PD4-7
  8013aa2:	f8ad 1000 	strh.w	r1, [sp]
  8013aa6:	f88d 5003 	strb.w	r5, [sp, #3]
  8013aaa:	4669      	mov	r1, sp
  8013aac:	4630      	mov	r0, r6
- 8013aae:	f7fe faf7 	bl	0x80120a0
- 8013ab2:	4668      	mov	r0, sp
- 8013ab4:	f7fe fd7f 	bl	0x80125b6
- 8013ab8:	f64f 7092 	movw	r0, #65426	@ 0xff92
+ 8013aae:	f7fe faf7 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOD, {PD4-7, input PU}) → keypad rows
+ 8013ab2:	4668      	mov	r0, sp ;; -- STEP 6: PORT E (0x40011800) --
+ 8013ab4:	f7fe fd7f 	bl	0x80125b6 ;; gpio_init_struct_default(sp)
+ 8013ab8:	f64f 7092 	movw	r0, #65426	@ 0xff92 ;; pins = 0xFF92 = PE1,4,7-15
  8013abc:	f8ad 0000 	strh.w	r0, [sp]
  8013ac0:	f88d 7002 	strb.w	r7, [sp, #2]
  8013ac4:	f88d 4003 	strb.w	r4, [sp, #3]
- 8013ac8:	4c0f      	ldr	r4, [pc, #60]	@ (0x8013b08)                     ; = 0x40011800 (GPIOE)
+ 8013ac8:	4c0f      	ldr	r4, [pc, #60]	@ (0x8013b08)                     ; = 0x40011800 (GPIOE) ;; r4 = GPIOE base
  8013aca:	4669      	mov	r1, sp
  8013acc:	4620      	mov	r0, r4
- 8013ace:	f7fe fae7 	bl	0x80120a0
- 8013ad2:	f44f 410d 	mov.w	r1, #36096	@ 0x8d00
+ 8013ace:	f7fe fae7 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOE, {0xFF92, out-OD}) → mute,RF,BK4829
+ 8013ad2:	f44f 410d 	mov.w	r1, #36096	@ 0x8d00 ;; r1 = 0x8D00 = PE8,10,11,15
  8013ad6:	4620      	mov	r0, r4
- 8013ad8:	f7fe fd75 	bl	0x80125c6
- 8013adc:	216d      	movs	r1, #109	@ 0x6d
+ 8013ad8:	f7fe fd75 	bl	0x80125c6 ;; CLR PE8(BK4829_CS1),PE10(MOSI),PE11(MISO),PE15(BK4829_CS2)
+ 8013adc:	216d      	movs	r1, #109	@ 0x6d ;; pins = 0x006D = PE0,2,3,5,6
  8013ade:	f8ad 1000 	strh.w	r1, [sp]
  8013ae2:	f88d 5003 	strb.w	r5, [sp, #3]
  8013ae6:	4669      	mov	r1, sp
  8013ae8:	4620      	mov	r0, r4
- 8013aea:	f7fe fad9 	bl	0x80120a0
- 8013aee:	e8bd 83f8 	ldmia.w	sp!, {r3, r4, r5, r6, r7, r8, r9, pc}
+ 8013aea:	f7fe fad9 	bl	0x80120a0 ;; gpio_pin_config_table(GPIOE, {PE0,2,3,5,6, input PU}) → PTT+misc
+ 8013aee:	e8bd 83f8 	ldmia.w	sp!, {r3, r4, r5, r6, r7, r8, r9, pc} ;; return - all 5 ports configured
 
 ; --- DATA @ 0x08013AF2 --------------------------------------------
   0x08013AF0: F8 83 00 00 10 40 0C 38 00 08 01 40 00 0C 01 40  |.....@.8...@...@| [+8] 0x40010800=GPIOA; [+12] 0x40010C00=GPIOB
@@ -31613,34 +33217,34 @@
 ;; Also shared bus with BK4829 (different CS pins: PD8/PD9)
 ;; ═══════════════════════════════════════════════════════════════════
  8014000:	b510      	push	{r4, lr}
- 8014002:	b086      	sub	sp, #24
- 8014004:	f44f 5180 	mov.w	r1, #4096	@ 0x1000
+ 8014002:	b086      	sub	sp, #24 ;; alloc spi_init struct
+ 8014004:	f44f 5180 	mov.w	r1, #4096	@ 0x1000 ;; r1 = 0x1000 = GPIO_PIN_12 (PB12/FLASH_CS)
  8014008:	4814      	ldr	r0, [pc, #80]	@ (0x801405c)                     ; = 0x40010C00 (GPIOB)
- 801400a:	f7fe fad2 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOB -> PB12/FLASH_CS
+ 801400a:	f7fe fad2 	bl	0x80125b2                                        ; gpio_bits_set ;; SET GPIOB -> PB12/FLASH_CS ;; PB12 HIGH = CS deassert (flash deselect)
  801400e:	2001      	movs	r0, #1
- 8014010:	f7f6 fca7 	bl	0x800a962                                        ; delay_short
- 8014014:	2000      	movs	r0, #0
- 8014016:	f8ad 0004 	strh.w	r0, [sp, #4]
- 801401a:	f44f 7182 	mov.w	r1, #260	@ 0x104
- 801401e:	f8ad 1006 	strh.w	r1, [sp, #6]
- 8014022:	f8ad 0008 	strh.w	r0, [sp, #8]
- 8014026:	2102      	movs	r1, #2
- 8014028:	f8ad 100a 	strh.w	r1, [sp, #10]
- 801402c:	2101      	movs	r1, #1
- 801402e:	f8ad 100c 	strh.w	r1, [sp, #12]
- 8014032:	0249      	lsls	r1, r1, #9
- 8014034:	f8ad 100e 	strh.w	r1, [sp, #14]
- 8014038:	2108      	movs	r1, #8
- 801403a:	f8ad 1010 	strh.w	r1, [sp, #16]
- 801403e:	f8ad 0012 	strh.w	r0, [sp, #18]
- 8014042:	f8ad 0014 	strh.w	r0, [sp, #20]
+ 8014010:	f7f6 fca7 	bl	0x800a962                                        ; delay_short ;; short delay for CS setup time
+ 8014014:	2000      	movs	r0, #0 ;; clear for struct init
+ 8014016:	f8ad 0004 	strh.w	r0, [sp, #4] ;; spi.mode = SPI_MASTER (0)
+ 801401a:	f44f 7182 	mov.w	r1, #260	@ 0x104 ;; 0x104 = bidirectional / 2-line mode
+ 801401e:	f8ad 1006 	strh.w	r1, [sp, #6] ;; spi.transfer_dir = FULL_DUPLEX_TX
+ 8014022:	f8ad 0008 	strh.w	r0, [sp, #8] ;; spi.data_size = 8-bit
+ 8014026:	2102      	movs	r1, #2 ;; prescaler = /4
+ 8014028:	f8ad 100a 	strh.w	r1, [sp, #10] ;; spi.clk_div = PCLK1/4 (30MHz)
+ 801402c:	2101      	movs	r1, #1 ;; value = 1
+ 801402e:	f8ad 100c 	strh.w	r1, [sp, #12] ;; spi.cs_mode = software (NSS)
+ 8014032:	0249      	lsls	r1, r1, #9 ;; r1 = 1<<9 = 0x200 = SSI bit
+ 8014034:	f8ad 100e 	strh.w	r1, [sp, #14] ;; spi.cs_idle_level = SSI high
+ 8014038:	2108      	movs	r1, #8 ;; data frame = 8-bit
+ 801403a:	f8ad 1010 	strh.w	r1, [sp, #16] ;; spi.data_first = MSB first
+ 801403e:	f8ad 0012 	strh.w	r0, [sp, #18] ;; spi.clk_polarity = 0 (idle low, mode 0)
+ 8014042:	f8ad 0014 	strh.w	r0, [sp, #20] ;; spi.clk_phase = 0 (sample on 1st edge)
  8014046:	4c06      	ldr	r4, [pc, #24]	@ (0x8014060)                     ; = 0x40003800 (SPI2)
  8014048:	a901      	add	r1, sp, #4
  801404a:	4620      	mov	r0, r4
- 801404c:	f008 f915 	bl	0x801c27a
+ 801404c:	f008 f915 	bl	0x801c27a ;; spi_config(SPI2, spi_struct) - apply config
  8014050:	2101      	movs	r1, #1
  8014052:	4620      	mov	r0, r4
- 8014054:	f008 f8fa 	bl	0x801c24c
+ 8014054:	f008 f8fa 	bl	0x801c24c ;; spi_enable(SPI2, 1) + flash_subsystem_init
  8014058:	b006      	add	sp, #24
  801405a:	bd10      	pop	{r4, pc}
 
@@ -32633,39 +34237,69 @@
 ; ║  Calls: memcpy, memset_zero_r2, font_glyph_bitmap_medium, font_glyph_addr_small, font_glyph_bitmap_small (+5 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_text_render [DISPLAY] - Text rendering core (638B, 14 callers, 10 subcalls). Complex glyph rendering.
+; -- display_text_render -------------------------------------------------
+; Text rendering core (638B, 14 callers). Renders a string to LCD
+; framebuffer using font glyph lookup and bitmap blitting.
+;
+; Args (mixed register + stack):
+;   r0 / sp[0x94] = LCD framebuffer pointer
+;   r1 = x position (pixel offset, incremented per glyph)
+;   r2 = string pointer (r8)
+;   r3 = font size selector (sl): 12=small, 16=medium, 24=large
+;   sp[0xC8] = y position (r6)
+;   sp[0xCC] = glyph width (r7)
+;   sp[0xD0] = inter-char gap (r9, 0=none)
+;
+; Glyph rendering loop:
+;   For each byte in string:
+;   1. If byte == 0: end of string → return
+;   2. If byte >= 0xA1: CJK/extended char (2-byte sequence)
+;      → Font lookup by size: 24→font_glyph_bitmap_large (25×24)
+;                               16→font_glyph_bitmap_medium (19×16)
+;                               12→font_glyph_bitmap_small (12×12)
+;      → Blit glyph to framebuffer, advance x by glyph width
+;      → If inter-char gap: fill gap rectangle, advance x by gap
+;      → Consume 2 bytes (i += 2)
+;   3. If byte < 0xA1: ASCII char (1-byte)
+;      → Font lookup by size: 24→12×24, 16→8×16, 12→6×12
+;      → Blit glyph to framebuffer, advance x by ASCII width
+;      → Consume 1 byte (i += 1)
+;
+; Internal: 148B stack frame (128B glyph buffer + locals)
+; ------------------------------------------------------------------------
  80149b8:	e92d 4fff 	stmdb	sp!, {r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, sl, fp, lr}
- 80149bc:	b0a5      	sub	sp, #148	@ 0x94
+ 80149bc:	b0a5      	sub	sp, #148 ;; 148B stack: 128B glyph buffer + locals	@ 0x94
  80149be:	460c      	mov	r4, r1
  80149c0:	e9dd 7933 	ldrd	r7, r9, [sp, #204]	@ 0xcc
  80149c4:	9e32      	ldr	r6, [sp, #200]	@ 0xc8
  80149c6:	4690      	mov	r8, r2
  80149c8:	469a      	mov	sl, r3
- 80149ca:	2180      	movs	r1, #128	@ 0x80
+ 80149ca:	2180      	movs	r1, #128 ;; memset glyph buffer to 0x80	@ 0x80
  80149cc:	a805      	add	r0, sp, #20
  80149ce:	f7ec fb22 	bl	0x8001016
  80149d2:	2500      	movs	r5, #0
- 80149d4:	f818 0005 	ldrb.w	r0, [r8, r5]
+ 80149d4:	f818 0005 	ldrb.w	r0, [r8, r5] ;; read next char from string
  80149d8:	2800      	cmp	r0, #0
  80149da:	d036      	beq.n	0x8014a4a
- 80149dc:	28a1      	cmp	r0, #161	@ 0xa1
+ 80149dc:	28a1      	cmp	r0, #161 ;; >= 0xA1 → CJK/extended char	@ 0xa1
  80149de:	d365      	bcc.n	0x8014aac
  80149e0:	eb08 0005 	add.w	r0, r8, r5
  80149e4:	7841      	ldrb	r1, [r0, #1]
  80149e6:	b319      	cbz	r1, 0x8014a30
- 80149e8:	f1ba 0f10 	cmp.w	sl, #16
+ 80149e8:	f1ba 0f10 	cmp.w	sl, #16 ;; font size == 16 → medium
  80149ec:	d040      	beq.n	0x8014a70
- 80149ee:	f1ba 0f0c 	cmp.w	sl, #12
+ 80149ee:	f1ba 0f0c 	cmp.w	sl, #12 ;; font size == 12 → small
  80149f2:	d04c      	beq.n	0x8014a8e
  80149f4:	a905      	add	r1, sp, #20
  80149f6:	f010 ff55 	bl	0x80258a4
  80149fa:	a805      	add	r0, sp, #20
  80149fc:	e88d 00c1 	stmia.w	sp, {r0, r6, r7}
- 8014a00:	2318      	movs	r3, #24
- 8014a02:	2219      	movs	r2, #25
+ 8014a00:	2318      	movs	r3, #24 ;; glyph height = 24 (large CJK)
+ 8014a02:	2219      	movs	r2, #25 ;; glyph width = 25 (large CJK)
  8014a04:	4621      	mov	r1, r4
  8014a06:	9825      	ldr	r0, [sp, #148]	@ 0x94
  8014a08:	f011 ff36 	bl	0x8026878
- 8014a0c:	3419      	adds	r4, #25
+ 8014a0c:	3419      	adds	r4, #25 ;; advance x by 25 pixels (large CJK width)
  8014a0e:	b2a4      	uxth	r4, r4
  8014a10:	f1b9 0f00 	cmp.w	r9, #0
  8014a14:	d009      	beq.n	0x8014a2a
@@ -32895,7 +34529,9 @@
 ; ║  Calls: delay_us_maybe, gpio_bits_reset, gpio_bits_set, lcd_data_bus_ctrl, gpio_data_strobe  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_init_engine [DISPLAY] - Display initialization engine (large). Called from oem_main. Sets up LCD layout, renders initial scr...
- 8014c3c:	f011 be8a 	b.w	0x8026954
+ 8014c3c:	f011 be8a 	b.w	0x8026954 ;; → LCD_Init (ST7789V) - see DATA @ 0x08026952
+;   pop {r4, lr}; return
+; ------------------------------------------------------------------------
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  gpio_mode_config                                                        ║
 ; ║  0x08014C40  size=66                                            ║
@@ -34394,76 +36030,98 @@
 ; ║  Calls: rf_audio_gate_ctrl, display_periodic_refresh, audio_ui_update, audio_state_machine, null_stub (+21 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ;; ═══════════════════════════════════════════════════════════════════
-;; MAIN_TASK_DISPATCH - Application-level task dispatcher
+;; MAIN_TASK_DISPATCH - Infinite super-loop (boot step [7], never returns)
 ;;
-;; Called from main loop. Dispatches to:
-;;   - audio_state_machine (beep/tone control)
-;;   - RF state handlers (frequency, mode changes)
-;;   - Display update
-;;   - Keypad scan
-;;   - RSSI/squelch monitoring
+;; This is the firmware's main polling loop. Called from oem_main after
+;; all init is complete. Dispatches tasks based on g_rf_state[1] (mode).
 ;;
-;; Reads GPIOE for PTT state, checks g_rf_state for mode
-;; This is the "super_loop" equivalent in OEM firmware
+;; ALWAYS-RUN tasks (every iteration):
+;;   state_query()           - check system state flags
+;;   dac_dma_audio_engine()  - feed audio DMA buffer
+;;   bk4829_quick_check(sp)  - poll BK4829 RF chip status (no IRQ)
+;;   multi_init_dispatch()   - flash/LCD/DAC/status init
+;;   display_periodic_refresh() - LCD frame update
+;;
+;; MODE DISPATCH (g_rf_state[1] selects handler):
+;;   Mode 0: rf_calibration_engine  - RF calibration (default/fallthrough)
+;;   Mode 1: bk4829_rf_control      - direct RF transceiver control
+;;   Mode 2: settings_menu_engine   - settings menu UI
+;;   Mode 3: radio_rx_engine        - receive engine
+;;   Mode 4: system_settings_handler - system configuration
+;;   Mode 5: rx_flag_check          - RX flag polling
+;;   Mode 6: rf_calibration_engine  - RF calibration (explicit)
+;;   Mode 7: radio_main_handler     - primary radio handler
+;;   Mode 11: rf_status_query       - query RF status
+;;   Mode 13: rf_config_apply       - apply RF config (post-display)
+;;   Mode 17: bk4829_init_check     - BK4829 initialization verify
+;;   Mode 20: audio_ui_update       - audio UI state machine
+;;   Mode 21: bt_flash_comms        - Bluetooth/flash communications
+;;
+;; CONDITIONAL tasks:
+;;   keypad_audio_handler()  - runs if RAM[0x2000AF72] != 0
+;;   rf_config_apply()       - runs if mode == 13 (after display sync)
+;;   rf_audio_gate_ctrl(0)   - runs if bk4829 scan == 3 or 4
+;;
+;; Loop back: b.n 0x8016b96 (to dac_dma_audio_engine)
 ;; ═══════════════════════════════════════════════════════════════════
- 8016b64:	b51c      	push	{r2, r3, r4, lr}
+ 8016b64:	b51c      	push	{r2, r3, r4, lr} ;; -- LOOP INIT: clear per-frame state --
  8016b66:	4c45      	ldr	r4, [pc, #276]	@ (0x8016c7c)                    ; = 0x2000A3B4 (g_rf_state)
- 8016b68:	2000      	movs	r0, #0
- 8016b6a:	7060      	strb	r0, [r4, #1]
- 8016b6c:	70e0      	strb	r0, [r4, #3]
- 8016b6e:	7020      	strb	r0, [r4, #0]
- 8016b70:	7520      	strb	r0, [r4, #20]
- 8016b72:	f884 0034 	strb.w	r0, [r4, #52]	@ 0x34
- 8016b76:	f884 004b 	strb.w	r0, [r4, #75]	@ 0x4b
- 8016b7a:	2108      	movs	r1, #8
+ 8016b68:	2000      	movs	r0, #0 ;; zero constant for clears
+ 8016b6a:	7060      	strb	r0, [r4, #1] ;; g_rf_state[1] = 0 (mode)
+ 8016b6c:	70e0      	strb	r0, [r4, #3] ;; g_rf_state[3] = 0
+ 8016b6e:	7020      	strb	r0, [r4, #0] ;; g_rf_state[0] = 0 (active flag)
+ 8016b70:	7520      	strb	r0, [r4, #20] ;; g_rf_state[20] = 0
+ 8016b72:	f884 0034 	strb.w	r0, [r4, #52]	@ 0x34 ;; g_rf_state[52] = 0
+ 8016b76:	f884 004b 	strb.w	r0, [r4, #75]	@ 0x4b ;; g_rf_state[75] = 0
+ 8016b7a:	2108      	movs	r1, #8 ;; PE3 (PTT1) - check if held during boot
  8016b7c:	4840      	ldr	r0, [pc, #256]	@ (0x8016c80)                    ; = 0x40011800 (GPIOE)
  8016b7e:	f7fb fd0c 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOE -> PE3/PTT1
- 8016b82:	b928      	cbnz	r0, 0x8016b90
- 8016b84:	f7fc fa38 	bl	0x8012ff8
- 8016b88:	280a      	cmp	r0, #10
+ 8016b82:	b928      	cbnz	r0, 0x8016b90 ;; if PTT1 pressed → skip module_init
+ 8016b84:	f7fc fa38 	bl	0x8012ff8 ;; gpio_output_control() - keypad scan
+ 8016b88:	280a      	cmp	r0, #10 ;; key code 10?
  8016b8a:	d101      	bne.n	0x8016b90
- 8016b8c:	f7f6 fe78 	bl	0x800d880
- 8016b90:	f7f2 fbfa 	bl	0x8009388
+ 8016b8c:	f7f6 fe78 	bl	0x800d880 ;; module_init_dispatch() - init on key match
+ 8016b90:	f7f2 fbfa 	bl	0x8009388 ;; -- ALWAYS: state_query() --
  8016b94:	4d3b      	ldr	r5, [pc, #236]	@ (0x8016c84)                    ; = 0x2000AF70 (RAM+0xAF70)
- 8016b96:	f7f3 fbbd 	bl	0x800a314
+ 8016b96:	f7f3 fbbd 	bl	0x800a314 ;; -- LOOP TOP -- dac_dma_audio_engine() - feed audio DMA
  8016b9a:	4668      	mov	r0, sp
- 8016b9c:	f003 ff97 	bl	0x801aace
- 8016ba0:	f7f1 fe18 	bl	0x80087d4
- 8016ba4:	b168      	cbz	r0, 0x8016bc2
- 8016ba6:	9801      	ldr	r0, [sp, #4]
- 8016ba8:	28ff      	cmp	r0, #255	@ 0xff
+ 8016b9c:	f003 ff97 	bl	0x801aace ;; bk4829_quick_check(sp) - poll RF chip (no IRQ)
+ 8016ba0:	f7f1 fe18 	bl	0x80087d4 ;; null_stub() - placeholder/NOP
+ 8016ba4:	b168      	cbz	r0, 0x8016bc2 ;; if stub returned 0 → skip to mode dispatch
+ 8016ba6:	9801      	ldr	r0, [sp, #4] ;; r0 = sp[4] (bk4829 scan result)
+ 8016ba8:	28ff      	cmp	r0, #255	@ 0xff ;; 0xFF = no pending action
  8016baa:	d00a      	beq.n	0x8016bc2
  8016bac:	9801      	ldr	r0, [sp, #4]
- 8016bae:	2803      	cmp	r0, #3
+ 8016bae:	2803      	cmp	r0, #3 ;; scan result == 3?
  8016bb0:	d002      	beq.n	0x8016bb8
  8016bb2:	9801      	ldr	r0, [sp, #4]
- 8016bb4:	2804      	cmp	r0, #4
+ 8016bb4:	2804      	cmp	r0, #4 ;; scan result == 4?
  8016bb6:	d102      	bne.n	0x8016bbe
- 8016bb8:	2000      	movs	r0, #0
- 8016bba:	f7ec ff1d 	bl	0x80039f8
- 8016bbe:	20ff      	movs	r0, #255	@ 0xff
- 8016bc0:	9001      	str	r0, [sp, #4]
- 8016bc2:	7820      	ldrb	r0, [r4, #0]
- 8016bc4:	2801      	cmp	r0, #1
+ 8016bb8:	2000      	movs	r0, #0 ;; -- BK4829 action 3 or 4 --
+ 8016bba:	f7ec ff1d 	bl	0x80039f8 ;; rf_audio_gate_ctrl(0) - gate audio
+ 8016bbe:	20ff      	movs	r0, #255	@ 0xff ;; mark action consumed
+ 8016bc0:	9001      	str	r0, [sp, #4] ;; sp[4] = 0xFF
+ 8016bc2:	7820      	ldrb	r0, [r4, #0] ;; -- MODE DISPATCH on g_rf_state[0] --
+ 8016bc4:	2801      	cmp	r0, #1 ;; active_flag == 1 → mode 1 path
  8016bc6:	d00f      	beq.n	0x8016be8
  8016bc8:	2802      	cmp	r0, #2
- 8016bca:	d022      	beq.n	0x8016c12
+ 8016bca:	d022      	beq.n	0x8016c12 ;; active_flag == 2 → skip dispatch, post-tasks
  8016bcc:	9801      	ldr	r0, [sp, #4]
  8016bce:	28ff      	cmp	r0, #255	@ 0xff
- 8016bd0:	d01d      	beq.n	0x8016c0e
- 8016bd2:	7860      	ldrb	r0, [r4, #1]
+ 8016bd0:	d01d      	beq.n	0x8016c0e ;; sp[4]==0xFF → no action, skip to multi_init
+ 8016bd2:	7860      	ldrb	r0, [r4, #1] ;; -- SWITCH on g_rf_state[1] (mode) --
  8016bd4:	2807      	cmp	r0, #7
- 8016bd6:	d038      	beq.n	0x8016c4a
+ 8016bd6:	d038      	beq.n	0x8016c4a ;; mode 7 → radio_main_handler
  8016bd8:	dc0e      	bgt.n	0x8016bf8
- 8016bda:	2806      	cmp	r0, #6
+ 8016bda:	2806      	cmp	r0, #6 ;; mode 6+ → rf_calibration_engine (default)
  8016bdc:	d214      	bcs.n	0x8016c08
- 8016bde:	e8df f000 	tbb	[pc, r0]
+ 8016bde:	e8df f000 	tbb	[pc, r0] ;; modes 0-5 table branch
  8016be2:	2813      	cmp	r0, #19
  8016be4:	2c20      	cmp	r4, #32
  8016be6:	4430      	add	r0, r6
  8016be8:	4668      	mov	r0, sp
- 8016bea:	f004 fa31 	bl	0x801b050
- 8016bee:	f7f6 fc2b 	bl	0x800d448
+ 8016bea:	f004 fa31 	bl	0x801b050 ;; [MODE 1] bk4829_rf_control(sp)
+ 8016bee:	f7f6 fc2b 	bl	0x800d448 ;; subsystem_poll()
  8016bf2:	f7ef fcbf 	bl	0x8006574                                        ; audio_state_machine
  8016bf6:	e00c      	b.n	0x8016c12
  8016bf8:	280b      	cmp	r0, #11
@@ -34474,49 +36132,49 @@
  8016c02:	d012      	beq.n	0x8016c2a
  8016c04:	2815      	cmp	r0, #21
  8016c06:	d02c      	beq.n	0x8016c62
- 8016c08:	4668      	mov	r0, sp
- 8016c0a:	f001 ff8d 	bl	0x8018b28
- 8016c0e:	f00c f87f 	bl	0x8022d10
- 8016c12:	78a8      	ldrb	r0, [r5, #2]
- 8016c14:	b108      	cbz	r0, 0x8016c1a
- 8016c16:	f7f7 f8d1 	bl	0x800ddbc
- 8016c1a:	7860      	ldrb	r0, [r4, #1]
- 8016c1c:	280d      	cmp	r0, #13
+ 8016c08:	4668      	mov	r0, sp ;; [MODE 0/6] fallthrough
+ 8016c0a:	f001 ff8d 	bl	0x8018b28 ;; rf_calibration_engine(sp)
+ 8016c0e:	f00c f87f 	bl	0x8022d10 ;; -- POST: multi_init_dispatch() --
+ 8016c12:	78a8      	ldrb	r0, [r5, #2] ;; -- CONDITIONAL TASKS --
+ 8016c14:	b108      	cbz	r0, 0x8016c1a ;; if RAM[0x2000AF72] == 0 → skip keypad
+ 8016c16:	f7f7 f8d1 	bl	0x800ddbc ;; keypad_audio_handler() - scan + beep
+ 8016c1a:	7860      	ldrb	r0, [r4, #1] ;; check mode for post-dispatch action
+ 8016c1c:	280d      	cmp	r0, #13 ;; mode 13 → rf_config_apply
  8016c1e:	d028      	beq.n	0x8016c72
  8016c20:	e029      	b.n	0x8016c76
- 8016c22:	4668      	mov	r0, sp
- 8016c24:	f7fa ff4e 	bl	0x8011ac4
+ 8016c22:	4668      	mov	r0, sp ;; [MODE 2]
+ 8016c24:	f7fa ff4e 	bl	0x8011ac4 ;; settings_menu_engine(sp)
  8016c28:	e7f1      	b.n	0x8016c0e
- 8016c2a:	4668      	mov	r0, sp
- 8016c2c:	f7ef fb5a 	bl	0x80062e4
+ 8016c2a:	4668      	mov	r0, sp ;; [MODE 20]
+ 8016c2c:	f7ef fb5a 	bl	0x80062e4 ;; audio_ui_update(sp)
  8016c30:	e7ed      	b.n	0x8016c0e
- 8016c32:	4668      	mov	r0, sp
- 8016c34:	f001 fa5e 	bl	0x80180f4
+ 8016c32:	4668      	mov	r0, sp ;; [MODE 1 alt]
+ 8016c34:	f001 fa5e 	bl	0x80180f4 ;; radio_tx_engine(sp)
  8016c38:	e7e9      	b.n	0x8016c0e
- 8016c3a:	4668      	mov	r0, sp
- 8016c3c:	f001 fd1c 	bl	0x8018678
+ 8016c3a:	4668      	mov	r0, sp ;; [MODE 3]
+ 8016c3c:	f001 fd1c 	bl	0x8018678 ;; radio_rx_engine(sp)
  8016c40:	e7e5      	b.n	0x8016c0e
- 8016c42:	4668      	mov	r0, sp
- 8016c44:	f008 f986 	bl	0x801ef54
+ 8016c42:	4668      	mov	r0, sp ;; [MODE 4]
+ 8016c44:	f008 f986 	bl	0x801ef54 ;; system_settings_handler(sp)
  8016c48:	e7e1      	b.n	0x8016c0e
- 8016c4a:	4668      	mov	r0, sp
- 8016c4c:	f7f6 faaa 	bl	0x800d1a4
+ 8016c4a:	4668      	mov	r0, sp ;; [MODE 7]
+ 8016c4c:	f7f6 faaa 	bl	0x800d1a4 ;; radio_main_handler(sp)
  8016c50:	e7dd      	b.n	0x8016c0e
- 8016c52:	4668      	mov	r0, sp
- 8016c54:	f00c fa06 	bl	0x8023064
+ 8016c52:	4668      	mov	r0, sp ;; [MODE 11]
+ 8016c54:	f00c fa06 	bl	0x8023064 ;; rf_status_query(sp)
  8016c58:	e7d9      	b.n	0x8016c0e
- 8016c5a:	4668      	mov	r0, sp
- 8016c5c:	f003 ff52 	bl	0x801ab04
+ 8016c5a:	4668      	mov	r0, sp ;; [MODE 17]
+ 8016c5c:	f003 ff52 	bl	0x801ab04 ;; bk4829_init_check(sp)
  8016c60:	e7d5      	b.n	0x8016c0e
- 8016c62:	4668      	mov	r0, sp
- 8016c64:	f009 fd30 	bl	0x80206c8
+ 8016c62:	4668      	mov	r0, sp ;; [MODE 21]
+ 8016c64:	f009 fd30 	bl	0x80206c8 ;; bt_flash_comms(sp)
  8016c68:	e7d1      	b.n	0x8016c0e
- 8016c6a:	4668      	mov	r0, sp
- 8016c6c:	f001 fd38 	bl	0x80186e0
+ 8016c6a:	4668      	mov	r0, sp ;; [MODE 5]
+ 8016c6c:	f001 fd38 	bl	0x80186e0 ;; rx_flag_check(sp)
  8016c70:	e7cd      	b.n	0x8016c0e
- 8016c72:	f7f6 fed3 	bl	0x800da1c
- 8016c76:	f7ec ff61 	bl	0x8003b3c
- 8016c7a:	e78c      	b.n	0x8016b96
+ 8016c72:	f7f6 fed3 	bl	0x800da1c ;; rf_config_apply() - apply RF config
+ 8016c76:	f7ec ff61 	bl	0x8003b3c ;; -- ALWAYS: display_periodic_refresh() - LCD update --
+ 8016c7a:	e78c      	b.n	0x8016b96 ;; -- LOOP BACK to dac_dma_audio_engine --
 
 ; --- DATA @ 0x08016C7C --------------------------------------------
   0x08016C70: CD E7 F6 F7 D3 FE EC F7 61 FF 8C E7 B4 A3 00 20  |........a...... | [+12] 0x2000A3B4=g_rf_state
@@ -34685,16 +36343,47 @@
 ; ║  Calls: radio_tx_engine, printf_handler, struct_zero_fill, rf_state_manager, rf_state_manager (+8 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_state_manager [RF] - RF state manager (6KB, 5 callers). Refs g_rf. Manages RF subsystem state transitions.
+; -- rf_state_manager ----------------------------------------------------
+; RF subsystem state manager (5960B, 6KB). Central RF state machine that
+; manages VFO/channel/frequency transitions, keypad event routing, and
+; display updates for the radio's primary operating modes.
+;
+; Entry: called from audio_playback_handler, display_render, and others
+; Always: calls codec_state_check + rf_mode_check first
+;
+; Main dispatch via g_rf_state[3] (TBB, 12 states 0..10+):
+;   State 0: INIT - if timer running, draw "scanning" display, loop 4
+;            channels with printf_handler formatting, then reset
+;   State 1: IDLE - write RF param (mode 0x14), init channel scan
+;            structs, call printf for channel info display
+;   State 2: FREQ ENTRY - process frequency digit input, validate
+;   State 3: CHANNEL SELECT - channel up/down with wrap
+;   State 4: TX PREP - radio_tx_engine entry, check PTT state
+;   State 5: SCANNING - frequency/channel scan with step control
+;   State 6: PRIORITY SCAN - alternate between priority and scan channels
+;   State 7: VFO COPY - copy VFO settings between A/B
+;   State 8/9: RESERVED - additional scan modes
+;   State 10: DTMF/TONE - DTMF sequence send mode
+;
+; State struct @ 0x2000E6A0 (main), + 0x2000A360 (timer ref):
+;   Stride 72B per channel (4 channels max, index in r4 loop)
+;   Per-channel: [8..24] = display format buffer (16B)
+;   Timer at [4] checked against running count
+;
+; g_rf_state @ 0x2000A3B4:
+;   [3] = current state (dispatch key)
+;   Other fields used contextually per state
+; ------------------------------------------------------------------------
  8016f1c:	b5f8      	push	{r3, r4, r5, r6, r7, lr}
- 8016f1e:	f7f2 ff63 	bl	0x8009de8
- 8016f22:	f000 ffcf 	bl	0x8017ec4
- 8016f26:	4846      	ldr	r0, [pc, #280]	@ (0x8017040)                    ; = 0x2000A3B4 (g_rf_state)
- 8016f28:	4d46      	ldr	r5, [pc, #280]	@ (0x8017044)                    ; = 0x2000E6A0 (RAM+0xE6A0)
- 8016f2a:	78c0      	ldrb	r0, [r0, #3]
+ 8016f1e:	f7f2 ff63 	bl	0x8009de8 ;; codec_state_check
+ 8016f22:	f000 ffcf 	bl	0x8017ec4 ;; rf_mode_check (internal helper)
+ 8016f26:	4846      	ldr	r0, [pc, #280]	@ (0x8017040 ;; g_rf_state @ 0x2000A3B4)                    ; = 0x2000A3B4 (g_rf_state)
+ 8016f28:	4d46      	ldr	r5, [pc, #280]	@ (0x8017044 ;; channel state base @ 0x2000E6A0)                    ; = 0x2000E6A0 (RAM+0xE6A0)
+ 8016f2a:	78c0      	ldrb	r0, [r0, #3] ;; r0 = current state
  8016f2c:	f105 0408 	add.w	r4, r5, #8
- 8016f30:	280b      	cmp	r0, #11
+ 8016f30:	280b      	cmp	r0, #11 ;; 12 states (0..11)
  8016f32:	d27d      	bcs.n	0x8017030
- 8016f34:	e8df f000 	tbb	[pc, r0]
+ 8016f34:	e8df f000 	tbb	[pc, r0] ;; -- TBB state dispatch --
  8016f38:	1313      	asrs	r3, r2, #12
  8016f3a:	8306      	strh	r6, [r0, #24]
  8016f3c:	565a      	ldrsb	r2, [r3, r1]
@@ -34733,7 +36422,7 @@
  8016f8c:	a030      	add	r0, pc, #192	@ (adr r0, 0x8017050)
  8016f8e:	f7e9 fc53 	bl	0x8000838
  8016f92:	1c64      	adds	r4, r4, #1
- 8016f94:	2c04      	cmp	r4, #4
+ 8016f94:	2c04      	cmp	r4, #4 ;; loop 4 channels
  8016f96:	d3e8      	bcc.n	0x8016f6a
  8016f98:	e8bd 40f8 	ldmia.w	sp!, {r3, r4, r5, r6, r7, lr}
  8016f9c:	2100      	movs	r1, #0
@@ -35952,15 +37641,46 @@
 ; ║  Calls: radio_tx_engine, byte_to_word_pattern, memset_aligned, rf_state_quick_clear, radio_tx_engine (+28 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * radio_tx_engine [RF/TX] - TX engine (large). Refs DAC+DMA2+TMR6 (tone gen), g_calibration+g_config+g_rf. Handles DTMF encode, ...
+; -- radio_tx_engine -----------------------------------------------------
+; TX engine - main transmit state machine (72KB, largest single function).
+; Handles all transmit operations: PTT, DTMF encode, CTCSS/DCS generation,
+; power control, tone burst, and TX timeout management.
+;
+; Entry: r0 = state pointer (contains sub-command at [4])
+; State refs: g_rf_state @ 0x2000A3B4, TX ctrl @ 0x20000BAC
+;
+; Sub-command dispatch via [r3+4] (binary tree search):
+;   cmd  2: TX key-up (release)
+;   cmd  3: TX key-down (press)
+;   cmd  5: TX timeout handler
+;   cmd  7: DTMF digit send
+;   cmd 10: (implied from bgt chain)
+;   cmd 16: TX power level change
+;   cmd 17: CTCSS/DCS tone update
+;   cmd 18: TX audio mode switch
+;   cmd 19: TX complete/cleanup
+;   cmd 20: TX scan start (checks RAM+0x215)
+;   cmd 21: TX scan continue
+;   cmd 22: TX scan stop
+;   cmd 24: TX frequency update
+;   cmd 26: TX calibration
+;   cmd 28: Emergency TX
+;   cmd 29: APRS TX
+;   cmd 30: Cross-band repeat
+;
+; Common registers:
+;   r6 = g_rf_state, r5 = TX ctrl struct, r4 = 0xFF (sentinel)
+;   r0 = g_rf_state[3] (RF mode), r2 = g_rf_state[2] (sub-mode)
+; ------------------------------------------------------------------------
  80180f4:	b5f8      	push	{r3, r4, r5, r6, r7, lr}
  80180f6:	4603      	mov	r3, r0
- 80180f8:	4ed9      	ldr	r6, [pc, #868]	@ (0x8018460)                    ; = 0x2000A3B4 (g_rf_state)
+ 80180f8:	4ed9      	ldr	r6, [pc, #868]	@ (0x8018460 ;; g_rf_state @ 0x2000A3B4)                    ; = 0x2000A3B4 (g_rf_state)
  80180fa:	6859      	ldr	r1, [r3, #4]
  80180fc:	24ff      	movs	r4, #255	@ 0xff
- 80180fe:	4dd7      	ldr	r5, [pc, #860]	@ (0x801845c)                    ; = 0x20000BAC (RAM+0xBAC)
- 8018100:	78f0      	ldrb	r0, [r6, #3]
+ 80180fe:	4dd7      	ldr	r5, [pc, #860]	@ (0x801845c ;; TX ctrl @ 0x20000BAC)                    ; = 0x20000BAC (RAM+0xBAC)
+ 8018100:	78f0      	ldrb	r0, [r6, #3] ;; RF mode
  8018102:	78b2      	ldrb	r2, [r6, #2]
- 8018104:	2913      	cmp	r1, #19
+ 8018104:	2913      	cmp	r1, #19 ;; -- sub-command dispatch (binary search) --
  8018106:	d07c      	beq.n	0x8018202
  8018108:	dc10      	bgt.n	0x801812c
  801810a:	2907      	cmp	r1, #7
@@ -36503,41 +38223,59 @@
 ; ║  Calls: tick_delay_check, display_channel_info, rf_signal_measure, rf_channel_switch, rf_status_query  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * radio_rx_engine [RF/RX] - RX engine (large). Refs ALL GPIO + DAC/TMR6, g_calibration. Handles squelch, RX audio routing, signa...
- 8018678:	b570      	push	{r4, r5, r6, lr}
- 801867a:	6840      	ldr	r0, [r0, #4]
- 801867c:	2812      	cmp	r0, #18
- 801867e:	d028      	beq.n	0x80186d2
- 8018680:	2500      	movs	r5, #0
- 8018682:	4c16      	ldr	r4, [pc, #88]	@ (0x80186dc)                     ; = 0x2000022E (RAM+0x22E)
- 8018684:	2813      	cmp	r0, #19
- 8018686:	d00a      	beq.n	0x801869e
- 8018688:	2815      	cmp	r0, #21
- 801868a:	d015      	beq.n	0x80186b8
- 801868c:	281c      	cmp	r0, #28
- 801868e:	d020      	beq.n	0x80186d2
- 8018690:	28a0      	cmp	r0, #160	@ 0xa0
- 8018692:	d222      	bcs.n	0x80186da
- 8018694:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+; -- radio_rx_engine -----------------------------------------------------
+; Mode 3 dispatch handler from main_task_dispatch. Manages RX state
+; transitions: squelch open/close, signal measurement, channel switching.
+;
+; Sub-command dispatch (sp[4]):
+;   sub 18: rf_channel_switch → rf_signal_freq_update (tail-call)
+;   sub 19: SET squelch flag → tick_delay + rf_channel_switch +
+;           rf_signal_measure → display_screen_layout (squelch open)
+;   sub 21: CLR squelch flag → tick_delay(2) + rf_channel_switch +
+;           rf_signal_measure → display_screen_layout (squelch close)
+;   sub 28: same as 18 (rf_signal_freq_update)
+;   sub ≥160: return (no action)
+;   default: tick_delay_check(0)
+;
+; r4 = RAM[0x2000022E] (squelch state struct)
+;   r4[1] = squelch_open flag (1=open, 0=closed)
+;   r4[2] = signal counter (halfword, cleared on state change)
+; ------------------------------------------------------------------------
+ 8018678:	b570      	push	{r4, r5, r6, lr} ;; -- RADIO_RX_ENGINE: mode 3 handler --
+ 801867a:	6840      	ldr	r0, [r0, #4] ;; r0 = sp[4] (sub-command)
+ 801867c:	2812      	cmp	r0, #18 ;; sub 18?
+ 801867e:	d028      	beq.n	0x80186d2 ;; sub 18 → rf_signal_freq_update
+ 8018680:	2500      	movs	r5, #0 ;; r5 = 0 (used for clearing counters)
+ 8018682:	4c16      	ldr	r4, [pc, #88]	@ (0x80186dc)                     ; = 0x2000022E (RAM+0x22E) ;; r4 = squelch state @ 0x2000022E
+ 8018684:	2813      	cmp	r0, #19 ;; sub 19?
+ 8018686:	d00a      	beq.n	0x801869e ;; sub 19 → SQUELCH OPEN path
+ 8018688:	2815      	cmp	r0, #21 ;; sub 21?
+ 801868a:	d015      	beq.n	0x80186b8 ;; sub 21 → SQUELCH CLOSE path
+ 801868c:	281c      	cmp	r0, #28 ;; sub 28?
+ 801868e:	d020      	beq.n	0x80186d2 ;; sub 28 → same as 18 (freq update)
+ 8018690:	28a0      	cmp	r0, #160	@ 0xa0 ;; sub >= 160?
+ 8018692:	d222      	bcs.n	0x80186da ;; sub >= 160 → return (done)
+ 8018694:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- DEFAULT: tick_delay_check(0) --
  8018698:	2000      	movs	r0, #0
- 801869a:	f7ee bd11 	b.w	0x80070c0
- 801869e:	2001      	movs	r0, #1
- 80186a0:	7060      	strb	r0, [r4, #1]
- 80186a2:	f7ee fd0d 	bl	0x80070c0
- 80186a6:	8065      	strh	r5, [r4, #2]
- 80186a8:	f006 f9be 	bl	0x801ea28
- 80186ac:	f7f3 fa00 	bl	0x800bab0
+ 801869a:	f7ee bd11 	b.w	0x80070c0 ;; tail-call tick_delay_check(0)
+ 801869e:	2001      	movs	r0, #1 ;; -- SUB 19: SQUELCH OPEN --
+ 80186a0:	7060      	strb	r0, [r4, #1] ;; squelch_state[1] = 1 (squelch open)
+ 80186a2:	f7ee fd0d 	bl	0x80070c0 ;; tick_delay_check(1)
+ 80186a6:	8065      	strh	r5, [r4, #2] ;; squelch_state[2] = 0 (reset signal counter)
+ 80186a8:	f006 f9be 	bl	0x801ea28 ;; rf_channel_switch() - retune to active channel
+ 80186ac:	f7f3 fa00 	bl	0x800bab0 ;; rf_signal_measure() - read RSSI
  80186b0:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80186b4:	f7f3 bad8 	b.w	0x800bc68
- 80186b8:	7065      	strb	r5, [r4, #1]
- 80186ba:	2002      	movs	r0, #2
- 80186bc:	f7ee fd00 	bl	0x80070c0
- 80186c0:	8065      	strh	r5, [r4, #2]
+ 80186b4:	f7f3 bad8 	b.w	0x800bc68 ;; tail-call display_screen_layout (update RX display)
+ 80186b8:	7065      	strb	r5, [r4, #1] ;; -- SUB 21: SQUELCH CLOSE --
+ 80186ba:	2002      	movs	r0, #2 ;; delay = 2
+ 80186bc:	f7ee fd00 	bl	0x80070c0 ;; tick_delay_check(2)
+ 80186c0:	8065      	strh	r5, [r4, #2] ;; squelch_state[2] = 0 (reset counter)
  80186c2:	f006 f9b1 	bl	0x801ea28
- 80186c6:	f7f3 f9f3 	bl	0x800bab0
+ 80186c6:	f7f3 f9f3 	bl	0x800bab0 ;; rf_signal_measure()
  80186ca:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80186ce:	f7f3 bacb 	b.w	0x800bc68
- 80186d2:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80186d6:	f006 b9df 	b.w	0x801ea98
+ 80186ce:	f7f3 bacb 	b.w	0x800bc68 ;; tail-call display_screen_layout
+ 80186d2:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- SUB 18|28: frequency update --
+ 80186d6:	f006 b9df 	b.w	0x801ea98 ;; tail-call rf_signal_freq_update()
  80186da:	bd70      	pop	{r4, r5, r6, pc}
  80186dc:	022e      	lsls	r6, r5, #8
  80186de:	2000      	movs	r0, #0
@@ -36547,14 +38285,14 @@
 ; ║  Called by: main_task_dispatch                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rx_flag_check [RF] - Tiny RX status check (20B, 1 subcall). Returns flag or state.
- 80186e0:	6840      	ldr	r0, [r0, #4]
+ 80186e0:	6840      	ldr	r0, [r0, #4] ;; -- RX_FLAG_CHECK: mode 5 handler --
  80186e2:	2805      	cmp	r0, #5
- 80186e4:	d003      	beq.n	0x80186ee
+ 80186e4:	d003      	beq.n	0x80186ee ;; sub 5 → display_screen_layout
  80186e6:	2806      	cmp	r0, #6
- 80186e8:	d001      	beq.n	0x80186ee
+ 80186e8:	d001      	beq.n	0x80186ee ;; sub 6 → display_screen_layout
  80186ea:	2812      	cmp	r0, #18
- 80186ec:	d101      	bne.n	0x80186f2
- 80186ee:	f7f5 bf97 	b.w	0x800e620
+ 80186ec:	d101      	bne.n	0x80186f2 ;; sub != 18 → return (nop)
+ 80186ee:	f7f5 bf97 	b.w	0x800e620 ;; tail-call display_screen_layout()
  80186f2:	4770      	bx	lr
 
 ; --- DATA @ 0x080186F4 --------------------------------------------
@@ -36609,46 +38347,50 @@
 ; ║  Calls: rcc_periph_flag_read, rcc_periph_flag_read                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
  8018750:	b538      	push	{r3, r4, r5, lr}
- 8018752:	f44f 60e0 	mov.w	r0, #1792	@ 0x700
- 8018756:	f000 f87f 	bl	0x8018858
- 801875a:	2025      	movs	r0, #37	@ 0x25
+ 8018752:	f44f 60e0 	mov.w	r0, #1792	@ 0x700 ;; r0 = 0x700 = NVIC_PRIORITYGROUP_4 (4 pre-empt, 0 sub)
+ 8018756:	f000 f87f 	bl	0x8018858 ;; nvic_priority_group_config(GROUP_4)
+;; --- NVIC Call 1: USART1 (BT module serial) ---
+ 801875a:	2025      	movs	r0, #37	@ 0x25 ;; irq_num = 0x25 = 37 = USART1_IRQ
  801875c:	f88d 0000 	strb.w	r0, [sp]
  8018760:	2401      	movs	r4, #1
- 8018762:	f88d 4001 	strb.w	r4, [sp, #1]
- 8018766:	f88d 4002 	strb.w	r4, [sp, #2]
- 801876a:	f88d 4003 	strb.w	r4, [sp, #3]
+ 8018762:	f88d 4001 	strb.w	r4, [sp, #1] ;; cfg[1] = preempt_priority = 1
+ 8018766:	f88d 4002 	strb.w	r4, [sp, #2] ;; cfg[2] = sub_priority = 1
+ 801876a:	f88d 4003 	strb.w	r4, [sp, #3] ;; cfg[3] = enable = 1
  801876e:	4668      	mov	r0, sp
- 8018770:	f000 f834 	bl	0x80187dc
- 8018774:	2027      	movs	r0, #39	@ 0x27
+ 8018770:	f000 f834 	bl	0x80187dc ;; nvic_irq_config(USART1_IRQ, pre=1, sub=1, en=1)
+;; --- NVIC Call 2: DMA1_CH1 (ADC1 scan DMA) ---
+ 8018774:	2027      	movs	r0, #39	@ 0x27 ;; irq_num = 0x27 = 39 = DMA1_CH1_IRQ
  8018776:	f88d 0000 	strb.w	r0, [sp]
- 801877a:	f88d 4001 	strb.w	r4, [sp, #1]
- 801877e:	2502      	movs	r5, #2
- 8018780:	f88d 5002 	strb.w	r5, [sp, #2]
- 8018784:	f88d 4003 	strb.w	r4, [sp, #3]
+ 801877a:	f88d 4001 	strb.w	r4, [sp, #1] ;; cfg[1] = preempt_priority = 1
+ 801877e:	2502      	movs	r5, #2 ;; sub_priority = 2
+ 8018780:	f88d 5002 	strb.w	r5, [sp, #2] ;; cfg[2] = sub_priority = 2
+ 8018784:	f88d 4003 	strb.w	r4, [sp, #3] ;; cfg[3] = enable = 1
  8018788:	4668      	mov	r0, sp
- 801878a:	f000 f827 	bl	0x80187dc
- 801878e:	2034      	movs	r0, #52	@ 0x34
+ 801878a:	f000 f827 	bl	0x80187dc ;; nvic_irq_config(DMA1_CH1, pre=1, sub=2, en=1)
+;; --- NVIC Call 3: UART4 (debug serial) ---
+ 801878e:	2034      	movs	r0, #52	@ 0x34 ;; irq_num = 0x34 = 52 = UART4_IRQ
  8018790:	f88d 0000 	strb.w	r0, [sp]
- 8018794:	f88d 4001 	strb.w	r4, [sp, #1]
- 8018798:	f88d 5002 	strb.w	r5, [sp, #2]
- 801879c:	f88d 4003 	strb.w	r4, [sp, #3]
+ 8018794:	f88d 4001 	strb.w	r4, [sp, #1] ;; cfg[1] = preempt_priority = 1
+ 8018798:	f88d 5002 	strb.w	r5, [sp, #2] ;; cfg[2] = sub_priority = 2
+ 801879c:	f88d 4003 	strb.w	r4, [sp, #3] ;; cfg[3] = enable = 1
  80187a0:	4668      	mov	r0, sp
- 80187a2:	f000 f81b 	bl	0x80187dc
- 80187a6:	203a      	movs	r0, #58	@ 0x3a
+ 80187a2:	f000 f81b 	bl	0x80187dc ;; nvic_irq_config(UART4, pre=1, sub=2, en=1)
+ 80187a6:	203a      	movs	r0, #58	@ 0x3a ;; irq_num = 0x3A = 58 = DMA2_CH3_IRQ (audio)
  80187a8:	f88d 0000 	strb.w	r0, [sp]
- 80187ac:	f88d 5001 	strb.w	r5, [sp, #1]
- 80187b0:	f88d 4002 	strb.w	r4, [sp, #2]
- 80187b4:	f88d 4003 	strb.w	r4, [sp, #3]
+ 80187ac:	f88d 5001 	strb.w	r5, [sp, #1] ;; cfg[1] = preempt_priority = 2
+ 80187b0:	f88d 4002 	strb.w	r4, [sp, #2] ;; cfg[2] = sub_priority = 1
+ 80187b4:	f88d 4003 	strb.w	r4, [sp, #3] ;; cfg[3] = enable = 1
  80187b8:	4668      	mov	r0, sp
- 80187ba:	f000 f80f 	bl	0x80187dc
- 80187be:	200b      	movs	r0, #11
+ 80187ba:	f000 f80f 	bl	0x80187dc ;; nvic_irq_config(DMA2_CH3, pre=2, sub=1, en=1)
+;; --- NVIC Call 5: DMA1_CH2 ---
+ 80187be:	200b      	movs	r0, #11 ;; irq_num = 0x0B = 11 = DMA1_CH2_IRQ
  80187c0:	f88d 0000 	strb.w	r0, [sp]
- 80187c4:	f88d 4001 	strb.w	r4, [sp, #1]
- 80187c8:	2000      	movs	r0, #0
- 80187ca:	f88d 0002 	strb.w	r0, [sp, #2]
- 80187ce:	f88d 4003 	strb.w	r4, [sp, #3]
+ 80187c4:	f88d 4001 	strb.w	r4, [sp, #1] ;; cfg[1] = preempt_priority = 1
+ 80187c8:	2000      	movs	r0, #0 ;; sub_priority = 0 (highest)
+ 80187ca:	f88d 0002 	strb.w	r0, [sp, #2] ;; cfg[2] = sub_priority = 0
+ 80187ce:	f88d 4003 	strb.w	r4, [sp, #3] ;; cfg[3] = enable = 1
  80187d2:	4668      	mov	r0, sp
- 80187d4:	f000 f802 	bl	0x80187dc
+ 80187d4:	f000 f802 	bl	0x80187dc ;; nvic_irq_config(DMA1_CH2, pre=1, sub=0, en=1)
  80187d8:	bd38      	pop	{r3, r4, r5, pc}
 
 ; --- DATA @ 0x080187DA --------------------------------------------
@@ -36730,15 +38472,15 @@
 ; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  flag_set_init                                                        ║
+; ║  nvic_vtor_set                                                        ║
 ; ║  0x0801886C  size=12                                            ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * flag_set_init [SYSTEM] - Tiny flag set (12B). Called from oem_main.
- 801886c:	4a02      	ldr	r2, [pc, #8]	@ (0x8018878)                      ; = 0x1FFFFF80
- 801886e:	4011      	ands	r1, r2
- 8018870:	4301      	orrs	r1, r0
- 8018872:	4802      	ldr	r0, [pc, #8]	@ (0x801887c)                      ; = 0xE000ED08
- 8018874:	6001      	str	r1, [r0, #0]
+; * nvic_vtor_set [SYSTEM/BOOT] - Set VTOR register (12B). Relocates vector table to 0x08003000.
+ 801886c:	4a02      	ldr	r2, [pc, #8]	@ (0x8018878)                      ; = 0x1FFFFF80 ;; r2 = 0x1FFFFF80 = VTOR alignment mask (bit[6:0] must be 0)
+ 801886e:	4011      	ands	r1, r2 ;; r1 = offset & mask (0x3000 & 0x1FFFFF80 = 0x3000)
+ 8018870:	4301      	orrs	r1, r0 ;; r1 = base | offset = 0x08000000 | 0x3000 = 0x08003000
+ 8018872:	4802      	ldr	r0, [pc, #8]	@ (0x801887c)                      ; = 0xE000ED08 ;; r0 = 0xE000ED08 = SCB->VTOR
+ 8018874:	6001      	str	r1, [r0, #0] ;; VTOR = 0x08003000 → vector table after 12KB bootloader
  8018876:	4770      	bx	lr
 
 ; --- DATA @ 0x08018878 --------------------------------------------
@@ -36853,21 +38595,69 @@
 ; ║  Calls: bt_protocol_handler, memset_aligned, memset_zero_r2, bt_flash_comms, rf_calibration_engine (+62 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_calibration_engine [RF/CAL] - RF calibration engine (large). Refs DAC+DMA2+GPIOA-E+TMR6, g_config+g_rf. Handles frequency calibrat...
- 8018b28:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
- 8018b2c:	4c8b      	ldr	r4, [pc, #556]	@ (0x8018d5c)                    ; = 0x2000A41C (RAM+0xA41C)
- 8018b2e:	4b8c      	ldr	r3, [pc, #560]	@ (0x8018d60)                    ; = 0x2000A360 (RAM+0xA360)
- 8018b30:	6845      	ldr	r5, [r0, #4]
- 8018b32:	f894 20fa 	ldrb.w	r2, [r4, #250]	@ 0xfa
- 8018b36:	1eaf      	subs	r7, r5, #2
- 8018b38:	eb02 0c42 	add.w	ip, r2, r2, lsl #1
- 8018b3c:	eb0c 02c2 	add.w	r2, ip, r2, lsl #3
- 8018b40:	eb04 04c2 	add.w	r4, r4, r2, lsl #3
- 8018b44:	2632      	movs	r6, #50	@ 0x32
- 8018b46:	685a      	ldr	r2, [r3, #4]
- 8018b48:	f103 0112 	add.w	r1, r3, #18
- 8018b4c:	2f34      	cmp	r7, #52	@ 0x34
- 8018b4e:	d27d      	bcs.n	0x8018c4c
- 8018b50:	e8df f007 	tbb	[pc, r7]
+; -- rf_calibration_engine -----------------------------------------------
+; Mode 0/6 dispatch handler. Massive RF calibration engine (109KB total).
+; Uses tbb (table branch byte) dispatch on sp[4]-2 for sub-commands 2-53.
+;
+; r4 = display_config @ 0x2000A41C (indexed by channel: +0xFA offset band,
+;       stride = r2*3 + r2*8 = r2*11 → offset*88 per channel)
+; r5 = sp[4] (sub-command from main_task_dispatch)
+; r6 = 50 (constant for countdown/timer operations)
+; r7 = r5 - 2 (tbb index)
+; r2 = RAM[0x2000A360+4] (calibration step counter)
+; r1 = RAM[0x2000A360+18] (cal data write pointer)
+; r3 = RAM[0x2000A360] (cal state struct)
+;
+; tbb dispatch table (sub-command → handler):
+;   sub  2: display_attr_config(1)  → LCD attribute setup
+;   sub  3: rf_audio_gate_ctrl(1)   → open audio gate
+;   sub  5: radio_audio_mixer()     → init RX audio path
+;   sub  7: tx_power_calibrate()    → TX power cal sequence
+;   sub 11: rf_cal_state_update() + tick_delay(3)
+;   sub 12: rf_aprs_dispatch()      → APRS state handler
+;   sub 13: rf_state_flag_set() + rf_display_config() check
+;           → tick_delay(7) or display_text_field
+;   sub 16: cal step manager (r4[0x130] check, count/bar/freq display)
+;   sub 17: rf_display_sync()       → sync RF→display
+;   sub 18: cal data write ('-'/space char, countdown, rf_cal_bar_render
+;           or rf_level_bar_draw based on r4[0x130])
+;   sub 19: → 0x8018d68 (r0=0, cal sub-engine)
+;   sub 20: → 0x8018d68 (r0=1, cal sub-engine)
+;   sub 21: → 0x8018ab8 (r0=0, cal verify)
+;   sub 22: → 0x8018ab8 (r0=1, cal verify)
+;   sub 23: → 0x801ae74 (BK4829 cal handler)
+;   sub 24: → rf_state_machine_step
+;   sub 25: rf_cal_state_update() + tick_delay(3) (same as 11)
+;   sub 28: → rf_signal_freq_update (channel switch)
+;   sub 29: → RF display update
+;   sub 30: channel_freq_calc(1) + rf_state_clear() + tick_delay(3)
+;   sub 31: rf_state_clear() + rf_cal_state_update → display handler
+;   sub 35: → display render function
+;   sub 46: → bt_flash_comms handler
+;   sub 47: → flash/config handler
+;   sub 49: rf_cal_channel_lookup() + tick_delay(1)
+;   sub 50: rf_cal_channel_lookup_b() + tick_delay(2)
+;   sub 51: channel detail render (load param)
+;   sub 52: channel detail render (r0=10)
+;   sub 53: → RF state transition
+;   default (sp[4]≥160): return
+;   default (other): tick_delay_check(0)
+; ------------------------------------------------------------------------
+ 8018b28:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr} ;; -- RF_CALIBRATION_ENGINE: mode 0/6 handler --
+ 8018b2c:	4c8b      	ldr	r4, [pc, #556]	@ (0x8018d5c)                    ; = 0x2000A41C (RAM+0xA41C) ;; r4 = display_config @ 0x2000A41C
+ 8018b2e:	4b8c      	ldr	r3, [pc, #560]	@ (0x8018d60)                    ; = 0x2000A360 (RAM+0xA360) ;; r3 = cal_state @ 0x2000A360
+ 8018b30:	6845      	ldr	r5, [r0, #4] ;; r5 = sp[4] (sub-command)
+ 8018b32:	f894 20fa 	ldrb.w	r2, [r4, #250]	@ 0xfa ;; r2 = display_config[0xFA] (band index)
+ 8018b36:	1eaf      	subs	r7, r5, #2 ;; r7 = sub_cmd - 2 (tbb table index)
+ 8018b38:	eb02 0c42 	add.w	ip, r2, r2, lsl #1 ;; ip = r2*3
+ 8018b3c:	eb0c 02c2 	add.w	r2, ip, r2, lsl #3 ;; r2 = r2*3 + r2*8 = r2*11
+ 8018b40:	eb04 04c2 	add.w	r4, r4, r2, lsl #3 ;; r4 += r2*88 (channel stride into display config)
+ 8018b44:	2632      	movs	r6, #50	@ 0x32 ;; r6 = 50 (countdown constant)
+ 8018b46:	685a      	ldr	r2, [r3, #4] ;; r2 = cal_state[4] (step counter)
+ 8018b48:	f103 0112 	add.w	r1, r3, #18 ;; r1 = cal_state+18 (write pointer)
+ 8018b4c:	2f34      	cmp	r7, #52	@ 0x34 ;; if tbb_index >= 52 → default
+ 8018b4e:	d27d      	bcs.n	0x8018c4c ;; out of range → check >=160 or tick_delay(0)
+ 8018b50:	e8df f007 	tbb	[pc, r7] ;; -- TBB DISPATCH: 52-entry table follows --
  8018b54:	a9c1      	add	r1, sp, #772	@ 0x304
  8018b56:	c5fa      	stmia	r5!, {r1, r3, r4, r5, r6, r7}
  8018b58:	bdfa      	pop	{r1, r3, r4, r5, r6, r7, pc}
@@ -36887,29 +38677,29 @@
  8018b82:	32fa      	adds	r2, #250	@ 0xfa
  8018b84:	dd39      	ble.n	0x8018bfa
  8018b86:	e7e2      	b.n	0x8018b4e
- 8018b88:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 8018b8c:	f7f5 b8b0 	b.w	0x800dcf0
- 8018b90:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018b88:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 17: rf_display_sync() --
+ 8018b8c:	f7f5 b8b0 	b.w	0x800dcf0 ;; tail-call rf_display_sync
+ 8018b90:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 20: cal sub-engine(1) --
  8018b94:	2001      	movs	r0, #1
  8018b96:	f000 b8e7 	b.w	0x8018d68
- 8018b9a:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018b9a:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 19: cal sub-engine(0) --
  8018b9e:	2000      	movs	r0, #0
  8018ba0:	f000 b8e2 	b.w	0x8018d68
- 8018ba4:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018ba4:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 22: cal verify(1) --
  8018ba8:	2001      	movs	r0, #1
  8018baa:	f7ff bf85 	b.w	0x8018ab8
- 8018bae:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018bae:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 21: cal verify(0) --
  8018bb2:	2000      	movs	r0, #0
  8018bb4:	f7ff bf80 	b.w	0x8018ab8
- 8018bb8:	f7ed fff4 	bl	0x8006ba4
+ 8018bb8:	f7ed fff4 	bl	0x8006ba4 ;; -- SUB 49: rf_cal_channel_lookup() --
  8018bbc:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018bc0:	2001      	movs	r0, #1
  8018bc2:	f7ee ba7d 	b.w	0x80070c0
- 8018bc6:	f7ed ffbb 	bl	0x8006b40
+ 8018bc6:	f7ed ffbb 	bl	0x8006b40 ;; -- SUB 50: rf_cal_channel_lookup_b() --
  8018bca:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018bce:	2002      	movs	r0, #2
  8018bd0:	f7ee ba76 	b.w	0x80070c0
- 8018bd4:	4862      	ldr	r0, [pc, #392]	@ (0x8018d60)                    ; = 0x2000A360 (RAM+0xA360)
+ 8018bd4:	4862      	ldr	r0, [pc, #392]	@ (0x8018d60)                    ; = 0x2000A360 (RAM+0xA360) ;; -- SUB 18: cal data write (complex) --
  8018bd6:	f894 4130 	ldrb.w	r4, [r4, #304]	@ 0x130
  8018bda:	6840      	ldr	r0, [r0, #4]
  8018bdc:	1e40      	subs	r0, r0, #1
@@ -36952,15 +38742,15 @@
  8018c44:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018c48:	2003      	movs	r0, #3
  8018c4a:	e000      	b.n	0x8018c4e
- 8018c4c:	e07c      	b.n	0x8018d48
+ 8018c4c:	e07c      	b.n	0x8018d48 ;; -- DEFAULT path (sub >= 52 without tbb hit) --
  8018c4e:	f7ee ba37 	b.w	0x80070c0
- 8018c52:	2001      	movs	r0, #1
+ 8018c52:	2001      	movs	r0, #1 ;; -- SUB 30: channel_freq_calc(1) --
  8018c54:	f008 fbbc 	bl	0x80213d0
  8018c58:	f001 ffcc 	bl	0x801abf4
  8018c5c:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018c60:	2003      	movs	r0, #3
  8018c62:	f7ee ba2d 	b.w	0x80070c0
- 8018c66:	4d3f      	ldr	r5, [pc, #252]	@ (0x8018d64)                    ; = 0x2000A3B4 (g_rf_state)
+ 8018c66:	4d3f      	ldr	r5, [pc, #252]	@ (0x8018d64)                    ; = 0x2000A3B4 (g_rf_state) ;; -- SUB 16: cal step manager --
  8018c68:	782d      	ldrb	r5, [r5, #0]
  8018c6a:	2d02      	cmp	r5, #2
  8018c6c:	d073      	beq.n	0x8018d56
@@ -36981,57 +38771,57 @@
  8018c90:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018c94:	4832      	ldr	r0, [pc, #200]	@ (0x8018d60)                    ; = 0x2000A360 (RAM+0xA360)
  8018c96:	f7ef babd 	b.w	0x8008214
- 8018c9a:	f001 ffab 	bl	0x801abf4
+ 8018c9a:	f001 ffab 	bl	0x801abf4 ;; -- SUB 31: rf_state_clear + cal update --
  8018c9e:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018ca2:	f008 bbdb 	b.w	0x802145c
- 8018ca6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018ca6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 3: rf_audio_gate_ctrl(1) --
  8018caa:	2001      	movs	r0, #1
  8018cac:	f7ea bea4 	b.w	0x80039f8
- 8018cb0:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cb0:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 28: rf_signal_freq_update --
  8018cb4:	f005 bf08 	b.w	0x801eac8
- 8018cb8:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cb8:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 24: rf_state_machine_step --
  8018cbc:	f7f4 be5a 	b.w	0x800d974
- 8018cc0:	f009 fa98 	bl	0x80221f4
+ 8018cc0:	f009 fa98 	bl	0x80221f4 ;; -- SUB 11|25: rf_cal_state_update + tick(3) --
  8018cc4:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018cc8:	2003      	movs	r0, #3
  8018cca:	f7ee b9f9 	b.w	0x80070c0
- 8018cce:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cce:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 7: tx_power_calibrate --
  8018cd2:	f7f4 befd 	b.w	0x800dad0
- 8018cd6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cd6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 2: display_attr_config(1) --
  8018cda:	f7fb ba4f 	b.w	0x801417c
- 8018cde:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cde:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 5: radio_audio_mixer --
  8018ce2:	f7f5 b841 	b.w	0x800dd68
- 8018ce6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018ce6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 23: BK4829 cal handler --
  8018cea:	f002 b8c3 	b.w	0x801ae74
- 8018cee:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cee:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 47: flash/config handler --
  8018cf2:	f00a b891 	b.w	0x8022e18
- 8018cf6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cf6:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 29: RF display update --
  8018cfa:	f7f5 b9cd 	b.w	0x800e098
- 8018cfe:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018cfe:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 35: display render --
  8018d02:	f7f5 b997 	b.w	0x800e034
- 8018d06:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018d06:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 12: rf_aprs_dispatch --
  8018d0a:	f7f5 bb1b 	b.w	0x800e344
- 8018d0e:	7800      	ldrb	r0, [r0, #0]
+ 8018d0e:	7800      	ldrb	r0, [r0, #0] ;; -- SUB 51: channel detail render --
  8018d10:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018d14:	f7f5 bff6 	b.w	0x800ed04
- 8018d18:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018d18:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 52: channel detail (r0=10) --
  8018d1c:	200a      	movs	r0, #10
  8018d1e:	f7f5 bff1 	b.w	0x800ed04
- 8018d22:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018d22:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 53: RF state transition --
  8018d26:	f7f4 bdbd 	b.w	0x800d8a4
- 8018d2a:	f7f4 fc8b 	bl	0x800d644
+ 8018d2a:	f7f4 fc8b 	bl	0x800d644 ;; -- SUB 13: rf_state_flag_set + config check --
  8018d2e:	f7ef ff73 	bl	0x8008c18
  8018d32:	2800      	cmp	r0, #0
  8018d34:	d10f      	bne.n	0x8018d56
  8018d36:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8018d3a:	2007      	movs	r0, #7
  8018d3c:	f7ee b9c0 	b.w	0x80070c0
- 8018d40:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
+ 8018d40:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr} ;; -- SUB 46: bt_flash_comms handler --
  8018d44:	f007 bdb0 	b.w	0x80208a8
- 8018d48:	2da0      	cmp	r5, #160	@ 0xa0
- 8018d4a:	d204      	bcs.n	0x8018d56
+ 8018d48:	2da0      	cmp	r5, #160	@ 0xa0 ;; -- DEFAULT: check if sub >= 160 --
+ 8018d4a:	d204      	bcs.n	0x8018d56 ;; sub >= 160 → return
  8018d4c:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 8018d50:	2000      	movs	r0, #0
+ 8018d50:	2000      	movs	r0, #0 ;; default: tick_delay_check(0)
  8018d52:	f7ee b9b5 	b.w	0x80070c0
  8018d56:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}
  8018d5a:	0000      	movs	r0, r0
@@ -37194,6 +38984,35 @@
   0x08018EB0: A8 42 F8 D3 3E BD 00 00 25 30 37 64 00 00 00 00  |.B..>...%07d....|
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: tim6_dac_dma_init(void)                                │
+; │   Full audio subsystem hardware init. Called by hw_init_main.       │
+; │                                                                     │
+; │   rcc_periph_enable(TIM6);           // Enable TIM6 clock          │
+; │   tim_config_prescaler(TIM6, 119);   // PSC=119                    │
+; │   tim_config_arr(TIM6, 125);         // ARR=125 → 7.94kHz          │
+; │   tim_config_clkdiv(TIM6, 32);                                     │
+; │                                                                     │
+; │   // Configure DAC trigger: BOFF1 + TEN1 + TSEL1=TIM6_TRGO        │
+; │   cfg = {4, 0, 0, 2};  // 4=TEN1(bit2), 2=BOFF1(bit1)            │
+; │   dac_dma_timer_config(channel=0, cfg);  // DAC_CTRL[11:1] = 0x6  │
+; │                                                                     │
+; │   // Configure DMA2 Channel 3                                       │
+; │   dma_ch_reset(DMA2_CH3);                                          │
+; │   dma_config(DMA2_CH3,                                              │
+; │     CPAR = 0x40007408,   // DAC_D1DTH12R (12-bit right-aligned)    │
+; │     CMAR = 0x2000E87C,   // RAM waveform buffer                    │
+; │     CNDTR = 16,          // 16 halfword samples                     │
+; │     dir = mem_to_periph, circular, 16-bit, priority=high);         │
+; │   dma_interrupt_enable(DMA2_CH3, half_transfer, 1);                │
+; │   dma_channel_enable(DMA2_CH3, 1);                                  │
+; │                                                                     │
+; │   // Initially DISABLE DAC output (enabled later by beep_play)     │
+; │   dac_enable(0, 0);      // Clear EN1                               │
+; │   dac_dma_enable(0, 0);  // Clear DMAEN1                            │
+; │                                                                     │
+; │   tim_enable(TIM6, 1);   // Start TIM6 running                     │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  tim6_dac_dma_init                                                        ║
 ; ║  0x08018EC0  size=174                                           ║
@@ -37201,83 +39020,135 @@
 ; ║  Called by: hw_init_main                                              ║
 ; ║  Calls: dac_enable, dac_dma_enable, tim6_dac_dma_init, tim6_dac_dma_init, dma_channel_disable (+9 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-;; ═══════════════════════════════════════════════════════════════════
-;; TIM6_DAC_DMA_INIT - Audio playback hardware setup
-;; TIM6 triggers DMA2 CH3 -> DAC1 (PA4) for tone generation
-;; Configures timer prescaler, ARR, DMA source/dest addresses
-;; Part of the beep/tone audio path
-;; ═══════════════════════════════════════════════════════════════════
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: tim6_dac_dma_init(void)                              │
+; │                                                                     │
+; │ Boot-time audio hardware setup. Configures TIM6→DMA2_CH3→DAC1      │
+; │ pipeline but leaves DAC DISABLED. beep_play() enables it later.     │
+; │                                                                     │
+; │   // 1. Enable TIM6+DAC clock                                      │
+; │   rcc_apb1_periph_enable(TIM6|DAC);                                │
+; │                                                                     │
+; │   // 2. TIM6 config: 120MHz / 120 / 126 = 7936 Hz sample rate     │
+; │   TIM6->PSC = 119;   // prescaler: 120MHz ÷ 120 = 1MHz tick       │
+; │   TIM6->ARR = 125;   // auto-reload: 1MHz ÷ 126 = 7936 Hz        │
+; │   TIM6->CLKDIV = 32; // clock division                            │
+; │                                                                     │
+; │   // 3. DAC trigger config (channel 1)                             │
+; │   dac_config.trigger_source = TIM6_TRGO;  // [sp+48] = 4          │
+; │   dac_config.wave_gen = NONE;              // [sp+52] = 0          │
+; │   dac_config.output_buffer = DISABLED;     // [sp+60] = 2 (BOFF1) │
+; │   dac_dma_timer_config(CH1, &dac_config);                          │
+; │                                                                     │
+; │   // 4. DMA2_CH3 config: RAM buffer → DAC_DHR12R1, circular        │
+; │   dma_reset(DMA2_CH3);                                             │
+; │   dma_init_t dma = {                                               │
+; │     .periph_addr  = 0x40007408,  // DAC_DHR12R1                    │
+; │     .memory_addr  = 0x2000E87C,  // g_audio_dma_buf (RAM)          │
+; │     .direction    = MEM_TO_PERIPH, // 0x10                         │
+; │     .buffer_size  = 2048,        // 2048 halfwords                 │
+; │     .periph_inc   = DISABLE,     // fixed peripheral addr          │
+; │     .memory_inc   = ENABLE,      // 0x80                           │
+; │     .periph_width = HALFWORD,    // 0x100 (16-bit)                 │
+; │     .memory_width = HALFWORD,    // 0x400 (16-bit)                 │
+; │     .loop_mode    = ENABLE,      // 0x20 (circular)                │
+; │     .priority     = HIGH,        // 0x2000                         │
+; │   };                                                               │
+; │   dma_init(DMA2_CH3, &dma);                                       │
+; │                                                                     │
+; │   // 5. Enable DMA TC interrupt + channel                         │
+; │   DMA2_CH3->CCR |= TCIE;    // transfer complete interrupt        │
+; │   dma_channel_enable(DMA2_CH3);                                    │
+; │                                                                     │
+; │   // 6. LEAVE DAC DISABLED at boot (beep_play enables it)         │
+; │   dac_enable(CH1, DISABLE);      // DAC_CR &= ~EN1                │
+; │   dac_dma_enable(CH1, DISABLE);  // DAC_CR &= ~DMAEN1             │
+; │                                                                     │
+; │   // 7. Start TIM6 (runs continuously, triggers DMA at 7936 Hz)   │
+; │   TIM6->CR1 |= CEN;                                               │
+; │                                                                     │
+; │ NOTE: DMA2_CH3 is shared with UART4_RX on AT32F403A.              │
+; │ NOTE: DAC CH2 (PA5) is enabled separately by dac_init().          │
+; │ NOTE: Buffer at 0x2000E87C is filled by beep_tone_generate().     │
+; └---------------------------------------------------------------------┘
  8018ec0:	b570      	push	{r4, r5, r6, lr}
- 8018ec2:	b090      	sub	sp, #64	@ 0x40
+ 8018ec2:	b090      	sub	sp, #64	@ 0x40 ;; alloc timer + DMA init structs
+;; --- Step 1: Enable TIM6 clock ---
  8018ec4:	2101      	movs	r1, #1
- 8018ec6:	2002      	movs	r0, #2
- 8018ec8:	f000 fffa 	bl	0x8019ec0
+ 8018ec6:	2002      	movs	r0, #2 ;; periph_id = 2 = TIM6
+ 8018ec8:	f000 fffa 	bl	0x8019ec0 ;; rcc_apb1_periph_enable(TIM6, 1)
  8018ecc:	4d28      	ldr	r5, [pc, #160]	@ (0x8018f70)                    ; = 0x40001000 (TIM6)
+;; --- Step 2: TIM6 config: PSC=119 ARR=125 → 8kHz ---
  8018ece:	2200      	movs	r2, #0
- 8018ed0:	2177      	movs	r1, #119	@ 0x77
+ 8018ed0:	2177      	movs	r1, #119	@ 0x77 ;; PSC = 119 → 120MHz/(119+1) = 1MHz tick
  8018ed2:	4628      	mov	r0, r5
- 8018ed4:	f008 fd47 	bl	0x8021966                                        ; tim_config_prescaler
- 8018ed8:	217d      	movs	r1, #125	@ 0x7d
+ 8018ed4:	f008 fd47 	bl	0x8021966                                        ; tim_config_prescaler ;; tim_prescaler(TIM6, 119, immediate)
+ 8018ed8:	217d      	movs	r1, #125	@ 0x7d ;; ARR = 125 → 1MHz/125 = 8kHz overflow
  8018eda:	4628      	mov	r0, r5
- 8018edc:	f008 fe32 	bl	0x8021b44                                        ; tim_config_arr
+ 8018edc:	f008 fe32 	bl	0x8021b44                                        ; tim_config_arr ;; tim_arr(TIM6, 125) - 8kHz DMA trigger rate
  8018ee0:	2120      	movs	r1, #32
  8018ee2:	4628      	mov	r0, r5
- 8018ee4:	f008 fe26 	bl	0x8021b34                                        ; tim_config_clkdiv
+ 8018ee4:	f008 fe26 	bl	0x8021b34                                        ; tim_config_clkdiv ;; tim_clkdiv(TIM6, div1)
+;; --- Step 3: DAC trigger config (TIM6 TRGO) ---
  8018ee8:	a80c      	add	r0, sp, #48	@ 0x30
- 8018eea:	f7f1 fb4b 	bl	0x800a584
- 8018eee:	2004      	movs	r0, #4
- 8018ef0:	900c      	str	r0, [sp, #48]	@ 0x30
+ 8018eea:	f7f1 fb4b 	bl	0x800a584 ;; dac_trigger_init_struct(defaults)
+ 8018eee:	2004      	movs	r0, #4 ;; trigger = TIM6_TRGO
+ 8018ef0:	900c      	str	r0, [sp, #48]	@ 0x30 ;; dac_cfg.trigger_src = TIM6_TRGO
  8018ef2:	2400      	movs	r4, #0
- 8018ef4:	940d      	str	r4, [sp, #52]	@ 0x34
+ 8018ef4:	940d      	str	r4, [sp, #52]	@ 0x34 ;; dac_cfg.wave_gen = disabled
  8018ef6:	2002      	movs	r0, #2
- 8018ef8:	900f      	str	r0, [sp, #60]	@ 0x3c
+ 8018ef8:	900f      	str	r0, [sp, #60]	@ 0x3c ;; dac_cfg.output_buffer = enabled
  8018efa:	a90c      	add	r1, sp, #48	@ 0x30
  8018efc:	2000      	movs	r0, #0
- 8018efe:	f7f1 fb23 	bl	0x800a548
+ 8018efe:	f7f1 fb23 	bl	0x800a548 ;; dac_config(CH1, dac_cfg) - TIM6 triggers DAC
+;; --- Step 4: DMA2_CH3 config (mem→DAC, circular, 2048 halfwords) ---
  8018f02:	4e1c      	ldr	r6, [pc, #112]	@ (0x8018f74)                    ; = 0x40020430 (DMA2_CH3)
  8018f04:	4630      	mov	r0, r6
- 8018f06:	f7f1 fbe5 	bl	0x800a6d4
+ 8018f06:	f7f1 fbe5 	bl	0x800a6d4 ;; dma_reset(DMA2_CH3) - clear config
  8018f0a:	a801      	add	r0, sp, #4
- 8018f0c:	f7f1 fb9a 	bl	0x800a644
+ 8018f0c:	f7f1 fb9a 	bl	0x800a644 ;; dma_init_struct(defaults)
  8018f10:	4919      	ldr	r1, [pc, #100]	@ (0x8018f78)                    ; = 0x40007408
- 8018f12:	9101      	str	r1, [sp, #4]
+ 8018f12:	9101      	str	r1, [sp, #4] ;; dma.periph_addr = 0x40007408 (DAC_DHR12R1)
  8018f14:	4919      	ldr	r1, [pc, #100]	@ (0x8018f7c)                    ; = 0x2000E87C (RAM+0xE87C)
- 8018f16:	9102      	str	r1, [sp, #8]
- 8018f18:	2010      	movs	r0, #16
- 8018f1a:	9003      	str	r0, [sp, #12]
- 8018f1c:	01c0      	lsls	r0, r0, #7
- 8018f1e:	9004      	str	r0, [sp, #16]
- 8018f20:	9405      	str	r4, [sp, #20]
- 8018f22:	2080      	movs	r0, #128	@ 0x80
- 8018f24:	9006      	str	r0, [sp, #24]
- 8018f26:	0040      	lsls	r0, r0, #1
- 8018f28:	9007      	str	r0, [sp, #28]
- 8018f2a:	0080      	lsls	r0, r0, #2
- 8018f2c:	9008      	str	r0, [sp, #32]
- 8018f2e:	2020      	movs	r0, #32
- 8018f30:	9009      	str	r0, [sp, #36]	@ 0x24
- 8018f32:	0200      	lsls	r0, r0, #8
- 8018f34:	900a      	str	r0, [sp, #40]	@ 0x28
- 8018f36:	940b      	str	r4, [sp, #44]	@ 0x2c
+ 8018f16:	9102      	str	r1, [sp, #8] ;; dma.memory_addr = 0x2000E87C (audio buf 1)
+ 8018f18:	2010      	movs	r0, #16 ;; direction = 0x10 = MEM_TO_PERIPH
+ 8018f1a:	9003      	str	r0, [sp, #12] ;; dma.direction = MEM_TO_PERIPH
+ 8018f1c:	01c0      	lsls	r0, r0, #7 ;; r0 = 16<<7 = 2048
+ 8018f1e:	9004      	str	r0, [sp, #16] ;; dma.buffer_size = 2048 halfwords
+ 8018f20:	9405      	str	r4, [sp, #20] ;; dma.periph_inc = 0 (fixed DAC addr)
+ 8018f22:	2080      	movs	r0, #128	@ 0x80 ;; 0x80 = memory increment
+ 8018f24:	9006      	str	r0, [sp, #24] ;; dma.memory_inc = ENABLE
+ 8018f26:	0040      	lsls	r0, r0, #1 ;; r0 = 0x80<<1 = 0x100 = halfword
+ 8018f28:	9007      	str	r0, [sp, #28] ;; dma.periph_width = HALFWORD (16-bit)
+ 8018f2a:	0080      	lsls	r0, r0, #2 ;; r0 = 0x100<<2 = 0x400 = halfword
+ 8018f2c:	9008      	str	r0, [sp, #32] ;; dma.memory_width = HALFWORD (16-bit)
+ 8018f2e:	2020      	movs	r0, #32 ;; 0x20 = circular mode
+ 8018f30:	9009      	str	r0, [sp, #36]	@ 0x24 ;; dma.loop_mode = CIRCULAR
+ 8018f32:	0200      	lsls	r0, r0, #8 ;; r0 = 0x20<<8 = 0x2000 = high priority
+ 8018f34:	900a      	str	r0, [sp, #40]	@ 0x28 ;; dma.priority = HIGH
+ 8018f36:	940b      	str	r4, [sp, #44]	@ 0x2c ;; dma.m2m = disabled
  8018f38:	a901      	add	r1, sp, #4
  8018f3a:	4630      	mov	r0, r6
- 8018f3c:	f7f1 fbac 	bl	0x800a698
+ 8018f3c:	f7f1 fbac 	bl	0x800a698 ;; dma_config(DMA2_CH3, dma) - apply DMA config
+;; --- Step 5: Enable DMA TC interrupt + channel ---
  8018f40:	2201      	movs	r2, #1
- 8018f42:	2102      	movs	r1, #2
+ 8018f42:	2102      	movs	r1, #2 ;; flag = 2 = DMA_TCIE (transfer complete int)
  8018f44:	4630      	mov	r0, r6
- 8018f46:	f7f1 fb9d 	bl	0x800a684
+ 8018f46:	f7f1 fb9d 	bl	0x800a684 ;; dma_interrupt_enable(DMA2_CH3, TCIE, 1)
  8018f4a:	2101      	movs	r1, #1
  8018f4c:	4630      	mov	r0, r6
- 8018f4e:	f7f1 fb53 	bl	0x800a5f8
- 8018f52:	2100      	movs	r1, #0
+ 8018f4e:	f7f1 fb53 	bl	0x800a5f8 ;; dma_channel_enable(DMA2_CH3, 1)
+;; --- Step 6: DAC CH1 OFF at boot (beep_play enables later) ---
+ 8018f52:	2100      	movs	r1, #0 ;; disable = 0
  8018f54:	4608      	mov	r0, r1
- 8018f56:	f7f1 fad7 	bl	0x800a508                                        ; dac_enable
- 8018f5a:	2100      	movs	r1, #0
+ 8018f56:	f7f1 fad7 	bl	0x800a508                                        ; dac_enable ;; dac_enable(CH1=0, 0) → DAC OFF at boot
+ 8018f5a:	2100      	movs	r1, #0 ;; disable = 0
  8018f5c:	4608      	mov	r0, r1
- 8018f5e:	f7f1 fae3 	bl	0x800a528                                        ; dac_dma_enable
- 8018f62:	2101      	movs	r1, #1
+ 8018f5e:	f7f1 fae3 	bl	0x800a528                                        ; dac_dma_enable ;; dac_dma_enable(CH1=0, 0) → DMA OFF at boot
+;; --- Step 7: Start TIM6 (runs continuously at 8kHz) ---
+ 8018f62:	2101      	movs	r1, #1 ;; enable = 1
  8018f64:	4628      	mov	r0, r5
- 8018f66:	f008 fcf2 	bl	0x802194e                                        ; tim_enable
+ 8018f66:	f008 fcf2 	bl	0x802194e                                        ; tim_enable ;; tim_enable(TIM6, 1) → 8kHz timer running
  8018f6a:	b010      	add	sp, #64	@ 0x40
  8018f6c:	bd70      	pop	{r4, r5, r6, pc}
 
@@ -37466,21 +39337,54 @@
 ; ║  Calls: display_animation, aprs_codec_data_format, math_format_number, math_multiply, string_parse_field  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_animation [DISPLAY] - Display animation (300B). Animated display transitions.
+; -- display_animation (ACTUALLY: APRS position parser) ------------------
+; APRS/NMEA position string parser (300B). Parses latitude, longitude,
+; and altitude from APRS compressed or uncompressed position format.
+;
+; NOTE: Name "display_animation" is a misnomer. This function parses
+; coordinate strings into a numeric struct for display/processing.
+;
+; r0 = input string (APRS position packet)
+; r1 = output struct (parsed position fields)
+;
+; Delimiter searches (via string_parse_field @ 0x8000D54):
+;   'E' (0x45) @ flash 0x8019240 - East longitude marker
+;   'W' (0x57) @ flash 0x8019244 - West longitude marker
+;   '/' (0x2F) @ flash 0x8019248 - altitude separator
+;
+; Output struct layout (r5):
+;   [1]    = symbol table ID (byte from input[7])
+;   [2:3]  = latitude degrees (halfword, from 4-byte BCD parse)
+;   [4]    = latitude minutes (byte, from 2-byte BCD parse)
+;   [5]    = longitude table ID (byte from input[17])
+;   [6:7]  = longitude degrees (halfword, from 5-byte BCD parse)
+;   [8]    = longitude minutes (byte, from 2-byte BCD parse)
+;   [9:10] = altitude (halfword, after float div by 3.2808 → ft→m)
+;   [11:12]= latitude decimal (halfword, from 3-byte parse near E/W)
+;   [13:14]= longitude decimal (halfword, from 3-byte parse after E/W)
+;
+; Altitude conversion: if "A=" found after '/' delimiter:
+;   Parse 6-byte altitude string → float → divide by 3.2808 (ft→meters)
+;   Store result as halfword at output[9]
+;
+; Returns: 1 on success, 0 on parse failure (delimiter not found
+;          or field too short - requires ≥17 chars between markers)
+; ------------------------------------------------------------------------
  8019114:	b5fe      	push	{r1, r2, r3, r4, r5, r6, r7, lr}
  8019116:	4604      	mov	r4, r0
  8019118:	460d      	mov	r5, r1
- 801911a:	a149      	add	r1, pc, #292	@ (adr r1, 0x8019240)
+ 801911a:	a149      	add	r1, pc, #292 ;; delimiter = 'E' (East longitude marker)	@ (adr r1, 0x8019240)
  801911c:	4620      	mov	r0, r4
  801911e:	f7e7 fe19 	bl	0x8000d54
  8019122:	4606      	mov	r6, r0
- 8019124:	a147      	add	r1, pc, #284	@ (adr r1, 0x8019244)
+ 8019124:	a147      	add	r1, pc, #284 ;; delimiter = 'W' (West longitude marker)	@ (adr r1, 0x8019244)
  8019126:	4620      	mov	r0, r4
  8019128:	f7e7 fe14 	bl	0x8000d54
  801912c:	ea56 0100 	orrs.w	r1, r6, r0
  8019130:	d007      	beq.n	0x8019142
  8019132:	b116      	cbz	r6, 0x801913a
  8019134:	1b31      	subs	r1, r6, r4
- 8019136:	2911      	cmp	r1, #17
+ 8019136:	2911      	cmp	r1, #17 ;; need ≥17 chars for valid position
  8019138:	db03      	blt.n	0x8019142
  801913a:	b120      	cbz	r0, 0x8019146
  801913c:	1b00      	subs	r0, r0, r4
@@ -37493,13 +39397,13 @@
  801914a:	2104      	movs	r1, #4
  801914c:	4668      	mov	r0, sp
  801914e:	f008 f8f1 	bl	0x8021334
- 8019152:	8068      	strh	r0, [r5, #2]
+ 8019152:	8068      	strh	r0, [r5, #2] ;; output[2:3] = latitude degrees
  8019154:	f8b4 0005 	ldrh.w	r0, [r4, #5]
  8019158:	f8ad 0000 	strh.w	r0, [sp]
  801915c:	2102      	movs	r1, #2
  801915e:	4668      	mov	r0, sp
  8019160:	f008 f8e8 	bl	0x8021334
- 8019164:	7128      	strb	r0, [r5, #4]
+ 8019164:	7128      	strb	r0, [r5, #4] ;; output[4] = latitude minutes
  8019166:	79e0      	ldrb	r0, [r4, #7]
  8019168:	7068      	strb	r0, [r5, #1]
  801916a:	f8d4 0009 	ldr.w	r0, [r4, #9]
@@ -37518,8 +39422,8 @@
  8019190:	7228      	strb	r0, [r5, #8]
  8019192:	7c60      	ldrb	r0, [r4, #17]
  8019194:	7168      	strb	r0, [r5, #5]
- 8019196:	f104 0713 	add.w	r7, r4, #19
- 801919a:	a12b      	add	r1, pc, #172	@ (adr r1, 0x8019248)
+ 8019196:	f104 0713 	add.w	r7, r4, #19 ;; r7 = input+19 (longitude field)
+ 801919a:	a12b      	add	r1, pc, #172 ;; delimiter = '/' (altitude separator)	@ (adr r1, 0x8019248)
  801919c:	4638      	mov	r0, r7
  801919e:	f7e7 fdd9 	bl	0x8000d54
  80191a2:	4606      	mov	r6, r0
@@ -37556,10 +39460,10 @@
  80191f6:	f7e7 fdad 	bl	0x8000d54
  80191fa:	4606      	mov	r6, r0
  80191fc:	7870      	ldrb	r0, [r6, #1]
- 80191fe:	2841      	cmp	r0, #65	@ 0x41
+ 80191fe:	2841      	cmp	r0, #65 ;; check for 'A' (altitude marker)	@ 0x41
  8019200:	d11c      	bne.n	0x801923c
  8019202:	78b0      	ldrb	r0, [r6, #2]
- 8019204:	283d      	cmp	r0, #61	@ 0x3d
+ 8019204:	283d      	cmp	r0, #61 ;; check for '=' (altitude= prefix)	@ 0x3d
  8019206:	d119      	bne.n	0x801923c
  8019208:	f856 0f03 	ldr.w	r0, [r6, #3]!
  801920c:	9000      	str	r0, [sp, #0]
@@ -37568,14 +39472,14 @@
  8019214:	2106      	movs	r1, #6
  8019216:	4668      	mov	r0, sp
  8019218:	f008 f88c 	bl	0x8021334
- 801921c:	f00e faba 	bl	0x8027794
- 8019220:	ed9f 1b0a 	vldr	d1, [pc, #40]	@ 0x801924c
+ 801921c:	f00e faba 	bl	0x8027794 ;; float conversion (string→double)
+ 8019220:	ed9f 1b0a 	vldr	d1, [pc, #40] ;; d1 = 3.2808 (feet-to-meters divisor)	@ 0x801924c
  8019224:	ec53 2b11 	vmov	r2, r3, d1
- 8019228:	f00d ffea 	bl	0x8027200
+ 8019228:	f00d ffea 	bl	0x8027200 ;; double divide: altitude_ft / 3.2808
  801922c:	ec41 0b10 	vmov	d0, r0, r1
  8019230:	ec51 0b10 	vmov	r0, r1, d0
  8019234:	f00e f9dc 	bl	0x80275f0
- 8019238:	f8a5 0009 	strh.w	r0, [r5, #9]
+ 8019238:	f8a5 0009 	strh.w	r0, [r5, #9] ;; output[9:10] = altitude in meters
  801923c:	2001      	movs	r0, #1
  801923e:	bdfe      	pop	{r1, r2, r3, r4, r5, r6, r7, pc}
 
@@ -37584,6 +39488,18 @@
   0x08019250: 28 3F 0A 40 70 B5 0E 4D 4F F4 00 44 21 46 28 46  |(?.@p..MO..D!F(F|
 ; --- end data --------------------------------------------------------
 
+; ┌---------------------------------------------------------------------┐
+; │ PSEUDOCODE: spk_mute_on_ptt(void)                                  │
+; │   Mutes speaker and enables mic when sideport button pressed.       │
+; │                                                                     │
+; │   if (gpio_read(GPIOC, PC15) == 0) {  // Sideport button LOW?     │
+; │       delay_ms(50);                    // Debounce                  │
+; │       if (gpio_read(GPIOC, PC15) == 0) {  // Still pressed?        │
+; │           gpio_bits_set(GPIOE, 0x02);  // SET PE1 → MUTE speaker  │
+; │           gpio_bits_set(GPIOB, 0x100); // SET PB8 → enable mic/amp│
+; │       }                                                             │
+; │   }                                                                 │
+; └---------------------------------------------------------------------┘
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  spk_mute_on_ptt                                                     ║
 ; ║  0x08019254  size=60                                            ║
@@ -37591,12 +39507,30 @@
 ; ║  Called by: uart_comm_handler                                              ║
 ; ║  Calls: gpio_input_data_bit_read, gpio_bits_set, delay_ms            ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-;; ═══════════════════════════════════════════════════════════════════
-;; SPK MUTE ON PTT - Mutes speaker when PTT is pressed
-;; Reads GPIO input twice with 50ms delay (debounce)
-;; Mutes PE1 (SPK_MUTE) and sets GPIOB pin
-;; Prevents audio feedback during TX
-;; ═══════════════════════════════════════════════════════════════════
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: spk_mute_on_ptt(void)                                │
+; │                                                                     │
+; │ Mutes speaker and enables mic when external PTT jack detected.     │
+; │ Reads PC15 twice with 50ms debounce.                               │
+; │                                                                     │
+; │   // PC15 = external PTT/speaker jack detection                    │
+; │   if (gpio_read(GPIOC, PC15) != 0) return; // no jack inserted    │
+; │   delay_ms(50);                              // debounce           │
+; │   if (gpio_read(GPIOC, PC15) != 0) return; // confirm             │
+; │                                                                     │
+; │   gpio_set(GPIOE, PE1);   // SET PE1 = SPK_MUTE (mute speaker)   │
+; │   gpio_set(GPIOB, PB8);   // SET PB8 = AMP_EN (0x100 → bit 8)    │
+; │                                                                     │
+; │ WAIT - PB8 here is 0x100 (bit 8), which IS PB8. But the asrs     │
+; │ instruction: r1 = 0x8000 >> 7 = 0x100 = bit 8. Confirmed PB8.     │
+; │                                                                     │
+; │ NOTE: This mutes the speaker (PE1=HIGH) while enabling the amp     │
+; │ (PB8=HIGH). This combination routes mic audio to the amp for TX    │
+; │ feedback or sidetone, while preventing RX audio from playing.      │
+; │                                                                     │
+; │ PC15 FINDING: This confirms PC15 is an INPUT (external PTT jack    │
+; │ or speaker jack detect), NOT a relay control as we assumed.        │
+; └---------------------------------------------------------------------┘
  8019254:	b570      	push	{r4, r5, r6, lr}
  8019256:	4d0e      	ldr	r5, [pc, #56]	@ (0x8019290)                     ; = 0x40011000 (GPIOC)
  8019258:	f44f 4400 	mov.w	r4, #32768	@ 0x8000
@@ -37618,7 +39552,7 @@
  8019282:	11e1      	asrs	r1, r4, #7
  8019284:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  8019288:	4803      	ldr	r0, [pc, #12]	@ (0x8019298)                     ; = 0x40010C00 (GPIOB)
- 801928a:	f7f9 b992 	b.w	0x80125b2                                       ; -> gpio_bits_set ;; SET GPIOB -> 0x0002
+ 801928a:	f7f9 b992 	b.w	0x80125b2                                       ; -> gpio_bits_set ;; SET GPIOB -> PB8/AMP_EN (r1=0x8000>>7=0x100=bit8)
  801928e:	bd70      	pop	{r4, r5, r6, pc}
 
 ; --- DATA @ 0x08019290 --------------------------------------------
@@ -37632,67 +39566,115 @@
 ; ║  Called by: audio_dma_dispatch                                              ║
 ; ║  Calls: null_stub, rf_relay_switch, rf_flag_audio_bk4829, lcd_cmd_dispatch    ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-;; SPK UNMUTE - Restores speaker audio after PTT release
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: spk_unmute(void)                                     │
+; │                                                                     │
+; │ Two-phase state machine controlling speaker mute/unmute during     │
+; │ beep playback. Alternates between "entering beep" and "leaving     │
+; │ beep" states. Called by audio_dma_dispatch.                         │
+; │                                                                     │
+; │   // Guard conditions: early-return if any fail                    │
+; │   if (null_stub() != 0) return;      // busy check                │
+; │   if (g_rf_state[1] == 3) return;    // TX active                 │
+; │   if (*(0x2000A8B1) == 0) return;    // audio disabled             │
+; │   if (g_config[0] == 1) return;      // mode lockout              │
+; │   if (g_rf_state[0x24] != 0) return; // countdown active          │
+; │                                                                     │
+; │   toggle = g_rf_state[0x22];         // mute state byte           │
+; │   band   = *(0x2000A526);            // current band for relay     │
+; │                                                                     │
+; │   if (toggle != 1) {                                                │
+; │       // PHASE 0→1: Entering beep mode                             │
+; │       g_rf_state[0x22] = 1;                                        │
+; │       rf_relay_switch(band, 0);        // relays → IDLE            │
+; │       bk4829_reg30_set_mode(0);        // R30=0x0000 STANDBY      │
+; │       bk4829_audio_config(1);          // R30=0, R37=0x1D00       │
+; │       // (tail-call to bk4829_audio_config @ 0x0801A546)          │
+; │   } else {                                                          │
+; │       // PHASE 1→0: Leaving beep mode, restore RX                  │
+; │       g_rf_state[0x22] = 0;                                        │
+; │       rf_relay_switch(band, 1);        // relays → RX              │
+; │       bk4829_audio_config(0);          // R37=0x9D1F (RX filter)  │
+; │       bk4829_reg30_set_mode(1);        // R30=0xBFF1 (RX mode)    │
+; │       // (tail-call to bk4829_reg30_set_mode @ 0x0801B9CC)        │
+; │   }                                                                 │
+; │                                                                     │
+; │ NOTE: Phase 0→1 sets BK4829 to STANDBY so it doesn't inject RF    │
+; │ noise into the audio path during beep playback.                    │
+; │ Phase 1→0 restores normal RX operation after beep completes.       │
+; │                                                                     │
+; │ FUNCTIONS CALLED:                                                   │
+; │   rf_relay_switch(band, mode) @ 0x0801A268                         │
+; │   bk4829_reg30_set_mode(mode) @ 0x0801B9CC (was peripheral_bus_*) │
+; │   bk4829_audio_config(flag)   @ 0x0801A546 (rf_flag_audio_bk4829) │
+; │   0x0801A624 = bk4829_reg30_set_mode (alternate entry?)           │
+; └---------------------------------------------------------------------┘
+;; SPK UNMUTE - Two-phase mute/unmute controller for beep isolation
  801929c:	b510      	push	{r4, lr}
- 801929e:	f7ef fa99 	bl	0x80087d4
+;; ---- Guard chain: early-exit if system busy or wrong mode ----
+ 801929e:	f7ef fa99 	bl	0x80087d4                                        ; null_stub() - returns 0 if idle
  80192a2:	2800      	cmp	r0, #0
- 80192a4:	d143      	bne.n	0x801932e
- 80192a6:	4922      	ldr	r1, [pc, #136]	@ (0x8019330)                    ; = 0x2000A3B4 (g_rf_state)
- 80192a8:	7848      	ldrb	r0, [r1, #1]
- 80192aa:	2803      	cmp	r0, #3
- 80192ac:	d03f      	beq.n	0x801932e
- 80192ae:	4821      	ldr	r0, [pc, #132]	@ (0x8019334)                    ; = 0x2000A8B0 (RAM+0xA8B0)
- 80192b0:	7840      	ldrb	r0, [r0, #1]
+ 80192a4:	d143      	bne.n	0x801932e                                       ; busy → exit
+ 80192a6:	4922      	ldr	r1, [pc, #136]	@ (0x8019330)                    ; r1 = 0x2000A3B4 (g_rf_state)
+ 80192a8:	7848      	ldrb	r0, [r1, #1]                                     ; r0 = g_rf_state[1] (radio mode)
+ 80192aa:	2803      	cmp	r0, #3                                           ; mode 3 = TX active?
+ 80192ac:	d03f      	beq.n	0x801932e                                       ; TX → exit (don't unmute during TX)
+ 80192ae:	4821      	ldr	r0, [pc, #132]	@ (0x8019334)                    ; = 0x2000A8B0 (rf_cfg)
+ 80192b0:	7840      	ldrb	r0, [r0, #1]                                     ; r0 = rf_cfg[1] (audio enable flag)
  80192b2:	2800      	cmp	r0, #0
- 80192b4:	d03b      	beq.n	0x801932e
+ 80192b4:	d03b      	beq.n	0x801932e                                       ; audio disabled → exit
  80192b6:	4a20      	ldr	r2, [pc, #128]	@ (0x8019338)                    ; = 0x2000ADD0 (g_config)
- 80192b8:	7812      	ldrb	r2, [r2, #0]
+ 80192b8:	7812      	ldrb	r2, [r2, #0]                                     ; r2 = g_config[0] (mode lock)
  80192ba:	2a01      	cmp	r2, #1
- 80192bc:	d037      	beq.n	0x801932e
- 80192be:	8c8a      	ldrh	r2, [r1, #36]	@ 0x24
+ 80192bc:	d037      	beq.n	0x801932e                                       ; mode locked → exit
+ 80192be:	8c8a      	ldrh	r2, [r1, #36]	@ 0x24                            ; r2 = g_rf_state[0x24] (countdown timer)
  80192c0:	2a00      	cmp	r2, #0
- 80192c2:	d134      	bne.n	0x801932e
- 80192c4:	f891 4022 	ldrb.w	r4, [r1, #34]	@ 0x22
- 80192c8:	221e      	movs	r2, #30
- 80192ca:	4b1c      	ldr	r3, [pc, #112]	@ (0x801933c)                    ; = 0x2000A41C (RAM+0xA41C)
- 80192cc:	2c01      	cmp	r4, #1
- 80192ce:	d012      	beq.n	0x80192f6
+ 80192c2:	d134      	bne.n	0x801932e                                       ; countdown active → exit
+;; ---- Read mute toggle state ----
+ 80192c4:	f891 4022 	ldrb.w	r4, [r1, #34]	@ 0x22                         ; r4 = g_rf_state[0x22] (mute toggle: 0=normal, 1=muted)
+ 80192c8:	221e      	movs	r2, #30                                          ; r2 = 30 (countdown reload value)
+ 80192ca:	4b1c      	ldr	r3, [pc, #112]	@ (0x801933c)                    ; r3 = 0x2000A41C (band state base)
+ 80192cc:	2c01      	cmp	r4, #1                                           ; currently muted (in beep mode)?
+ 80192ce:	d012      	beq.n	0x80192f6                                       ; → Phase 1→0: leave beep mode
+;; ---- PHASE 0→1: Entering beep - silence RF path ----
  80192d0:	2401      	movs	r4, #1
- 80192d2:	f881 4022 	strb.w	r4, [r1, #34]	@ 0x22
- 80192d6:	8ccc      	ldrh	r4, [r1, #38]	@ 0x26
- 80192d8:	b324      	cbz	r4, 0x8019324
- 80192da:	848a      	strh	r2, [r1, #36]	@ 0x24
- 80192dc:	f893 010a 	ldrb.w	r0, [r3, #266]	@ 0x10a
- 80192e0:	2100      	movs	r1, #0
- 80192e2:	f000 ffc1 	bl	0x801a268                                        ; rf_relay_switch
+ 80192d2:	f881 4022 	strb.w	r4, [r1, #34]	@ 0x22                         ; g_rf_state[0x22] = 1 (now muted)
+ 80192d6:	8ccc      	ldrh	r4, [r1, #38]	@ 0x26                            ; r4 = g_rf_state[0x26] (band index)
+ 80192d8:	b324      	cbz	r4, 0x8019324                                    ; band 0 → alt countdown table
+ 80192da:	848a      	strh	r2, [r1, #36]	@ 0x24                            ; g_rf_state[0x24] = 30 (start countdown)
+ 80192dc:	f893 010a 	ldrb.w	r0, [r3, #266]	@ 0x10a                       ; r0 = band_state[0x10A] (relay band index)
+ 80192e0:	2100      	movs	r1, #0                                           ; mode = 0 (IDLE)
+ 80192e2:	f000 ffc1 	bl	0x801a268                                        ; rf_relay_switch(band, 0) - relays → IDLE
  80192e6:	2000      	movs	r0, #0
- 80192e8:	f001 f99c 	bl	0x801a624
+ 80192e8:	f001 f99c 	bl	0x801a624                                        ; bk4829_reg30_set_mode(0) - R30=0x0000 (STANDBY)
  80192ec:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 80192f0:	2001      	movs	r0, #1
- 80192f2:	f001 b928 	b.w	0x801a546
+ 80192f0:	2001      	movs	r0, #1                                           ; enter_beep = 1
+ 80192f2:	f001 b928 	b.w	0x801a546                                       ; → bk4829_audio_mode_switch(1): R37=0x1D00 on both chips
+;; ---- PHASE 1→0: Leaving beep - restore RX path ----
  80192f6:	2400      	movs	r4, #0
- 80192f8:	f881 4022 	strb.w	r4, [r1, #34]	@ 0x22
- 80192fc:	8ccc      	ldrh	r4, [r1, #38]	@ 0x26
- 80192fe:	b16c      	cbz	r4, 0x801931c
- 8019300:	848a      	strh	r2, [r1, #36]	@ 0x24
- 8019302:	f893 010a 	ldrb.w	r0, [r3, #266]	@ 0x10a
- 8019306:	2101      	movs	r1, #1
- 8019308:	f000 ffae 	bl	0x801a268                                        ; rf_relay_switch
- 801930c:	2000      	movs	r0, #0
- 801930e:	f001 f91a 	bl	0x801a546
+ 80192f8:	f881 4022 	strb.w	r4, [r1, #34]	@ 0x22                         ; g_rf_state[0x22] = 0 (unmuted)
+ 80192fc:	8ccc      	ldrh	r4, [r1, #38]	@ 0x26                            ; r4 = band index
+ 80192fe:	b16c      	cbz	r4, 0x801931c                                    ; band 0 → alt countdown table
+ 8019300:	848a      	strh	r2, [r1, #36]	@ 0x24                            ; g_rf_state[0x24] = 30 (start countdown)
+ 8019302:	f893 010a 	ldrb.w	r0, [r3, #266]	@ 0x10a                       ; r0 = relay band index
+ 8019306:	2101      	movs	r1, #1                                           ; mode = 1 (RX)
+ 8019308:	f000 ffae 	bl	0x801a268                                        ; rf_relay_switch(band, 1) - relays → RX
+ 801930c:	2000      	movs	r0, #0                                           ; enter_beep = 0
+ 801930e:	f001 f91a 	bl	0x801a546                                        ; bk4829_audio_mode_switch(0): R37=0x9D1F on both chips
  8019312:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  8019316:	2001      	movs	r0, #1
- 8019318:	f001 b984 	b.w	0x801a624
- 801931c:	4a08      	ldr	r2, [pc, #32]	@ (0x8019340)                     ; = 0x0802F71D (flash+0x2F71D)
- 801931e:	5c80      	ldrb	r0, [r0, r2]
- 8019320:	8488      	strh	r0, [r1, #36]	@ 0x24
- 8019322:	e7ee      	b.n	0x8019302
- 8019324:	4a06      	ldr	r2, [pc, #24]	@ (0x8019340)                     ; = 0x0802F71D (flash+0x2F71D)
- 8019326:	1f12      	subs	r2, r2, #4
+ 8019318:	f001 b984 	b.w	0x801a624                                       ; → bk4829_reg30_set_mode(1): R30=0xBFF1 (RX mode)
+;; ---- Alt paths: band==0, lookup countdown from flash table ----
+ 801931c:	4a08      	ldr	r2, [pc, #32]	@ (0x8019340)                     ; = 0x0802F71D (countdown table in flash)
+ 801931e:	5c80      	ldrb	r0, [r0, r2]                                     ; r0 = flash_table[band_state_base + band]
+ 8019320:	8488      	strh	r0, [r1, #36]	@ 0x24                            ; g_rf_state[0x24] = countdown from table
+ 8019322:	e7ee      	b.n	0x8019302                                        ; → continue with relay switch (RX)
+ 8019324:	4a06      	ldr	r2, [pc, #24]	@ (0x8019340)                     ; = 0x0802F71D
+ 8019326:	1f12      	subs	r2, r2, #4                                       ; offset -4 for band 0 entering beep
  8019328:	5c80      	ldrb	r0, [r0, r2]
- 801932a:	8488      	strh	r0, [r1, #36]	@ 0x24
- 801932c:	e7d6      	b.n	0x80192dc
- 801932e:	bd10      	pop	{r4, pc}
+ 801932a:	8488      	strh	r0, [r1, #36]	@ 0x24                            ; g_rf_state[0x24] = alt countdown
+ 801932c:	e7d6      	b.n	0x80192dc                                        ; → continue with relay switch (IDLE)
+ 801932e:	bd10      	pop	{r4, pc}                                         ; guard exit
 
 ; --- DATA @ 0x08019330 --------------------------------------------
   0x08019330: B4 A3 00 20 B0 A8 00 20 D0 AD 00 20 1C A4 00 20  |... ... ... ... | [+0] 0x2000A3B4=g_rf_state; [+4] 0x2000A8B0=RAM+0xA8B0; [+8] 0x2000ADD0=g_config; [+12] 0x2000A41C=RAM+0xA41C
@@ -38721,7 +40703,27 @@
 ; ║  Called by: rf_flag_audio_bk4829, system_rf_config                                ║
 ; ║  Calls: delay_short, gpio_bits_reset, gpio_bits_set, spi_bitbang_byte  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_reg_table_a [BK4829/DATA] - BK4829 register config table A (8.3KB). No GPIO refs, no subcalls - likely register init data.
+; ┌---------------------------------------------------------------------┐
+; │ RENAMED: bk4829_reg_table_a → bk4829_beep_standby_config          │
+; │ C PSEUDOCODE: bk4829_beep_standby_config(uint8_t chip)            │
+; │                                                                     │
+; │ Configures BK4829 for beep mode: STANDBY + CTCSS beep filter.     │
+; │ chip=0 → CHIP0 (via 0x0801C090), chip=1 → CHIP1 (via 0x0801C0E4) │
+; │                                                                     │
+; │   reg_write = (chip != 0) ? chip1_reg_write : chip0_reg_write;    │
+; │   reg_write(0x30, 0x0000);   // REG30 = STANDBY (all blocks off)  │
+; │   reg_write(0x37, 0x1D00);   // REG37 = CTCSS beep filter config  │
+; │                                                                     │
+; │ NOTE: Only writes 2 registers! Despite "8334 size" in header,      │
+; │ this is NOT a large table - the size includes the next function     │
+; │ (bk4829_reg_load) and data that follows.                           │
+; │                                                                     │
+; │ REG 0x37 = 0x1D00 breakdown (BK4819-compatible):                  │
+; │   [15:8] = 0x1D = CTCSS/tone detection filter bandwidth           │
+; │   [7:0]  = 0x00 = tone frequency / gain control                   │
+; │   Compare: RX mode uses REG 0x37 = 0x9D1F (wider filter)          │
+; └---------------------------------------------------------------------┘
+; * bk4829_beep_standby_config [BK4829] - BK4829 STANDBY+beep filter (R30=0, R37=0x1D00)
  801a09e:	b510      	push	{r4, lr}
  801a0a0:	f44f 54e8 	mov.w	r4, #7424	@ 0x1d00
  801a0a4:	2800      	cmp	r0, #0
@@ -38745,7 +40747,22 @@
 ; ║  0x0801A0D0  size=20                                            ║
 ; ║  Called by: rf_flag_audio_bk4829, system_rf_config                                ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_audio_config_read  [BK4829] - BK4829 audio config read - ←bk4829_reg_load, audio_bk4829_config
+; ┌---------------------------------------------------------------------┐
+; │ RENAMED: bk4829_reg_load / bk4829_audio_config_read                │
+; │        → bk4829_rx_filter_restore                                   │
+; │ C PSEUDOCODE: bk4829_rx_filter_restore(uint8_t chip)              │
+; │                                                                     │
+; │ Restores BK4829 REG 0x37 to RX filter mode after beep.             │
+; │ Called during spk_unmute phase 1→0 (leaving beep, restoring RX).   │
+; │                                                                     │
+; │   reg_write = (chip != 0) ? chip1_reg_write : chip0_reg_write;    │
+; │   reg_write(0x37, 0x9D1F);   // RX filter: wider bandwidth        │
+; │                                                                     │
+; │ Compare with bk4829_beep_standby_config which sets R37=0x1D00.    │
+; │ 0x9D1F = bit15 set = enable some detection + wider BW for RX.     │
+; │ 0x1D00 = bit15 clr = narrower BW suitable for beep/CTCSS only.    │
+; └---------------------------------------------------------------------┘
+; * bk4829_rx_filter_restore [BK4829] - REG37=0x9D1F (RX audio filter config)
  801a0d0:	f649 511f 	movw	r1, #40223	@ 0x9d1f
  801a0d4:	2800      	cmp	r0, #0
  801a0d6:	d002      	beq.n	0x801a0de
@@ -38877,7 +40894,18 @@
 ; ║  0x0801A1CC  size=16                                            ║
 ; ║  Called by: audio_dma_dispatch                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_get_channel_status  [BK4829] - Read REG_0x67 bits[8:0] - 16B, ←string_channel_format
+; * bk4829_get_channel_status  [BK4829] - Read BK4829 REG 0x67 signal status (16B)
+;
+;   C pseudocode:
+;     uint16_t bk4829_get_channel_status(void) {
+;       uint16_t val = hal_reg_read(0x67);  // BK4829 REG 0x67: signal/channel status
+;       return val & 0x1FF;                // extract bits [8:0] = detected CTCSS tone index
+;     }
+;
+;   REG 0x67 bit field decode:
+;     Bits [8:0]  = CTCSS/DCS tone code (0-50 for standard CTCSS tones)
+;     Upper bits  = reserved / signal quality flags
+;   Called by: string_channel_format (display formatting)
  801a1cc:	b510      	push	{r4, lr}
  801a1ce:	4803      	ldr	r0, [pc, #12]	@ (0x801a1dc)                     ; = 0x20000C28 (RAM+0xC28)
  801a1d0:	6841      	ldr	r1, [r0, #4]
@@ -38895,7 +40923,20 @@
 ; ║  0x0801A1E0  size=34                                            ║
 ; ║  Called by: audio_dma_dispatch, radio_audio_mixer, display_channel_info, display_full_redraw, dac_state_dispatch  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * state_check [UTIL] - State variable check (34B, 8 callers). Reads global flag and returns status.
+; * bk4829_rx_tone_active  [BK4829] - Check if RX tone detection active (34B, 8 callers)
+;
+;   C pseudocode:
+;     bool bk4829_rx_tone_active(void) {
+;       if (g_chip_select_flag == 0) return true;  // no chip → always pass
+;       uint16_t status = hal_reg_read(0x0C);      // BK4829 REG 0x0C: status register
+;       if (status & 0x02) return false;            // bit 1 set → tone NOT matched
+;       return true;                                // bit 1 clear → tone matched/idle
+;     }
+;
+;   REG 0x0C bit 1 (tested via lsls r0,r0,#30 → bpl):
+;     0 = CTCSS/DCS tone matched or disabled → return 1 (pass)
+;     1 = tone mismatch (squelch should stay closed) → return 0
+;   RENAME: was state_check - actually BK4829 REG 0x0C tone detection readback
  801a1e0:	b510      	push	{r4, lr}
  801a1e2:	4808      	ldr	r0, [pc, #32]	@ (0x801a204)                     ; = 0x2000A8B0 (RAM+0xA8B0)
  801a1e4:	7800      	ldrb	r0, [r0, #0]
@@ -38923,7 +40964,19 @@
 ; ║  0x0801A20C  size=34                                            ║
 ; ║  Called by: audio_dma_dispatch                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_check_active_mode  [BK4829] - Read REG_0x0C, check mode flag - 26B, ←lcd_cmd_dispatch
+; * bk4829_check_active_mode  [BK4829] - Read REG 0x0C, check RX active (26B)
+;
+;   C pseudocode:
+;     bool bk4829_check_active_mode(void) {
+;       if (g_chip_active == 0) return false;      // chip not selected
+;       uint16_t status = hal_reg_read(0x0C);      // BK4829 REG 0x0C: status register
+;       if (status & 0x02) return false;            // bit 1 = tone mismatch
+;       return true;                                // RX active, tone OK
+;     }
+;
+;   Same REG 0x0C bit 1 check as bk4829_rx_tone_active (0x0801A1E0)
+;   but with inverted default: returns 0 (not 1) when chip inactive
+;   Caller: lcd_cmd_dispatch (display formatting based on RX state)
  801a20c:	b510      	push	{r4, lr}
  801a20e:	4808      	ldr	r0, [pc, #32]	@ (0x801a230)                     ; = 0x2000A8B0 (RAM+0xA8B0)
  801a210:	7800      	ldrb	r0, [r0, #0]
@@ -38985,35 +41038,98 @@
 ; ║  Called by: audio_dma_dispatch, display_screen_layout, rf_calibration_engine, spk_unmute, bk4829_power_table (+5 more)  ║
 ; ║  Calls: gpio_bits_reset, gpio_bits_set, lcd_wr_strobe                 ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-;; ═══════════════════════════════════════════════════════════════════
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: rf_relay_switch(uint8_t band, uint8_t mode)          │
+; │                                                                     │
+; │ Controls RF frontend relay/switch network. 4 modes:                │
+; │                                                                     │
+; │   mode 0: IDLE - all relays off (beep standby)                     │
+; │     CLR PE13(U6R_EN), PE7(U3T_EN), PB1(V3T), PE12(U3R_EN),       │
+; │     PB0(V3R), PE14(SW3T)                                           │
+; │     // All RF switches/LNAs/PAs disabled                            │
+; │                                                                     │
+; │   mode 1: RX - enable receive path                                 │
+; │     if (band_flag == 0xA5 && g_rf_state[1] != 2)                  │
+; │       return null_stub(0, 0);  // special case                     │
+; │     CLR PE7(U3T_EN), PB1(V3T), PE14(SW3T)  // TX path off         │
+; │     if (band < threshold) {   // VHF                               │
+; │       SET PE12(U3R_EN), PB0(V3R)  // VHF RX LNA chain             │
+; │     } else {                  // UHF                               │
+; │       SET PE13(U6R_EN)            // UHF RX LNA                    │
+; │       CLR PE12, PB0               // VHF RX off                    │
+; │     }                                                               │
+; │                                                                     │
+; │   mode 2: TX - enable transmit path                                │
+; │     CLR PE12(U3R_EN), PB0(V3R), PE13(U6R_EN)  // RX off           │
+; │     SET PE7(U3T_EN)                             // TX path on      │
+; │     if (band < threshold) {   // VHF TX                            │
+; │       SET PB1(V3T)            // VHF PA bias                       │
+; │       CLR PE14(SW3T)          // VHF antenna path                  │
+; │     } else {                  // UHF TX                            │
+; │       CLR PB1(V3T)            // VHF PA off                        │
+; │       SET PE14(SW3T)          // UHF antenna path                  │
+; │     }                                                               │
+; │                                                                     │
+; │   mode 3: (variant, similar to mode 2 with different PE14 logic)   │
+; │                                                                     │
+; │ GPIO PINOUT:                                                        │
+; │   PE7  = U3T_EN  (TX path enable)                                  │
+; │   PE12 = U3R_EN  (VHF RX switch)                                   │
+; │   PE13 = U6R_EN  (UHF RX switch)                                   │
+; │   PE14 = SW3T    (band antenna select)                              │
+; │   PB0  = V3R     (VHF RX LNA bias)                                │
+; │   PB1  = V3T     (VHF TX PA bias)                                 │
+; │   PC4  = BAND_RELAY (not controlled here!)                         │
+; │                                                                     │
+; │ SAFETY: Mode 0 (IDLE) must be called before beep to prevent RF     │
+; │ coupling into the audio amplifier during DAC playback.             │
+; └---------------------------------------------------------------------┘
 ;; RF RELAY SWITCH - Controls antenna path for VHF/UHF RX/TX
 ;;
 ;; DANGER: Incorrect relay switching can damage RF frontend!
 ;;
 ;; Controls: PE7(U3T_EN), PE12(U3R_EN), PE13(U6R_EN), PE14(SW3T),
 ;;           PB0(V3R), PB1(V3T)
-;;
-;; Mode 0: VHF RX?  Mode 1: UHF RX?  Mode 2: VHF TX?  Mode 3: UHF TX?
-;; (Exact mode mapping TBD - needs hardware verification)
-;;
-;; PC4 (BAND_RELAY) is controlled elsewhere - NEVER toggle without care!
-;; ═══════════════════════════════════════════════════════════════════
+; -- rf_relay_switch -----------------------------------------------------
+; RF antenna relay switching (390B). Controls VHF/UHF RX/TX path.
+; CRITICAL: Incorrect sequencing can damage RF frontend or PA.
+;
+; Relay GPIO assignments:
+;   PE7  = U3T_EN (UHF TX enable)    PE12 = U3R_EN (UHF RX enable)
+;   PE13 = U6R_EN (VHF RX enable)    PE14 = SW3T   (antenna switch)
+;   PB0  = V3R    (VHF RX amp)       PB1  = V3T    (VHF TX amp)
+;
+; r0 = band (0=VHF low, 1=VHF mid, 3=VHF high, 4=UHF)
+; r1 = mode:
+;   mode 0: IDLE - All relays OFF (safe state for beep/standby)
+;   mode 1: RX   - Band-dependent RX path:
+;     band 0: PB0=SET (VHF RX)
+;     band 1,3: PE12=SET (UHF RX)
+;     band 4: PE13=SET (VHF high RX)
+;     Special: if g_rf[0x4A]==0xA5 AND dispatch≠2 → cal_init(0,0) first
+;   mode 2: TX   - Band-dependent TX path via TBB:
+;     band 0,1: PE7=SET, SW3T=CLR (UHF TX via U3T)
+;     band 2: PB1=SET, SW3T=CLR (VHF TX via V3T)
+;     band 3,4: all TX relays OFF, SW3T=SET
+;     band ≥5: all OFF, SW3T=SET
+;   mode 3: PTT release - CLR PE13+PE12, then PB0=CLR (reset RX path)
+; ------------------------------------------------------------------------
  801a268:	e92d 47f0 	stmdb	sp!, {r4, r5, r6, r7, r8, r9, sl, lr}
  801a26c:	4604      	mov	r4, r0
  801a26e:	4a5d      	ldr	r2, [pc, #372]	@ (0x801a3e4)                    ; = 0x2000A3B4 (g_rf_state)
  801a270:	4d5d      	ldr	r5, [pc, #372]	@ (0x801a3e8)                    ; = 0x40011800 (GPIOE)
  801a272:	4e5e      	ldr	r6, [pc, #376]	@ (0x801a3ec)                    ; = 0x40010C00 (GPIOB)
- 801a274:	f892 004a 	ldrb.w	r0, [r2, #74]	@ 0x4a
- 801a278:	f44f 5780 	mov.w	r7, #4096	@ 0x1000
- 801a27c:	f44f 5800 	mov.w	r8, #8192	@ 0x2000
- 801a280:	2901      	cmp	r1, #1
+ 801a274:	f892 004a 	ldrb.w	r0, [r2, #74] ;; g_rf[0x4A] - cal flag (0xA5=active)	@ 0x4a
+ 801a278:	f44f 5780 	mov.w	r7, #4096 ;; r7 = PE12 mask (U3R_EN)	@ 0x1000
+ 801a27c:	f44f 5800 	mov.w	r8, #8192 ;; r8 = PE13 mask (U6R_EN)	@ 0x2000
+ 801a280:	2901      	cmp	r1, #1 ;; -- mode 1: RX path setup
  801a282:	d01f      	beq.n	0x801a2c4
  801a284:	f44f 4980 	mov.w	r9, #16384	@ 0x4000
- 801a288:	2902      	cmp	r1, #2
+ 801a288:	2902      	cmp	r1, #2 ;; -- mode 2: TX path setup
  801a28a:	d055      	beq.n	0x801a338
- 801a28c:	2903      	cmp	r1, #3
+ 801a28c:	2903      	cmp	r1, #3 ;; -- mode 3: PTT release
  801a28e:	d07d      	beq.n	0x801a38c
- 801a290:	4641      	mov	r1, r8
+ 801a290:	4641      	mov	r1, r8 ;; -- mode 0 (IDLE): clear all relays
  801a292:	4628      	mov	r0, r5
  801a294:	f7f8 f98b 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOE -> PE13/U6R_EN
  801a298:	2180      	movs	r1, #128	@ 0x80
@@ -39032,7 +41148,7 @@
  801a2ba:	4628      	mov	r0, r5
  801a2bc:	e8bd 47f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, lr}
  801a2c0:	f7f8 b975 	b.w	0x80125ae                                       ; -> gpio_bits_reset
- 801a2c4:	28a5      	cmp	r0, #165	@ 0xa5
+ 801a2c4:	28a5      	cmp	r0, #165 ;; -- RX: check cal flag 0xA5	@ 0xa5
  801a2c6:	d106      	bne.n	0x801a2d6
  801a2c8:	7850      	ldrb	r0, [r2, #1]
  801a2ca:	2802      	cmp	r0, #2
@@ -39040,12 +41156,12 @@
  801a2ce:	2100      	movs	r1, #0
  801a2d0:	4608      	mov	r0, r1
  801a2d2:	f000 fe7b 	bl	0x801afcc
- 801a2d6:	b12c      	cbz	r4, 0x801a2e4
- 801a2d8:	2c01      	cmp	r4, #1
+ 801a2d6:	b12c      	cbz	r4, 0x801a2e4 ;; band 0 (VHF low): PB0=SET
+ 801a2d8:	2c01      	cmp	r4, #1 ;; band 1 or 3: PE12=SET (UHF RX)
  801a2da:	d01f      	beq.n	0x801a31c
  801a2dc:	2c03      	cmp	r4, #3
  801a2de:	d01d      	beq.n	0x801a31c
- 801a2e0:	2c04      	cmp	r4, #4
+ 801a2e0:	2c04      	cmp	r4, #4 ;; band 4: PE13=SET (VHF high RX)
  801a2e2:	d00d      	beq.n	0x801a300
  801a2e4:	4641      	mov	r1, r8
  801a2e6:	4628      	mov	r0, r5
@@ -39077,14 +41193,14 @@
  801a32e:	4628      	mov	r0, r5
  801a330:	e8bd 47f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, lr}
  801a334:	f7f8 b93d 	b.w	0x80125b2                                       ; -> gpio_bits_set
- 801a338:	28a5      	cmp	r0, #165	@ 0xa5
+ 801a338:	28a5      	cmp	r0, #165 ;; -- TX: check cal flag	@ 0xa5
  801a33a:	d103      	bne.n	0x801a344
  801a33c:	2100      	movs	r1, #0
  801a33e:	4608      	mov	r0, r1
  801a340:	f000 fe44 	bl	0x801afcc
- 801a344:	2c05      	cmp	r4, #5
+ 801a344:	2c05      	cmp	r4, #5 ;; band >= 5: default TX (all off)
  801a346:	d230      	bcs.n	0x801a3aa
- 801a348:	e8df f004 	tbb	[pc, r4]
+ 801a348:	e8df f004 	tbb	[pc, r4] ;; TX band dispatch (5 entries)
  801a34c:	0311      	lsls	r1, r2, #12
  801a34e:	0311      	lsls	r1, r2, #12
  801a350:	001f      	movs	r7, r3
@@ -39164,24 +41280,49 @@
 ; ║  Calls: bk4829_power_table, rf_relay_switch, rf_power_dispatch, system_rf_config, bk4829_reg_dump (+3 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_tx_power_set  [RF] - TX power control - calls rf_power_dispatch, rf_relay_switch
+; -- rf_tx_power_set -----------------------------------------------------
+; TX power control handler (86B). Sets transmit power level based on
+; band, frequency range, and operating mode (APRS monitor mode gets 
+; lower power).
+;
+; Key structures:
+;   g_display_config @ 0x2000A41C: [0x10D] = band index for power table
+;   g_channel_work @ 0x2000A858: [0x38] = freq direction flag
+;     [0x18] → ptr to freq struct → [0] = current frequency (Hz)
+;   g_rf_state @ 0x2000A3B4: [1] = dispatch mode
+;
+; Power selection logic:
+;   1. Read band index → call rf_power_table_lookup(band)
+;   2. Check freq direction flag [0x38]:
+;      - If 1 (offset active) → use high power path
+;      - Else check frequency range: freq - 0xFF5B3480 vs 0x002AB980
+;        (tests if within 10.8-13.6 MHz special BT band)
+;   3. If in BT band (< threshold) → use high power
+;      If out of range → use rf_power_dispatch(0) = low power
+;   4. In high power path: check if mode 11 (APRS monitor)
+;      - Mode 11 → rf_power_dispatch(0) = low power
+;      - Else → rf_power_dispatch(1) = high power
+;   5. Call rf_relay_switch(band, 0) → configure antenna relays
+;   6. TAIL-CALL rf_pa_bias_set → set PA bias current
+; ------------------------------------------------------------------------
  801a400:	b510      	push	{r4, lr}
- 801a402:	4c14      	ldr	r4, [pc, #80]	@ (0x801a454)                     ; = 0x2000A41C (RAM+0xA41C)
- 801a404:	f894 010d 	ldrb.w	r0, [r4, #269]	@ 0x10d
+ 801a402:	4c14      	ldr	r4, [pc, #80]	@ (0x801a454 ;; g_display_config @ 0x2000A41C)                     ; = 0x2000A41C (RAM+0xA41C)
+ 801a404:	f894 010d 	ldrb.w	r0, [r4, #269] ;; band index for power table	@ 0x10d
  801a408:	f000 f8cb 	bl	0x801a5a2
- 801a40c:	4812      	ldr	r0, [pc, #72]	@ (0x801a458)                     ; = 0x2000A858 (RAM+0xA858)
- 801a40e:	f890 1038 	ldrb.w	r1, [r0, #56]	@ 0x38
+ 801a40c:	4812      	ldr	r0, [pc, #72]	@ (0x801a458 ;; g_channel_work @ 0x2000A858)                     ; = 0x2000A858 (RAM+0xA858)
+ 801a40e:	f890 1038 	ldrb.w	r1, [r0, #56] ;; freq direction flag	@ 0x38
  801a412:	2901      	cmp	r1, #1
  801a414:	d006      	beq.n	0x801a424
- 801a416:	6980      	ldr	r0, [r0, #24]
+ 801a416:	6980      	ldr	r0, [r0, #24] ;; ptr to freq struct
  801a418:	4910      	ldr	r1, [pc, #64]	@ (0x801a45c)                     ; = 0xFF5B3480
- 801a41a:	6800      	ldr	r0, [r0, #0]
+ 801a41a:	6800      	ldr	r0, [r0, #0] ;; current frequency (Hz)
  801a41c:	4408      	add	r0, r1
  801a41e:	4910      	ldr	r1, [pc, #64]	@ (0x801a460)                     ; = 0x002AB980
  801a420:	4288      	cmp	r0, r1
  801a422:	d20b      	bcs.n	0x801a43c
  801a424:	480f      	ldr	r0, [pc, #60]	@ (0x801a464)                     ; = 0x2000A3B4 (g_rf_state)
- 801a426:	7840      	ldrb	r0, [r0, #1]
- 801a428:	280b      	cmp	r0, #11
+ 801a426:	7840      	ldrb	r0, [r0, #1] ;; dispatch mode
+ 801a428:	280b      	cmp	r0, #11 ;; mode 11 = APRS monitor
  801a42a:	d003      	beq.n	0x801a434
  801a42c:	2001      	movs	r0, #1
  801a42e:	f000 f853 	bl	0x801a4d8
@@ -39191,7 +41332,7 @@
  801a43a:	e002      	b.n	0x801a442
  801a43c:	2000      	movs	r0, #0
  801a43e:	f000 f84b 	bl	0x801a4d8
- 801a442:	f894 010a 	ldrb.w	r0, [r4, #266]	@ 0x10a
+ 801a442:	f894 010a 	ldrb.w	r0, [r4, #266] ;; band index for relay	@ 0x10a
  801a446:	2100      	movs	r1, #0
  801a448:	f7ff ff0e 	bl	0x801a268                                        ; rf_relay_switch
  801a44c:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
@@ -39211,11 +41352,17 @@
 ; ║  Called by: bk4829_spi_delay, subsystem_poll, bk4829_rf_control                  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_filter_table [BK4829/DATA] - BK4829 filter/bandwidth data (4.4KB, 4 callers). RF filter configuration tables.
+; -- bk4829_filter_table (ACTUALLY: bk4829_cs_ctrl) ---------------------
+; BK4829 chip select control (14B trampoline).
+; r0=1 → enable CS (call 0x801B3A8 with param=1)
+; r0=0 → disable CS (call 0x801B540)
+; NOTE: Name "bk4829_filter_table" is a misnomer; this is CS pin control.
+; ------------------------------------------------------------------------
  801a468:	2801      	cmp	r0, #1
  801a46a:	d001      	beq.n	0x801a470
- 801a46c:	f001 b868 	b.w	0x801b540
+ 801a46c:	f001 b868 	b.w	0x801b540 ;; CS disable → gpio_bits_reset(PE8)
  801a470:	2001      	movs	r0, #1
- 801a472:	f000 bf99 	b.w	0x801b3a8
+ 801a472:	f000 bf99 	b.w	0x801b3a8 ;; CS enable → gpio_bits_set(PE8)
  801a476:	0000      	movs	r0, r0
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_dma_filter_block                                                        ║
@@ -39223,13 +41370,34 @@
 ; ║  Called by: bk4829_reg_dump                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * uart_dma_filter_block  [COMMS] - UART DMA filter block - ←uart_dma_settings_read
+; -- uart_dma_filter_block (ACTUALLY: bk4829_rssi_read) ------------------
+; BK4829 RSSI reader with squelch tail elimination (88B).
+; Reads REG 0x52 (RSSI), optionally applies squelch tail elimination
+; via REG 0x51 and REG 0x07, then writes back filtered RSSI to REG 0x52.
+;
+; r0 = mode (0=basic read, non-0=full filter with STE)
+;
+; REG 0x52: RSSI register ([12:0] = RSSI value, bit 15 = STE flag)
+; REG 0x51: Squelch threshold + noise gate config
+; REG 0x07: AGC/filter bandwidth control (value 0x0471)
+;
+; Squelch tail elimination (STE) path (r6 != 0):
+;   Check HAL struct [20] and [25]: if mode <= 1 AND [25]==0
+;     → STE active: read (RAM+0x11E)[1] & 0x7F, OR 0x9000 → REG51
+;     → write REG07 = 0x0471 (AGC config for STE)
+;   else → set bit 15 of RSSI (STE flag)
+;
+; Basic path (r6 == 0): write REG51 = 0 (clear squelch gate)
+;
+; Final: write filtered RSSI back to REG 0x52
+; ------------------------------------------------------------------------
  801a478:	b570      	push	{r4, r5, r6, lr}
  801a47a:	4606      	mov	r6, r0
  801a47c:	4d14      	ldr	r5, [pc, #80]	@ (0x801a4d0)                     ; = 0x20000C28 (RAM+0xC28)
- 801a47e:	2052      	movs	r0, #82	@ 0x52
+ 801a47e:	2052      	movs	r0, #82 ;; REG 0x52 (RSSI)	@ 0x52
  801a480:	6869      	ldr	r1, [r5, #4]
  801a482:	4788      	blx	r1
- 801a484:	f3c0 040c 	ubfx	r4, r0, #0, #13
+ 801a484:	f3c0 040c 	ubfx	r4, r0, #0, #13 ;; r4 = RSSI[12:0]
  801a488:	b1c6      	cbz	r6, 0x801a4bc
  801a48a:	f105 000c 	add.w	r0, r5, #12
  801a48e:	7d01      	ldrb	r1, [r0, #20]
@@ -39237,18 +41405,18 @@
  801a492:	d801      	bhi.n	0x801a498
  801a494:	7e40      	ldrb	r0, [r0, #25]
  801a496:	b110      	cbz	r0, 0x801a49e
- 801a498:	f444 4400 	orr.w	r4, r4, #32768	@ 0x8000
+ 801a498:	f444 4400 	orr.w	r4, r4, #32768 ;; set STE flag (bit 15)	@ 0x8000
  801a49c:	e012      	b.n	0x801a4c4
  801a49e:	480d      	ldr	r0, [pc, #52]	@ (0x801a4d4)                     ; = 0x2000011E (RAM+0x11E)
  801a4a0:	68aa      	ldr	r2, [r5, #8]
  801a4a2:	7840      	ldrb	r0, [r0, #1]
  801a4a4:	f000 007f 	and.w	r0, r0, #127	@ 0x7f
  801a4a8:	f440 4110 	orr.w	r1, r0, #36864	@ 0x9000
- 801a4ac:	2051      	movs	r0, #81	@ 0x51
+ 801a4ac:	2051      	movs	r0, #81 ;; REG 0x51 (squelch threshold)	@ 0x51
  801a4ae:	4790      	blx	r2
  801a4b0:	68aa      	ldr	r2, [r5, #8]
- 801a4b2:	f240 4171 	movw	r1, #1137	@ 0x471
- 801a4b6:	2007      	movs	r0, #7
+ 801a4b2:	f240 4171 	movw	r1, #1137 ;; 0x0471 = AGC config for STE	@ 0x471
+ 801a4b6:	2007      	movs	r0, #7 ;; REG 0x07 (AGC/filter BW)
  801a4b8:	4790      	blx	r2
  801a4ba:	e003      	b.n	0x801a4c4
  801a4bc:	2100      	movs	r1, #0
@@ -39299,7 +41467,7 @@
 ; ║  Called by: bk4829_spi_delay, subsystem_poll, bk4829_rf_control                  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_reg_table_c [BK4829/DATA] - BK4829 register config table C (6.2KB, 4 callers). BK4829 register preset data.
- 801a4f2:	f001 bc15 	b.w	0x801bd20
+ 801a4f2:	f001 bc15 	b.w	0x801bd20 ;; bk4829_reg_write trampoline → 0x801BD20 (HAL dispatch)
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  nop_return                                                        ║
 ; ║  0x0801A4F6  size=2                                             ║
@@ -39353,20 +41521,45 @@
 ; ║  Called by: radio_audio_mixer, spk_unmute, display_mode_update, rf_flag_read      ║
 ; ║  Calls: bk4829_reg_table_a, bk4829_reg_load                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_bk4829_config  [AUDIO] - Audio BK4829 config - calls bk4829_reg_table_a
+; ┌---------------------------------------------------------------------┐
+; │ RENAMED: rf_flag_audio_bk4829 → bk4829_audio_mode_switch          │
+; │ C PSEUDOCODE: bk4829_audio_mode_switch(uint8_t enter_beep)        │
+; │                                                                     │
+; │ Dispatcher for BK4829 audio configuration. Applies settings to     │
+; │ BOTH chips (chip 0 and chip 1) for the requested mode.             │
+; │                                                                     │
+; │   if (enter_beep == 1) {                                            │
+; │       // Entering beep mode: STANDBY + narrow filter               │
+; │       bk4829_beep_standby_config(0);  // CHIP0: R30=0, R37=0x1D00 │
+; │       bk4829_beep_standby_config(1);  // CHIP1: R30=0, R37=0x1D00 │
+; │   } else {                                                          │
+; │       // Leaving beep mode: restore RX filter (NOT R30!)           │
+; │       bk4829_rx_filter_restore(0);    // CHIP0: R37=0x9D1F        │
+; │       bk4829_rx_filter_restore(1);    // CHIP1: R37=0x9D1F        │
+; │   }                                                                 │
+; │                                                                     │
+; │ NOTE: R30 (mode register) is NOT restored here - that's done by   │
+; │ bk4829_reg30_set_mode(1) in the spk_unmute phase 1→0 path.        │
+; │                                                                     │
+; │ CALLED BY: spk_unmute (both phases), radio_audio_mixer,            │
+; │            display_mode_update, rf_flag_read                        │
+; └---------------------------------------------------------------------┘
+; * bk4829_audio_mode_switch [AUDIO/BK4829] - Audio BK4829 mode: beep(1) or RX(0) on both chips
  801a546:	b510      	push	{r4, lr}
- 801a548:	2801      	cmp	r0, #1
- 801a54a:	d007      	beq.n	0x801a55c
- 801a54c:	2000      	movs	r0, #0
- 801a54e:	f7ff fdbf 	bl	0x801a0d0
+ 801a548:	2801      	cmp	r0, #1                                           ; enter_beep?
+ 801a54a:	d007      	beq.n	0x801a55c                                       ; → beep path
+;; ---- RX path: restore normal RX audio filter on both chips ----
+ 801a54c:	2000      	movs	r0, #0                                           ; chip = 0
+ 801a54e:	f7ff fdbf 	bl	0x801a0d0                                        ; bk4829_rx_filter_restore(0) - CHIP0: R37=0x9D1F
  801a552:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 801a556:	2001      	movs	r0, #1
- 801a558:	f7ff bdba 	b.w	0x801a0d0
- 801a55c:	2000      	movs	r0, #0
- 801a55e:	f7ff fd9e 	bl	0x801a09e
+ 801a556:	2001      	movs	r0, #1                                           ; chip = 1
+ 801a558:	f7ff bdba 	b.w	0x801a0d0                                       ; → bk4829_rx_filter_restore(1) - CHIP1: R37=0x9D1F
+;; ---- Beep path: set STANDBY + narrow filter on both chips ----
+ 801a55c:	2000      	movs	r0, #0                                           ; chip = 0
+ 801a55e:	f7ff fd9e 	bl	0x801a09e                                        ; bk4829_beep_standby_config(0) - CHIP0: R30=0, R37=0x1D00
  801a562:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 801a566:	2001      	movs	r0, #1
- 801a568:	f7ff bd99 	b.w	0x801a09e
+ 801a566:	2001      	movs	r0, #1                                           ; chip = 1
+ 801a568:	f7ff bd99 	b.w	0x801a09e                                       ; → bk4829_beep_standby_config(1) - CHIP1: R30=0, R37=0x1D00
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_dma_init                                                        ║
 ; ║  0x0801A56C  size=16                                            ║
@@ -39582,10 +41775,12 @@
 ; ║  0x0801AACE  size=8                                             ║
 ; ║  Called by: main_task_dispatch                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_quick_check [RF] - Quick BK4829 check (8B, 2 callers, 2 subcalls). Fast register poll.
- 801aace:	4601      	mov	r1, r0
- 801aad0:	2000      	movs	r0, #0
- 801aad2:	f7f3 bc5d 	b.w	0x800e390
+; * bk4829_quick_check [RF] - BK4829 status poll trampoline (8B). Called every main loop frame.
+;; Trampoline: moves sp arg to r1, sets r0=0 (VFO-A), tail-calls rf_bk4829_poll.
+;; C: void bk4829_quick_check(void *sp) { rf_bk4829_poll(0, sp); }
+ 801aace:	4601      	mov	r1, r0 ;; r1 = sp (caller's stack frame with scan results)
+ 801aad0:	2000      	movs	r0, #0 ;; r0 = 0 (VFO index: VFO-A)
+ 801aad2:	f7f3 bc5d 	b.w	0x800e390 ;; TAIL: rf_bk4829_poll(0, sp) - poll BK4829 registers
 
 ; --- DATA @ 0x0801AAD6 --------------------------------------------
   0x0801AAD0: 00 20 F3 F7 5D BC 00 00 10 B5 09 48 B0 F8 0D 00  |. ..]......H....|
@@ -39601,43 +41796,43 @@
 ; ║  Calls: bk4829_init_check, bk4829_init_check, bk4829_cal_data_load                     ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_init_check [RF] - BK4829 init/check (96B, 5 subcalls). Likely chip presence or mode check.
- 801ab04:	b510      	push	{r4, lr}
- 801ab06:	6840      	ldr	r0, [r0, #4]
- 801ab08:	4c16      	ldr	r4, [pc, #88]	@ (0x801ab64)                     ; = 0x2000B240 (RAM+0xB240)
- 801ab0a:	2811      	cmp	r0, #17
- 801ab0c:	d00c      	beq.n	0x801ab28
- 801ab0e:	2812      	cmp	r0, #18
- 801ab10:	d023      	beq.n	0x801ab5a
- 801ab12:	2813      	cmp	r0, #19
- 801ab14:	d01b      	beq.n	0x801ab4e
- 801ab16:	2815      	cmp	r0, #21
- 801ab18:	d019      	beq.n	0x801ab4e
- 801ab1a:	28a0      	cmp	r0, #160	@ 0xa0
- 801ab1c:	d21c      	bcs.n	0x801ab58
- 801ab1e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 801ab22:	2000      	movs	r0, #0
- 801ab24:	f7ec bacc 	b.w	0x80070c0
- 801ab28:	7820      	ldrb	r0, [r4, #0]
- 801ab2a:	2803      	cmp	r0, #3
- 801ab2c:	d004      	beq.n	0x801ab38
- 801ab2e:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 801ab32:	2007      	movs	r0, #7
- 801ab34:	f7ec bac4 	b.w	0x80070c0
- 801ab38:	f003 f8b6 	bl	0x801dca8
- 801ab3c:	2001      	movs	r0, #1
- 801ab3e:	f7f3 fd87 	bl	0x800e650
- 801ab42:	2106      	movs	r1, #6
+ 801ab04:	b510      	push	{r4, lr} ;; -- BK4829_INIT_CHECK: mode 17 handler --
+ 801ab06:	6840      	ldr	r0, [r0, #4] ;; r0 = sp[4] (sub-command from main_task_dispatch)
+ 801ab08:	4c16      	ldr	r4, [pc, #88]	@ (0x801ab64)                     ; = 0x2000B240 (RAM+0xB240) ;; r4 = RAM[0x2000B240] (BK4829 init state struct)
+ 801ab0a:	2811      	cmp	r0, #17 ;; -- SUB-CMD DISPATCH --
+ 801ab0c:	d00c      	beq.n	0x801ab28 ;; sub 17 → BK4829 calibration load path
+ 801ab0e:	2812      	cmp	r0, #18 ;; sub 18?
+ 801ab10:	d023      	beq.n	0x801ab5a ;; sub 18 → rf_channel_init(1) only
+ 801ab12:	2813      	cmp	r0, #19 ;; sub 19?
+ 801ab14:	d01b      	beq.n	0x801ab4e ;; sub 19 → hw_init_display_msg + set init flag
+ 801ab16:	2815      	cmp	r0, #21 ;; sub 21?
+ 801ab18:	d019      	beq.n	0x801ab4e ;; sub 21 → same as 19 (display msg + init flag)
+ 801ab1a:	28a0      	cmp	r0, #160	@ 0xa0 ;; sub >= 160 (0xA0)?
+ 801ab1c:	d21c      	bcs.n	0x801ab58 ;; sub >= 160 → return (done, no action)
+ 801ab1e:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- DEFAULT: unknown sub-cmd --
+ 801ab22:	2000      	movs	r0, #0 ;; tick_delay_check(0)
+ 801ab24:	f7ec bacc 	b.w	0x80070c0 ;; tail-call tick_delay_check
+ 801ab28:	7820      	ldrb	r0, [r4, #0] ;; -- SUB 17: check init progress flag --
+ 801ab2a:	2803      	cmp	r0, #3 ;; init_state == 3 (ready for cal load)?
+ 801ab2c:	d004      	beq.n	0x801ab38 ;; if ready → load cal data
+ 801ab2e:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; not ready yet:
+ 801ab32:	2007      	movs	r0, #7 ;; tick_delay_check(7) - retry later
+ 801ab34:	f7ec bac4 	b.w	0x80070c0 ;; tail-call tick_delay_check
+ 801ab38:	f003 f8b6 	bl	0x801dca8 ;; -- bk4829_cal_data_load() - read cal from EEPROM --
+ 801ab3c:	2001      	movs	r0, #1 ;; channel = 1
+ 801ab3e:	f7f3 fd87 	bl	0x800e650 ;; rf_channel_init(1) - init RF channel with cal data
+ 801ab42:	2106      	movs	r1, #6 ;; param = 6
  801ab44:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 801ab48:	2047      	movs	r0, #71	@ 0x47
- 801ab4a:	f008 b8c5 	b.w	0x8022cd8
- 801ab4e:	2000      	movs	r0, #0
- 801ab50:	f7ff f934 	bl	0x8019dbc
+ 801ab48:	2047      	movs	r0, #71	@ 0x47 ;; r0 = 0x47 = 71
+ 801ab4a:	f008 b8c5 	b.w	0x8022cd8 ;; tail-call lcd_write_wrapper(0x47, 6) - update display
+ 801ab4e:	2000      	movs	r0, #0 ;; -- SUB 19|21: show init message on LCD --
+ 801ab50:	f7ff f934 	bl	0x8019dbc ;; hw_init_display_msg(0) - display BK4829 init status
  801ab54:	2001      	movs	r0, #1
  801ab56:	7020      	strb	r0, [r4, #0]
  801ab58:	bd10      	pop	{r4, pc}
- 801ab5a:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 801ab5e:	2001      	movs	r0, #1
- 801ab60:	f7f3 bd76 	b.w	0x800e650
+ 801ab5a:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- SUB 18: rf_channel_init(1) only --
+ 801ab5e:	2001      	movs	r0, #1 ;; channel = 1
+ 801ab60:	f7f3 bd76 	b.w	0x800e650 ;; tail-call rf_channel_init(1)
 
 ; --- DATA @ 0x0801AB64 --------------------------------------------
   0x0801AB60: F3 F7 76 BD 40 B2 00 20 00 B5 8B B0 20 21 03 A8  |..v.@.. .... !..| [+4] 0x2000B240=RAM+0xB240
@@ -39758,25 +41953,27 @@
 ; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  rf_flag_read                                                        ║
+; ║  rf_flag_audio_bk4829                                                     ║
 ; ║  0x0801AC10  size=38                                            ║
-; ║  Called by: rf_flag_read                                              ║
-; ║  Calls: rf_flag_audio_bk4829                                                 ║
+; ║  Called by: rf_state_clear, main_task_dispatch                            ║
+; ║  Calls: audio_bk4829_config                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * rf_flag_audio_bk4829  [RF/AUDIO] - RF flag audio BK4829 - ←rf_flag_read, ->audio_bk4829_config
+; * rf_flag_audio_bk4829  [RF/AUDIO] - Resets mute state and reconfigures BK4829 audio mode
+;; If currently muted (beep mode), switch BK4829 back to RX before resetting state
  801ac10:	b510      	push	{r4, lr}
- 801ac12:	4c09      	ldr	r4, [pc, #36]	@ (0x801ac38)                     ; = 0x2000A3B4 (g_rf_state)
- 801ac14:	f894 0022 	ldrb.w	r0, [r4, #34]	@ 0x22
- 801ac18:	2801      	cmp	r0, #1
- 801ac1a:	d102      	bne.n	0x801ac22
- 801ac1c:	2000      	movs	r0, #0
- 801ac1e:	f7ff fc92 	bl	0x801a546
- 801ac22:	f44f 707a 	mov.w	r0, #1000	@ 0x3e8
- 801ac26:	84a0      	strh	r0, [r4, #36]	@ 0x24
+ 801ac12:	4c09      	ldr	r4, [pc, #36]	@ (0x801ac38)                     ; r4 = 0x2000A3B4 (g_rf_state)
+ 801ac14:	f894 0022 	ldrb.w	r0, [r4, #34]	@ 0x22                         ; r0 = mute toggle (0x22)
+ 801ac18:	2801      	cmp	r0, #1                                           ; currently muted (in beep)?
+ 801ac1a:	d102      	bne.n	0x801ac22                                       ; no → skip BK4829 restore
+ 801ac1c:	2000      	movs	r0, #0                                           ; enter_beep = 0
+ 801ac1e:	f7ff fc92 	bl	0x801a546                                        ; bk4829_audio_mode_switch(0) - restore RX filter
+;; Reset all mute/beep state timers
+ 801ac22:	f44f 707a 	mov.w	r0, #1000	@ 0x3e8                            ; countdown = 1000 ticks
+ 801ac26:	84a0      	strh	r0, [r4, #36]	@ 0x24                            ; g_rf_state[0x24] = 1000 (guard timer)
  801ac28:	2000      	movs	r0, #0
- 801ac2a:	f884 0022 	strb.w	r0, [r4, #34]	@ 0x22
- 801ac2e:	f244 6050 	movw	r0, #18000	@ 0x4650
- 801ac32:	84e0      	strh	r0, [r4, #38]	@ 0x26
+ 801ac2a:	f884 0022 	strb.w	r0, [r4, #34]	@ 0x22                         ; g_rf_state[0x22] = 0 (clear mute toggle)
+ 801ac2e:	f244 6050 	movw	r0, #18000	@ 0x4650                          ; 18000 ticks ≈ long hold timer
+ 801ac32:	84e0      	strh	r0, [r4, #38]	@ 0x26                            ; g_rf_state[0x26] = 18000 (band hold timer)
  801ac34:	bd10      	pop	{r4, pc}
 
 ; --- DATA @ 0x0801AC36 --------------------------------------------
@@ -40153,51 +42350,51 @@
 ; ║  Calls: null_stub, bk4829_filter_table, bk4829_reg_table_c, bk4829_rf_control, peripheral_bus_select (+4 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_rf_control [RF] - BK4829 RF management (large). Refs GPIOE (RF ctrl pins), g_config+g_display+g_rf. Main RF transceive...
- 801b050:	b570      	push	{r4, r5, r6, lr}
- 801b052:	4604      	mov	r4, r0
- 801b054:	f7ed fbbe 	bl	0x80087d4
- 801b058:	2800      	cmp	r0, #0
- 801b05a:	d119      	bne.n	0x801b090
- 801b05c:	6861      	ldr	r1, [r4, #4]
- 801b05e:	29a0      	cmp	r1, #160	@ 0xa0
- 801b060:	d816      	bhi.n	0x801b090
+ 801b050:	b570      	push	{r4, r5, r6, lr} ;; -- BK4829_RF_CONTROL: mode 1 dispatch handler --
+ 801b052:	4604      	mov	r4, r0 ;; r4 = sp (input param struct)
+ 801b054:	f7ed fbbe 	bl	0x80087d4 ;; check subsystem_poll() - returns nonzero if busy
+ 801b058:	2800      	cmp	r0, #0 ;; subsystem busy?
+ 801b05a:	d119      	bne.n	0x801b090 ;; if busy → return
+ 801b05c:	6861      	ldr	r1, [r4, #4] ;; r1 = sp[4] (sub-command code)
+ 801b05e:	29a0      	cmp	r1, #160	@ 0xa0 ;; sub-command > 160?
+ 801b060:	d816      	bhi.n	0x801b090 ;; if > 160 → return (out of range)
  801b062:	4d35      	ldr	r5, [pc, #212]	@ (0x801b138)                    ; = 0x2000A3B4 (g_rf_state)
- 801b064:	f895 0032 	ldrb.w	r0, [r5, #50]	@ 0x32
- 801b068:	2801      	cmp	r0, #1
- 801b06a:	d112      	bne.n	0x801b092
- 801b06c:	7822      	ldrb	r2, [r4, #0]
+ 801b064:	f895 0032 	ldrb.w	r0, [r5, #50]	@ 0x32 ;; r0 = g_rf_state[0x32] (RF calibrating flag?)
+ 801b068:	2801      	cmp	r0, #1 ;; calibrating?
+ 801b06a:	d112      	bne.n	0x801b092 ;; if not calibrating → normal dispatch
+ 801b06c:	7822      	ldrb	r2, [r4, #0] ;; -- CALIBRATION EXIT PATH --
  801b06e:	0612      	lsls	r2, r2, #24
  801b070:	d50f      	bpl.n	0x801b092
- 801b072:	2100      	movs	r1, #0
+ 801b072:	2100      	movs	r1, #0 ;; clear calibration, r1=0
  801b074:	4608      	mov	r0, r1
- 801b076:	f7ff fa3c 	bl	0x801a4f2
+ 801b076:	f7ff fa3c 	bl	0x801a4f2 ;; bk4829_tx_disable(0, 0)
  801b07a:	2000      	movs	r0, #0
- 801b07c:	f7ff f9f4 	bl	0x801a468
- 801b080:	f000 ff64 	bl	0x801bf4c
- 801b084:	200a      	movs	r0, #10
- 801b086:	f004 fed9 	bl	0x801fe3c
+ 801b07c:	f7ff f9f4 	bl	0x801a468 ;; bk4829_rx_disable(0)
+ 801b080:	f000 ff64 	bl	0x801bf4c ;; rf_frontend_off()
+ 801b084:	200a      	movs	r0, #10 ;; set state = 10
+ 801b086:	f004 fed9 	bl	0x801fe3c ;; state_update(10)
  801b08a:	2000      	movs	r0, #0
- 801b08c:	f885 0032 	strb.w	r0, [r5, #50]	@ 0x32
+ 801b08c:	f885 0032 	strb.w	r0, [r5, #50]	@ 0x32 ;; g_rf_state[0x32] = 0 (clear cal flag)
  801b090:	bd70      	pop	{r4, r5, r6, pc}
- 801b092:	792a      	ldrb	r2, [r5, #4]
- 801b094:	2a03      	cmp	r2, #3
- 801b096:	d2fb      	bcs.n	0x801b090
- 801b098:	6822      	ldr	r2, [r4, #0]
+ 801b092:	792a      	ldrb	r2, [r5, #4] ;; -- NORMAL DISPATCH: r2 = g_rf_state[4] (mode) --
+ 801b094:	2a03      	cmp	r2, #3 ;; mode >= 3?
+ 801b096:	d2fb      	bcs.n	0x801b090 ;; if mode>=3 → return
+ 801b098:	6822      	ldr	r2, [r4, #0] ;; r2 = sp[0] (full command word)
  801b09a:	0613      	lsls	r3, r2, #24
  801b09c:	d4f8      	bmi.n	0x801b090
  801b09e:	2801      	cmp	r0, #1
  801b0a0:	d0f6      	beq.n	0x801b090
- 801b0a2:	2913      	cmp	r1, #19
+ 801b0a2:	2913      	cmp	r1, #19 ;; -- SUB-CMD DISPATCH (r1 = sub-command code) --
  801b0a4:	d02d      	beq.n	0x801b102
  801b0a6:	dc1c      	bgt.n	0x801b0e2
  801b0a8:	2910      	cmp	r1, #16
  801b0aa:	d02f      	beq.n	0x801b10c
  801b0ac:	dc10      	bgt.n	0x801b0d0
- 801b0ae:	2905      	cmp	r1, #5
- 801b0b0:	d001      	beq.n	0x801b0b6
- 801b0b2:	2908      	cmp	r1, #8
+ 801b0ae:	2905      	cmp	r1, #5 ;; sub 5: band display
+ 801b0b0:	d001      	beq.n	0x801b0b6 ;; → clamp + display_mode_set
+ 801b0b2:	2908      	cmp	r1, #8 ;; sub 8: also band display
  801b0b4:	d1ec      	bne.n	0x801b090
- 801b0b6:	4821      	ldr	r0, [pc, #132]	@ (0x801b13c)                    ; = 0x2000A8B0 (RAM+0xA8B0)
+ 801b0b6:	4821      	ldr	r0, [pc, #132]	@ (0x801b13c)                    ; = 0x2000A8B0 (RAM+0xA8B0) ;; clamp band value to 0-3
  801b0b8:	7f81      	ldrb	r1, [r0, #30]
  801b0ba:	2903      	cmp	r1, #3
  801b0bc:	d901      	bls.n	0x801b0c2
@@ -40205,12 +42402,12 @@
  801b0c0:	7781      	strb	r1, [r0, #30]
  801b0c2:	7f80      	ldrb	r0, [r0, #30]
  801b0c4:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801b0c8:	3011      	adds	r0, #17
+ 801b0c8:	3011      	adds	r0, #17 ;; r0 += 17 → display cmd 17-20
  801b0ca:	b2c0      	uxtb	r0, r0
- 801b0cc:	f7f2 b956 	b.w	0x800d37c
- 801b0d0:	2911      	cmp	r1, #17
+ 801b0cc:	f7f2 b956 	b.w	0x800d37c ;; tail-call display_mode_set(17+band)
+ 801b0d0:	2911      	cmp	r1, #17 ;; sub 17: → display cmd 10
  801b0d2:	d026      	beq.n	0x801b122
- 801b0d4:	2912      	cmp	r1, #18
+ 801b0d4:	2912      	cmp	r1, #18 ;; sub 18: → display cmd 13
  801b0d6:	d1db      	bne.n	0x801b090
  801b0d8:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  801b0dc:	200d      	movs	r0, #13
@@ -40225,7 +42422,7 @@
  801b0f0:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  801b0f4:	200e      	movs	r0, #14
  801b0f6:	f7f2 b941 	b.w	0x800d37c
- 801b0fa:	291a      	cmp	r1, #26
+ 801b0fa:	291a      	cmp	r1, #26 ;; sub 26: → display cmd 10
  801b0fc:	d011      	beq.n	0x801b122
  801b0fe:	291f      	cmp	r1, #31
  801b100:	d1c6      	bne.n	0x801b090
@@ -40233,7 +42430,7 @@
  801b106:	200b      	movs	r0, #11
  801b108:	f7f2 b938 	b.w	0x800d37c
  801b10c:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801b110:	f002 000f 	and.w	r0, r2, #15
+ 801b110:	f002 000f 	and.w	r0, r2, #15 ;; r0 = sp[0]  0x0F
  801b114:	f7f2 b932 	b.w	0x800d37c
  801b118:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  801b11c:	200f      	movs	r0, #15
@@ -40448,7 +42645,25 @@
 ; ║  0x0801B2B0  size=34                                            ║
 ; ║  Called by: display_full_redraw                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_check_dtmf_active  [BK4829] - Read REG_0x0D bit15 - 18B, ←display_full_redraw
+; * bk4829_check_dtmf_active  [BK4829] - DTMF detection readback (34B)
+;
+;   C pseudocode:
+;     uint32_t bk4829_check_dtmf_active(void) {
+;       uint16_t reg0d = hal_reg_read(0x0D);   // BK4829 REG 0x0D: DTMF status
+;       if (reg0d & 0x8000)                     // bit 15 = DTMF active (active HIGH)
+;         return 0;                              // DTMF NOT detected → return 0
+;       // DTMF detected - read digit code:
+;       uint32_t upper = (reg0d & 0x7FF) << 16; // bits [10:0] = DTMF upper code
+;       uint16_t reg0e = hal_reg_read(0x0E);    // REG 0x0E: DTMF digit code
+;       return upper | reg0e;                    // combined 27-bit DTMF result
+;     }
+;
+;   REG 0x0D bit field decode:
+;     Bit 15      : DTMF detection flag (1=no DTMF, 0=DTMF detected)
+;     Bits [10:0] : DTMF frequency pair upper (11 bits)
+;   REG 0x0E: DTMF digit code lower 16 bits
+;   Combined: (REG_0D[10:0] << 16) | REG_0E = full DTMF decode result
+;   Caller: display_full_redraw (show DTMF digit on screen)
  801b2b0:	b570      	push	{r4, r5, r6, lr}
  801b2b2:	4d08      	ldr	r5, [pc, #32]	@ (0x801b2d4)                     ; = 0x20000C28 (RAM+0xC28)
  801b2b4:	200d      	movs	r0, #13
@@ -40486,7 +42701,20 @@
 ; ║  Called by: display_full_redraw                                              ║
 ; ║  Calls: bk4829_reg_dump, peripheral_bus_select                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_tune_and_gpio  [BK4829] - Write REGs 0x37+0x51, SPI read - ←display_full_redraw
+; * bk4829_ctcss_enable_and_tune  [BK4829] - Enable CTCSS + tune frequency (48B)
+;
+;   C pseudocode:
+;     void bk4829_ctcss_enable_and_tune(uint32_t freq_word) {
+;       hal_reg_write(0x37, 0x9F1F);       // enable sub-audio processing (bit 15 + filter)
+;       chip_select(0);                      // select primary chip
+;       rf_freq_program(freq_word);          // program PLL frequency
+;       hal_reg_write(0x51, 0x0300);         // REG 0x51: CTCSS detector threshold
+;       chip_select(1);                      // restore chip select
+;     }
+;
+;   REG 0x37 = 0x9F1F: Sub-audio enable (bit 15) + wideband filter + CTCSS detect
+;   REG 0x51 = 0x0300: CTCSS detector threshold/gain configuration
+;   RENAME: was bk4829_tune_and_gpio - actually CTCSS enable + frequency program
  801b374:	b570      	push	{r4, r5, r6, lr}
  801b376:	4605      	mov	r5, r0
  801b378:	4c0a      	ldr	r4, [pc, #40]	@ (0x801b3a4)                     ; = 0x20000C28 (RAM+0xC28)
@@ -40764,7 +42992,24 @@
 ; ║  0x0801B6AC  size=46                                            ║
 ; ║  Called by: bk4829_data_block                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * bk4829_read_mode_state  [BK4829] - Read REG_0x0C + HAL data - 30B
+; * bk4829_ctcss_detect_status  [BK4829] - CTCSS/DCS detection readback (46B)
+;
+;   C pseudocode:
+;     uint32_t bk4829_ctcss_detect_status(void) {
+;       uint16_t reg0c = hal_reg_read(0x0C);
+;       uint8_t mode = g_hal_config[8];    // [+20] RF mode
+;       uint8_t flag = g_hal_config[24];   // [+36] sub-audio enable flag
+;       if (mode > 1 || flag != 0)
+;         return reg0c & 0x0400;            // bit 10: CTCSS tone detected
+;       // Mode 0/1 with sub-audio enabled:
+;       uint8_t bits = (reg0c >> 10) & 0x3; // bits [11:10]
+;       return (bits == 3) ? 1 : 0;         // both bits = confirmed CTCSS match
+;     }
+;
+;   REG 0x0C bit field decode:
+;     Bit 10 (0x0400): CTCSS frequency detected (single threshold)
+;     Bits [11:10] = 0x3: CTCSS CONFIRMED match (both detect + valid)
+;   RENAME: was bk4829_read_mode_state - actually CTCSS detection status reader
  801b6ac:	b510      	push	{r4, lr}
  801b6ae:	480b      	ldr	r0, [pc, #44]	@ (0x801b6dc)                     ; = 0x20000C28 (RAM+0xC28)
  801b6b0:	6841      	ldr	r1, [r0, #4]
@@ -41026,24 +43271,85 @@
 ; ║  Called by: bk4829_spi_delay, subsystem_poll, bk4829_power_table, bk4829_rf_control, peripheral_bus_select (+4 more)  ║
 ; ║  Calls: delay_short                                                  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * peripheral_bus_select [SPI_BITBANG] - Peripheral bus select (122B, 11 callers). Selects SPI target device.
+; ┌---------------------------------------------------------------------┐
+; │ RENAMED: peripheral_bus_select → bk4829_reg30_set_mode             │
+; │ C PSEUDOCODE: bk4829_reg30_set_mode(uint8_t mode)                 │
+; │                                                                     │
+; │ Sets BK4829 register 0x30 to control RF front-end mode.            │
+; │ Uses function pointer from g_bk4829_hal[+8] (reg_write) which      │
+; │ targets either CHIP0 or CHIP1 depending on tmr_init_rf_dispatch.    │
+; │                                                                     │
+; │ RAM layout:                                                         │
+; │   0x20000C28 = g_bk4829_hal base                                   │
+; │   0x20000C34 = g_bk4829_hal + 0x0C = flag area (byte at +21)      │
+; │   [r5+8] = [0x20000C30] = bk4829_reg_write fn ptr                 │
+; │                                                                     │
+; │   state_byte = *(uint8_t*)(0x20000C34 + 21) // @ 0x20000C49       │
+; │   reg_write  = *(fn_ptr*)(0x20000C28 + 8)   // @ 0x20000C30       │
+; │                                                                     │
+; │   if (state_byte == 0 && (mode == 1 || mode == 2)) {              │
+; │       reg_write(0x30, 0x0200);  // transitional: VCO cal           │
+; │   }                                                                 │
+; │                                                                     │
+; │   // All modes except 0 write R30=0 first, then delay(50)         │
+; │   if (mode != 0 || state_byte != 0) {                              │
+; │       reg_write(0x30, 0x0000);  // STANDBY                         │
+; │       delay_short(50);                                              │
+; │   }                                                                 │
+; │                                                                     │
+; │   switch (mode) {                                                   │
+; │       case 0: return;           // STANDBY (R30 already 0x0000)    │
+; │       case 1: reg_write(0x30, 0xBFF1); return; // RX MODE         │
+; │       case 2: reg_write(0x30, 0xC1FE); return; // TX MODE         │
+; │       case 3: reg_write(0x30, 0x0302); return; // ??? (cal?)      │
+; │       case 4: reg_write(0x30, 0xC3FA); return; // ??? (APRS TX?)  │
+; │   }                                                                 │
+; │                                                                     │
+; │ BK4829 REG 0x30 bit meanings (BK4819-compatible):                  │
+; │   [0]  = VCO calibration    [8]  = Compander enable                │
+; │   [1]  = VCO/PLL enable     [9]  = AF DAC (speaker driver)        │
+; │   [2]  = unknown            [10] = AF ADC (mic input)              │
+; │   [3]  = PA enable (TX)     [11:15] = PA gain / reserved          │
+; │   [4]  = RX DSP             0xBFF1 = RX: everything ON except PA   │
+; │   [5]  = Mixer              0xC1FE = TX: PA+VCO+PLL+mixer+comp    │
+; │   [6]  = LNA                0x0000 = STANDBY: all OFF              │
+; │   [7]  = PGA                                                        │
+; └---------------------------------------------------------------------┘
+; -- peripheral_bus_select (BK4829 REG 0x30 mode control) ----------------
+; Sets BK4829 operating mode via Register 30 (enables block, 122B).
+; REG 0x30 bit fields control which RF blocks are powered on:
+;   [0]=MFB, [1]=PLL, [2]=PA, [3]=RX_DSP, [4]=TX_DSP, [5]=VCO,
+;   [6]=Mixer, [7]=LNA, [8]=PGA, [9]=comp, [10:15]=various
+;
+; r4 = mode parameter:
+;   mode 0: STANDBY - REG30=0x0000 (all blocks OFF), then skip to delay
+;   mode 1: RX      - first write 0x0200 (PLL warmup), delay, then
+;                      REG30=0xBFF1 (RX: all ON except PA)
+;   mode 2: TX      - first write 0x0200 (PLL warmup), delay, then
+;                      REG30=0xC1FE (TX: PA+VCO+PLL+mixer+comp)
+;   mode 3: TUNE    - first REG30=0, delay, REG30=0x0302 (PLL+VCO only)
+;   mode 4: CAL     - first REG30=0, delay, REG30=0xC3FA (full cal mode)
+;
+; Special: if chip_flag[21]==0 AND mode∈{1,2}, skip the REG30=0 reset
+; (fast RX↔TX switching without full power-down).
+; ------------------------------------------------------------------------
  801b9cc:	b570      	push	{r4, r5, r6, lr}
  801b9ce:	4604      	mov	r4, r0
- 801b9d0:	481d      	ldr	r0, [pc, #116]	@ (0x801ba48)                    ; = 0x20000C34 (RAM+0xC34)
+ 801b9d0:	481d      	ldr	r0, [pc, #116]	@ (0x801ba48 ;; r0 = chip state @ 0x20000C34)                    ; = 0x20000C34 (RAM+0xC34)
  801b9d2:	4d1d      	ldr	r5, [pc, #116]	@ (0x801ba48)                    ; = 0x20000C34 (RAM+0xC34)
- 801b9d4:	3d0c      	subs	r5, #12
- 801b9d6:	7d40      	ldrb	r0, [r0, #21]
- 801b9d8:	68aa      	ldr	r2, [r5, #8]
- 801b9da:	2800      	cmp	r0, #0
+ 801b9d4:	3d0c      	subs	r5, #12 ;; r5 = g_hal_dispatch (0xC34-0xC = 0xC28)
+ 801b9d6:	7d40      	ldrb	r0, [r0, #21] ;; chip_flag[21] - fast switch flag
+ 801b9d8:	68aa      	ldr	r2, [r5, #8] ;; r2 = reg_write function ptr
+ 801b9da:	2800      	cmp	r0, #0 ;; flag==0: skip STANDBY for mode 1/2
  801b9dc:	d103      	bne.n	0x801b9e6
  801b9de:	2c01      	cmp	r4, #1
  801b9e0:	d016      	beq.n	0x801ba10
  801b9e2:	2c02      	cmp	r4, #2
  801b9e4:	d014      	beq.n	0x801ba10
- 801b9e6:	2100      	movs	r1, #0
+ 801b9e6:	2100      	movs	r1, #0 ;; -- REG 0x30 = 0 (STANDBY first)
  801b9e8:	2030      	movs	r0, #48	@ 0x30
  801b9ea:	4790      	blx	r2
- 801b9ec:	2032      	movs	r0, #50	@ 0x32
+ 801b9ec:	2032      	movs	r0, #50 ;; delay ~50 cycles (PLL settle)	@ 0x32
  801b9ee:	f7ee ffb8 	bl	0x800a962                                        ; delay_short
  801b9f2:	2c01      	cmp	r4, #1
  801b9f4:	d011      	beq.n	0x801ba1a
@@ -41055,26 +43361,26 @@
  801ba00:	d120      	bne.n	0x801ba44
  801ba02:	68aa      	ldr	r2, [r5, #8]
  801ba04:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801ba08:	f24c 31fa 	movw	r1, #50170	@ 0xc3fa
+ 801ba08:	f24c 31fa 	movw	r1, #50170 ;; -- mode 4: REG 0x30 = 0xC3FA (CAL)	@ 0xc3fa
  801ba0c:	2030      	movs	r0, #48	@ 0x30
  801ba0e:	4710      	bx	r2
- 801ba10:	f44f 7100 	mov.w	r1, #512	@ 0x200
+ 801ba10:	f44f 7100 	mov.w	r1, #512 ;; -- mode 1/2 fast: REG 0x30 = 0x0200 (PLL warmup)	@ 0x200
  801ba14:	2030      	movs	r0, #48	@ 0x30
  801ba16:	4790      	blx	r2
  801ba18:	e7e8      	b.n	0x801b9ec
  801ba1a:	68aa      	ldr	r2, [r5, #8]
  801ba1c:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801ba20:	f64b 71f1 	movw	r1, #49137	@ 0xbff1
+ 801ba20:	f64b 71f1 	movw	r1, #49137 ;; -- mode 1: REG 0x30 = 0xBFF1 (RX)	@ 0xbff1
  801ba24:	2030      	movs	r0, #48	@ 0x30
  801ba26:	4710      	bx	r2
  801ba28:	68aa      	ldr	r2, [r5, #8]
  801ba2a:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801ba2e:	f24c 11fe 	movw	r1, #49662	@ 0xc1fe
+ 801ba2e:	f24c 11fe 	movw	r1, #49662 ;; -- mode 2: REG 0x30 = 0xC1FE (TX)	@ 0xc1fe
  801ba32:	2030      	movs	r0, #48	@ 0x30
  801ba34:	4710      	bx	r2
  801ba36:	68aa      	ldr	r2, [r5, #8]
  801ba38:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801ba3c:	f240 3102 	movw	r1, #770	@ 0x302
+ 801ba3c:	f240 3102 	movw	r1, #770 ;; -- mode 3: REG 0x30 = 0x0302 (TUNE)	@ 0x302
  801ba40:	2030      	movs	r0, #48	@ 0x30
  801ba42:	4710      	bx	r2
  801ba44:	bd70      	pop	{r4, r5, r6, pc}
@@ -41281,42 +43587,73 @@
 ; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  spi_bitbang_timing                                                        ║
+; ║  bk4829_af_path_config                                                       ║
 ; ║  0x0801BC2C  size=94                                            ║
-; ║  Called by: bk4829_spi_delay, subsystem_poll, bk4829_rf_control, bk4829_reg_write_multi    ║
+; ║  Called by: bk4829_hal_init (tail), bk4829_filter_setup, subsystem_poll, bk4829_rf_control  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * spi_bitbang_timing [SPI_BITBANG] - SPI bitbang timing (94B, 8 callers). Clock timing for software SPI bus.
+; * bk4829_af_path_config [BK4829/AUDIO] - Configure AF speaker path (94B, 8 callers)
+;   r0 = mode: 0=FM_RX_chip0, 1=FM_RX_chip1, 3=BEEP/AM, 0xF1=filter_config
+;   Writes REG_47 = 0x6042 | LUT[mode & 0xF]  (AF source/routing)
+;   Writes REG_48:
+;     mode 3 or 0xF1 → 0xB0A3 (fixed beep gain)
+;     otherwise       → 0xB00F | (cal_value << 4) from flash calibration
+;
+;   LUT @ 0x0802B80C:
+;     [0] 0xDB27 → REG_47=0xFB67  FM RX chip0 (default after init)
+;     [1] 0xBB94 → REG_47=0xFBD6  FM RX chip1 / APRS
+;     [2] 0x6616 → REG_47=0x6656  TX mode
+;     [3] 0xEB4F → REG_47=0xEB4F  AM RX / BEEP (routes analog input to speaker)
+; -- bk4829_af_path_config -----------------------------------------------
+; BK4829 audio path + gain configuration (96B). Tail-called by hal_init.
+; Sets REG 0x47 (AF source/routing) and REG 0x48 (AF gain/filter).
+;
+; r0 = mode (lower 4 bits select LUT entry):
+;   mode 0: FM RX chip0   → REG_47 = 0x6042 | LUT[0] = 0xFB67
+;   mode 1: FM RX chip1   → REG_47 = 0x6042 | LUT[1] = 0xFBD6
+;   mode 2: TX mode        → REG_47 = 0x6042 | LUT[2] = 0x6656
+;   mode 3: AM/BEEP        → REG_47 = 0x6042 | LUT[3] = 0xEB4F
+;   mode 0xF1: same as 3 (AM path alias)
+;
+; REG 0x48 (AF gain):
+;   mode 3/0xF1: REG_48 = 0xB0A3 (fixed gain for AM/beep)
+;   if chip_flag[21] != 0:
+;     REG_48 = 0xB00F | (cal_data[4] & 0x3F) << 4
+;   else:
+;     REG_48 = 0xB00F | (cal_data[3] & 0x3F) << 4
+;
+; LUT @ flash 0x0802B80C (4 entries × 2 bytes)
+; ------------------------------------------------------------------------
  801bc2c:	b570      	push	{r4, r5, r6, lr}
  801bc2e:	4604      	mov	r4, r0
- 801bc30:	f246 0042 	movw	r0, #24642	@ 0x6042
- 801bc34:	4a15      	ldr	r2, [pc, #84]	@ (0x801bc8c)                     ; = 0x0802B80C (flash+0x2B80C)
- 801bc36:	f004 010f 	and.w	r1, r4, #15
+ 801bc30:	f246 0042 	movw	r0, #24642 ;; base = 0x6042 (AF routing bits)	@ 0x6042
+ 801bc34:	4a15      	ldr	r2, [pc, #84]	@ (0x801bc8c ;; r2 = LUT @ flash 0x0802B80C)                     ; = 0x0802B80C (flash+0x2B80C)
+ 801bc36:	f004 010f 	and.w	r1, r4, #15 ;; mode 801bc36:	f004 010f 	and.w	r1, r4, #15 0x0F → LUT index
  801bc3a:	f832 1011 	ldrh.w	r1, [r2, r1, lsl #1]
- 801bc3e:	4301      	orrs	r1, r0
+ 801bc3e:	4301      	orrs	r1, r0 ;; REG_47 value = base | LUT[mode]
  801bc40:	4d13      	ldr	r5, [pc, #76]	@ (0x801bc90)                     ; = 0x20000C28 (RAM+0xC28)
- 801bc42:	2047      	movs	r0, #71	@ 0x47
+ 801bc42:	2047      	movs	r0, #71 ;; reg_write(0x47, value) - AF source	@ 0x47
  801bc44:	68aa      	ldr	r2, [r5, #8]
  801bc46:	4790      	blx	r2
- 801bc48:	2c03      	cmp	r4, #3
+ 801bc48:	2c03      	cmp	r4, #3 ;; mode 3 → AM/BEEP fixed gain
  801bc4a:	d013      	beq.n	0x801bc74
- 801bc4c:	2cf1      	cmp	r4, #241	@ 0xf1
+ 801bc4c:	2cf1      	cmp	r4, #241 ;; mode 0xF1 → same as mode 3	@ 0xf1
  801bc4e:	d011      	beq.n	0x801bc74
  801bc50:	f105 000c 	add.w	r0, r5, #12
- 801bc54:	7d41      	ldrb	r1, [r0, #21]
+ 801bc54:	7d41      	ldrb	r1, [r0, #21] ;; chip_flag[21] - cal source select
  801bc56:	480f      	ldr	r0, [pc, #60]	@ (0x801bc94)                     ; = 0x2000011E (RAM+0x11E)
  801bc58:	b199      	cbz	r1, 0x801bc82
  801bc5a:	7900      	ldrb	r0, [r0, #4]
  801bc5c:	f000 003f 	and.w	r0, r0, #63	@ 0x3f
  801bc60:	68aa      	ldr	r2, [r5, #8]
- 801bc62:	f24b 010f 	movw	r1, #45071	@ 0xb00f
+ 801bc62:	f24b 010f 	movw	r1, #45071 ;; base = 0xB00F (AF gain)	@ 0xb00f
  801bc66:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801bc6a:	ea41 1000 	orr.w	r0, r1, r0, lsl #4
+ 801bc6a:	ea41 1000 	orr.w	r0, r1, r0, lsl #4 ;; REG_48 = 0xB00F | (cal<<4)
  801bc6e:	b281      	uxth	r1, r0
- 801bc70:	2048      	movs	r0, #72	@ 0x48
+ 801bc70:	2048      	movs	r0, #72 ;; reg_write(0x48, value) - AF gain	@ 0x48
  801bc72:	4710      	bx	r2
  801bc74:	68aa      	ldr	r2, [r5, #8]
  801bc76:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801bc7a:	f24b 01a3 	movw	r1, #45219	@ 0xb0a3
+ 801bc7a:	f24b 01a3 	movw	r1, #45219 ;; -- AM/BEEP: REG_48 = 0xB0A3 (fixed)	@ 0xb0a3
  801bc7e:	2048      	movs	r0, #72	@ 0x48
  801bc80:	4710      	bx	r2
  801bc82:	78c0      	ldrb	r0, [r0, #3]
@@ -41334,35 +43671,56 @@
 ; ║  Called by: lcd_cmd_tmr_config                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * config_rf_param_lookup  [CONFIG] - Read g_config RF params - no dispatch, ←tmr_lcd_config_read
+; -- config_rf_param_lookup ----------------------------------------------
+; RF parameter config writer (120B). Reads tuning/channel parameters from
+; g_config and flash calibration table, writes to HAL dispatch struct.
+;
+; Args (many, via stack): r0=freq, r1=mode, r2=param_code, r3=?,
+;   sp[28..40]: additional channel params (7 args total on stack)
+;
+; HAL target struct @ 0x20000C34:
+;   Two slots (selected by r6: 0=primary [0..8], 1=secondary [12..26])
+;   Primary:   [0]=freq, [4]=tuning_word, [8]=mode
+;   Secondary: [12]=freq, [16]=tuning_word, [20]=mode, [21..26]=channel params
+;
+; param_code (r2) decode:
+;   0 → tuning_word = 0 (clear)
+;   1..250 → look up from flash table @ 0x0802B72A [(code-1)*2]
+;   mode==3 special: offset param by -106 before lookup
+;   0xA0000000 mask test: if bits match → use raw value
+;
+; Band match guard: if g_config[0] != 0 AND display_config[0xFA] == g_config[0x1C]
+;   (active band matches display band) → force mode = 0
+; ------------------------------------------------------------------------
  801bc98:	e92d 43f0 	stmdb	sp!, {r4, r5, r6, r7, r8, r9, lr}
  801bc9c:	e9dd 7c07 	ldrd	r7, ip, [sp, #28]
  801bca0:	e9dd 860a 	ldrd	r8, r6, [sp, #40]	@ 0x28
  801bca4:	9d09      	ldr	r5, [sp, #36]	@ 0x24
  801bca6:	2e00      	cmp	r6, #0
  801bca8:	d10d      	bne.n	0x801bcc6
- 801bcaa:	4c19      	ldr	r4, [pc, #100]	@ (0x801bd10)                    ; = 0x2000ADD0 (g_config)
- 801bcac:	f894 9000 	ldrb.w	r9, [r4]
+ 801bcaa:	4c19      	ldr	r4, [pc, #100]	@ (0x801bd10 ;; g_config @ 0x2000ADD0)                    ; = 0x2000ADD0 (g_config)
+ 801bcac:	f894 9000 	ldrb.w	r9, [r4] ;; g_config[0] = active flag
  801bcb0:	f1b9 0f00 	cmp.w	r9, #0
  801bcb4:	d007      	beq.n	0x801bcc6
  801bcb6:	f8df 905c 	ldr.w	r9, [pc, #92]	@ 0x801bd14                     ; = 0x2000A41C (RAM+0xA41C)
- 801bcba:	7f24      	ldrb	r4, [r4, #28]
- 801bcbc:	f899 90fa 	ldrb.w	r9, [r9, #250]	@ 0xfa
- 801bcc0:	45a1      	cmp	r9, r4
+ 801bcba:	7f24      	ldrb	r4, [r4, #28] ;; g_config[0x1C] = current band
+ 801bcbc:	f899 90fa 	ldrb.w	r9, [r9, #250] ;; display[0xFA] = display band	@ 0xfa
+ 801bcc0:	45a1      	cmp	r9, r4 ;; band match → force mode=0
  801bcc2:	d100      	bne.n	0x801bcc6
  801bcc4:	2100      	movs	r1, #0
- 801bcc6:	2afa      	cmp	r2, #250	@ 0xfa
+ 801bcc6:	2afa      	cmp	r2, #250 ;; param code range check (0..250)	@ 0xfa
  801bcc8:	d80b      	bhi.n	0x801bce2
  801bcca:	0014      	movs	r4, r2
  801bccc:	d009      	beq.n	0x801bce2
  801bcce:	f04f 4420 	mov.w	r4, #2684354560	@ 0xa0000000
  801bcd2:	4394      	bics	r4, r2
  801bcd4:	d005      	beq.n	0x801bce2
- 801bcd6:	4c10      	ldr	r4, [pc, #64]	@ (0x801bd18)                     ; = 0x0802B72A (flash+0x2B72A)
+ 801bcd6:	4c10      	ldr	r4, [pc, #64]	@ (0x801bd18 ;; flash cal table @ 0x0802B72A)                     ; = 0x0802B72A (flash+0x2B72A)
  801bcd8:	2903      	cmp	r1, #3
  801bcda:	d010      	beq.n	0x801bcfe
  801bcdc:	1e52      	subs	r2, r2, #1
- 801bcde:	f834 2012 	ldrh.w	r2, [r4, r2, lsl #1]
- 801bce2:	4c0e      	ldr	r4, [pc, #56]	@ (0x801bd1c)                     ; = 0x20000C34 (RAM+0xC34)
+ 801bcde:	f834 2012 	ldrh.w	r2, [r4, r2 ;; tuning_word = table[(code-1)*2], lsl #1]
+ 801bce2:	4c0e      	ldr	r4, [pc, #56]	@ (0x801bd1c ;; HAL struct @ 0x20000C34)                     ; = 0x20000C34 (RAM+0xC34)
  801bce4:	b17e      	cbz	r6, 0x801bd06
  801bce6:	60e0      	str	r0, [r4, #12]
  801bce8:	7521      	strb	r1, [r4, #20]
@@ -41373,7 +43731,7 @@
  801bcf2:	f884 c017 	strb.w	ip, [r4, #23]
  801bcf6:	f884 801a 	strb.w	r8, [r4, #26]
  801bcfa:	e8bd 83f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, pc}
- 801bcfe:	3a6a      	subs	r2, #106	@ 0x6a
+ 801bcfe:	3a6a      	subs	r2, #106 ;; mode 3: offset param by -106	@ 0x6a
  801bd00:	f834 2012 	ldrh.w	r2, [r4, r2, lsl #1]
  801bd04:	e7ed      	b.n	0x801bce2
  801bd06:	6020      	str	r0, [r4, #0]
@@ -41394,19 +43752,27 @@
 ; ║  Called by: display_status_icons                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_set_frequency  [BK4829] - Write REGs 0x38+0x39 (freq word) - ←display_status_icons
+; -- display_status_icons ------------------------------------------------
+; BK4829 dual-register GPIO write (32B). Writes a 32-bit value as two
+; 16-bit halves to BK4829 REG 0x38 (low) and REG 0x39 (high) via
+; the HAL dispatch vtable, then calls peripheral_bus_select(1) → RX mode.
+; Used to set GPIO output pins on the BK4829 (LEDs, indicators).
+;
+; r0 = 32-bit GPIO value: [15:0]→REG38, [31:16]→REG39
+; ------------------------------------------------------------------------
  801bd40:	b570      	push	{r4, r5, r6, lr}
  801bd42:	4604      	mov	r4, r0
- 801bd44:	4d06      	ldr	r5, [pc, #24]	@ (0x801bd60)                     ; = 0x20000C28 (RAM+0xC28)
+ 801bd44:	4d06      	ldr	r5, [pc, #24]	@ (0x801bd60 ;; HAL vtable @ 0x20000C28)                     ; = 0x20000C28 (RAM+0xC28)
  801bd46:	b2a1      	uxth	r1, r4
- 801bd48:	2038      	movs	r0, #56	@ 0x38
- 801bd4a:	68aa      	ldr	r2, [r5, #8]
+ 801bd48:	2038      	movs	r0, #56 ;; REG 0x38 (GPIO low)	@ 0x38
+ 801bd4a:	68aa      	ldr	r2, [r5, #8] ;; r2 = reg_write fn ptr
  801bd4c:	4790      	blx	r2
  801bd4e:	0c21      	lsrs	r1, r4, #16
  801bd50:	68aa      	ldr	r2, [r5, #8]
- 801bd52:	2039      	movs	r0, #57	@ 0x39
+ 801bd52:	2039      	movs	r0, #57 ;; REG 0x39 (GPIO high)	@ 0x39
  801bd54:	4790      	blx	r2
  801bd56:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 801bd5a:	2001      	movs	r0, #1
+ 801bd5a:	2001      	movs	r0, #1 ;; peripheral_bus_select(1) → RX mode
  801bd5c:	f7ff be36 	b.w	0x801b9cc
 
 ; --- DATA @ 0x0801BD60 --------------------------------------------
@@ -41422,15 +43788,43 @@
 ; ║  Called by: bk4829_power_table, bk4829_reg_dump                                ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_spi_raw_xfer  [BK4829] - Raw BK4829 SPI transfer - called by bk4829_spi_read/dump
+; -- bk4829_spi_raw_xfer ------------------------------------------------
+; BK4829 SPI IF filter bandwidth control (174B). Reads current filter
+; config from REG 0x31, checks chip mode and frequency validity, then
+; writes appropriate bandwidth filter setting to REG 0x40 + REG 0x71.
+;
+; r0 = current REG 0x31 value (passed in from caller)
+; r4 = bandwidth index (0=auto, 1-9=fixed bandwidth level)
+;
+; HAL vtable @ 0x20000C28:
+;   [4] = reg_read(reg_num) → returns register value
+;   [8] = reg_write(reg_num, value)
+;
+; Chip mode check (RAM+0xD4):
+;   [0] == 6 AND vtable[0] == 0 → dual-chip mode, chip 0 selected
+;   [1] == 6 AND vtable[0] == 1 → dual-chip mode, chip 1 selected
+;   Otherwise: single-chip mode, check frequency range
+;
+; Frequency range check (single-chip):
+;   vtable[12] + 0xFF5B3480 compared to 0x002AB980
+;   (validates frequency is within BK4829 supported range)
+;
+; Bandwidth paths:
+;   r4 == 0 (auto): REG31 &= ~0x02 (clear manual BW bit),
+;     read REG40, mask [15:12], OR 0x050A → write back
+;   r4 > 0 (manual): clamp to 9, REG31 |= 0x02 (set manual BW),
+;     write REG71 = bandwidth_table[r4-1] from flash 0x0802B7FC,
+;     read REG40, mask [15:12], OR 0x050A → write back
+; ------------------------------------------------------------------------
  801bd98:	b570      	push	{r4, r5, r6, lr}
  801bd9a:	4604      	mov	r4, r0
- 801bd9c:	4d2a      	ldr	r5, [pc, #168]	@ (0x801be48)                    ; = 0x20000C28 (RAM+0xC28)
- 801bd9e:	2031      	movs	r0, #49	@ 0x31
- 801bda0:	6869      	ldr	r1, [r5, #4]
+ 801bd9c:	4d2a      	ldr	r5, [pc, #168]	@ (0x801be48 ;; HAL vtable @ 0x20000C28)                    ; = 0x20000C28 (RAM+0xC28)
+ 801bd9e:	2031      	movs	r0, #49 ;; REG 0x31 (filter config)	@ 0x31
+ 801bda0:	6869      	ldr	r1, [r5, #4] ;; r1 = reg_read
  801bda2:	4788      	blx	r1
  801bda4:	4929      	ldr	r1, [pc, #164]	@ (0x801be4c)                    ; = 0x200000D4 (RAM+0xD4)
- 801bda6:	f240 560a 	movw	r6, #1290	@ 0x50a
- 801bdaa:	780a      	ldrb	r2, [r1, #0]
+ 801bda6:	f240 560a 	movw	r6, #1290 ;; 0x050A = filter passband constant	@ 0x50a
+ 801bdaa:	780a      	ldrb	r2, [r1, #0] ;; chip_mode[0]
  801bdac:	2a06      	cmp	r2, #6
  801bdae:	d101      	bne.n	0x801bdb4
  801bdb0:	782a      	ldrb	r2, [r5, #0]
@@ -41449,14 +43843,14 @@
  801bdca:	4a22      	ldr	r2, [pc, #136]	@ (0x801be54)                    ; = 0x002AB980
  801bdcc:	4291      	cmp	r1, r2
  801bdce:	d20f      	bcs.n	0x801bdf0
- 801bdd0:	f020 0102 	bic.w	r1, r0, #2
+ 801bdd0:	f020 0102 	bic.w	r1, r0, #2 ;; REG31 801bdd0:	f020 0102 	bic.w	r1, r0, #2= ~0x02 (auto BW)
  801bdd4:	68aa      	ldr	r2, [r5, #8]
  801bdd6:	2031      	movs	r0, #49	@ 0x31
  801bdd8:	4790      	blx	r2
  801bdda:	6869      	ldr	r1, [r5, #4]
- 801bddc:	2040      	movs	r0, #64	@ 0x40
+ 801bddc:	2040      	movs	r0, #64 ;; REG 0x40 (filter output)	@ 0x40
  801bdde:	4788      	blx	r1
- 801bde0:	f400 4170 	and.w	r1, r0, #61440	@ 0xf000
+ 801bde0:	f400 4170 	and.w	r1, r0, #61440 ;; mask [15:12] of REG40	@ 0xf000
  801bde4:	4331      	orrs	r1, r6
  801bde6:	68aa      	ldr	r2, [r5, #8]
  801bde8:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
@@ -41465,16 +43859,16 @@
  801bdf0:	b1cc      	cbz	r4, 0x801be26
  801bdf2:	2c09      	cmp	r4, #9
  801bdf4:	d900      	bls.n	0x801bdf8
- 801bdf6:	2409      	movs	r4, #9
- 801bdf8:	f040 0102 	orr.w	r1, r0, #2
+ 801bdf6:	2409      	movs	r4, #9 ;; clamp bandwidth index to 9
+ 801bdf8:	f040 0102 	orr.w	r1, r0, #2 ;; REG31 |= 0x02 (manual BW)
  801bdfc:	68aa      	ldr	r2, [r5, #8]
  801bdfe:	2031      	movs	r0, #49	@ 0x31
  801be00:	4790      	blx	r2
- 801be02:	4815      	ldr	r0, [pc, #84]	@ (0x801be58)                     ; = 0x0802B7FC (flash+0x2B7FC)
+ 801be02:	4815      	ldr	r0, [pc, #84]	@ (0x801be58 ;; bandwidth LUT @ flash 0x0802B7FC)                     ; = 0x0802B7FC (flash+0x2B7FC)
  801be04:	1e64      	subs	r4, r4, #1
  801be06:	68aa      	ldr	r2, [r5, #8]
  801be08:	f830 1014 	ldrh.w	r1, [r0, r4, lsl #1]
- 801be0c:	2071      	movs	r0, #113	@ 0x71
+ 801be0c:	2071      	movs	r0, #113 ;; REG 0x71 (bandwidth value)	@ 0x71
  801be0e:	4790      	blx	r2
  801be10:	6869      	ldr	r1, [r5, #4]
  801be12:	2040      	movs	r0, #64	@ 0x40
@@ -41535,7 +43929,28 @@
 ; ║  0x0801BEC4  size=46                                            ║
 ; ║  Called by: channel_field_draw, lcd_redraw_channel, display_full_redraw                  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * lcd_redraw_channel  [LCD] - LCD redraw channel - ←lcd_cmd_channel_field
+; * bk4829_ctcss_dcs_detect  [BK4829] - CTCSS/DCS/DTMF detection readback (46B)
+;
+;   C pseudocode:
+;     uint32_t bk4829_ctcss_dcs_detect(void) {
+;       uint16_t reg0c = hal_reg_read(0x0C);
+;       uint8_t mode = g_hal_config[8];    // RF mode (0=chip0, 1=chip1, 2=APRS, 3=DCS)
+;       uint8_t flag = g_hal_config[24];   // sub-audio enable
+;       if (mode > 1 || flag != 0) {
+;         if (mode == 3)
+;           return reg0c & 0x8000;          // bit 15: DCS code matched
+;         return reg0c & 0x4000;            // bit 14: CTCSS/DCS intermediate detect
+;       }
+;       return reg0c & 0x0400;              // bit 10: CTCSS tone detected
+;     }
+;
+;   REG 0x0C bit field decode (complete):
+;     Bit 1   (0x0002): RX active/tone gate (tested by bk4829_rx_tone_active)
+;     Bit 10  (0x0400): CTCSS tone frequency detected
+;     Bit 14  (0x4000): CTCSS/DCS intermediate detection flag
+;     Bit 15  (0x8000): DCS Golay codeword matched (mode 3 only)
+;     Bits [11:10] = 0x3: CTCSS confirmed (both detect + valid)
+;   RENAME: was lcd_redraw_channel - actually BK4829 CTCSS/DCS detection dispatcher
  801bec4:	b510      	push	{r4, lr}
  801bec6:	480b      	ldr	r0, [pc, #44]	@ (0x801bef4)                     ; = 0x20000C28 (RAM+0xC28)
  801bec8:	6841      	ldr	r1, [r0, #4]
@@ -41601,7 +44016,7 @@
 ; ║  bk4829_reg_write_multi                                                        ║
 ; ║  0x0801BF4C  size=60                                            ║
 ; ║  Called by: subsystem_poll, bk4829_rf_control                                ║
-; ║  Calls: bk4829_reg_write_multi, peripheral_bus_select, spi_bitbang_timing, bk4829_reg_write_multi       ║
+; ║  Calls: bk4829_reg_write_multi, peripheral_bus_select, bk4829_af_path_config, bk4829_reg_write_multi       ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bk4829_reg_write_multi [BK4829] - BK4829 multi-register write (60B, 4 callers). Writes several BK4829 regs in sequence.
  801bf4c:	b510      	push	{r4, lr}
@@ -43130,60 +45545,103 @@
 ; ║  Called by: audio_dma_dispatch                                              ║
 ; ║  Calls: tick_delay_check, audio_dma_rf_sync, audio_dma_rf_sync, rf_data_init, display_color_set (+3 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_dma_rf_sync  [AUDIO/RF] - Syncs audio DMA with RF state - called by audio_dma_dispatch
- 801e9a4:	b51f      	push	{r0, r1, r2, r3, r4, lr}
- 801e9a6:	a802      	add	r0, sp, #8
- 801e9a8:	f7f4 fb8c 	bl	0x80130c4
- 801e9ac:	2800      	cmp	r0, #0
- 801e9ae:	d037      	beq.n	0x801ea20
- 801e9b0:	4c1c      	ldr	r4, [pc, #112]	@ (0x801ea24)                    ; = 0x2000A3B4 (g_rf_state)
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_dma_rf_sync(void)                              │
+; │                                                                     │
+; │ Synchronizes audio DMA pipeline with RF state changes. Polls GPIO  │
+; │ via audio_dma_gpio_ctrl() for button/state changes, then routes    │
+; │ the detected event to appropriate handlers.                        │
+; │                                                                     │
+; │   uint32_t cmd[2];  // [0]=cmd_type, [1]=gpio_value               │
+; │   if (audio_dma_gpio_ctrl(&cmd) == 0) return;  // no change       │
+; │                                                                     │
+; │   g_rf_state[9] = 4;  // set RF sync flag (halfword)              │
+; │   audio_playback_settings(&cmd, &local);  // decode event         │
+; │                                                                     │
+; │   // Route based on event value (0x33, 0x50-0x54)                  │
+; │   value = local[1];                                                │
+; │   if (value == 0x50 || value == 0x52 ||  // freq up/down?         │
+; │       value == 0x51 || value == 0x53 ||  // vol up/down?          │
+; │       value == 0x54 || value == 0x33) {  // preset keys           │
+; │       rf_data_handler(&local, &local);   // process RF event      │
+; │   }                                                                 │
+; │                                                                     │
+; │   // Check special RF flag for audio gate                          │
+; │   if (g_rf_state[0x63] != 0 &&                                    │
+; │       (value - 0x10) < 0x90) {  // in range 0x10..0x9F            │
+; │       audio_engine_call(0);      // trigger audio update           │
+; │       local = {0, 0xFF};         // clear event                    │
+; │   }                                                                 │
+; │                                                                     │
+; │   if (value != 0xFF) {                                             │
+; │       display_subsystem_flag(&local); // update display            │
+; │       rf_state_update();              // sync RF state             │
+; │   }                                                                 │
+; │                                                                     │
+; │ CALLED BY: audio_dma_dispatch (state 0)                            │
+; │ KEY: This is the primary "input event → audio/RF action" router.   │
+; │ GPIO changes detected by audio_dma_gpio_ctrl feed through here     │
+; │ to control radio frequency, volume, and mode changes.              │
+; └---------------------------------------------------------------------┘
+; * audio_dma_rf_sync  [AUDIO/RF] - Input event router: GPIO→RF/audio action dispatch
+ 801e9a4:	b51f      	push	{r0, r1, r2, r3, r4, lr}                         ; reserve 16B for local cmd[4]
+ 801e9a6:	a802      	add	r0, sp, #8                                       ; r0 = &cmd (on stack)
+ 801e9a8:	f7f4 fb8c 	bl	0x80130c4                                        ; audio_dma_gpio_ctrl(&cmd) - poll GPIO
+ 801e9ac:	2800      	cmp	r0, #0                                           ; event detected?
+ 801e9ae:	d037      	beq.n	0x801ea20                                       ; no → exit
+;; ---- Event detected - set RF sync flag and decode ----
+ 801e9b0:	4c1c      	ldr	r4, [pc, #112]	@ (0x801ea24)                    ; r4 = 0x2000A3B4 (g_rf_state)
  801e9b2:	2004      	movs	r0, #4
- 801e9b4:	f8a4 0009 	strh.w	r0, [r4, #9]
- 801e9b8:	4669      	mov	r1, sp
- 801e9ba:	a802      	add	r0, sp, #8
- 801e9bc:	f7f5 fbf8 	bl	0x80141b0
- 801e9c0:	9801      	ldr	r0, [sp, #4]
- 801e9c2:	2850      	cmp	r0, #80	@ 0x50
- 801e9c4:	d00e      	beq.n	0x801e9e4
+ 801e9b4:	f8a4 0009 	strh.w	r0, [r4, #9]                                  ; g_rf_state[9] = 4 (sync flag)
+ 801e9b8:	4669      	mov	r1, sp                                           ; r1 = &local (decoded event)
+ 801e9ba:	a802      	add	r0, sp, #8                                       ; r0 = &cmd (raw GPIO)
+ 801e9bc:	f7f5 fbf8 	bl	0x80141b0                                        ; audio_playback_settings(&cmd, &local)
+;; ---- Route by event code: 0x50=freq↑ 0x51=vol↑ 0x52=freq↓ 0x53=vol↓ 0x54=preset 0x33=preset_key ----
+ 801e9c0:	9801      	ldr	r0, [sp, #4]                                     ; r0 = local[1] (event value)
+ 801e9c2:	2850      	cmp	r0, #80	@ 0x50                                  ; FREQ UP?
+ 801e9c4:	d00e      	beq.n	0x801e9e4                                       ; → rf_data_handler
  801e9c6:	9801      	ldr	r0, [sp, #4]
- 801e9c8:	2852      	cmp	r0, #82	@ 0x52
+ 801e9c8:	2852      	cmp	r0, #82	@ 0x52                                  ; FREQ DOWN?
  801e9ca:	d00b      	beq.n	0x801e9e4
  801e9cc:	9801      	ldr	r0, [sp, #4]
- 801e9ce:	2851      	cmp	r0, #81	@ 0x51
+ 801e9ce:	2851      	cmp	r0, #81	@ 0x51                                  ; VOL UP?
  801e9d0:	d008      	beq.n	0x801e9e4
  801e9d2:	9801      	ldr	r0, [sp, #4]
- 801e9d4:	2853      	cmp	r0, #83	@ 0x53
+ 801e9d4:	2853      	cmp	r0, #83	@ 0x53                                  ; VOL DOWN?
  801e9d6:	d005      	beq.n	0x801e9e4
  801e9d8:	9801      	ldr	r0, [sp, #4]
- 801e9da:	2854      	cmp	r0, #84	@ 0x54
+ 801e9da:	2854      	cmp	r0, #84	@ 0x54                                  ; PRESET?
  801e9dc:	d002      	beq.n	0x801e9e4
  801e9de:	9801      	ldr	r0, [sp, #4]
- 801e9e0:	2833      	cmp	r0, #51	@ 0x33
- 801e9e2:	d103      	bne.n	0x801e9ec
- 801e9e4:	4669      	mov	r1, sp
- 801e9e6:	4668      	mov	r0, sp
- 801e9e8:	f7eb fc3c 	bl	0x800a264
- 801e9ec:	f894 0063 	ldrb.w	r0, [r4, #99]	@ 0x63
- 801e9f0:	b150      	cbz	r0, 0x801ea08
- 801e9f2:	9801      	ldr	r0, [sp, #4]
- 801e9f4:	3810      	subs	r0, #16
- 801e9f6:	2890      	cmp	r0, #144	@ 0x90
- 801e9f8:	d206      	bcs.n	0x801ea08
+ 801e9e0:	2833      	cmp	r0, #51	@ 0x33                                  ; PRESET KEY?
+ 801e9e2:	d103      	bne.n	0x801e9ec                                       ; none matched → skip
+ 801e9e4:	4669      	mov	r1, sp                                           ; r1 = &local
+ 801e9e6:	4668      	mov	r0, sp                                           ; r0 = &local (in-place)
+ 801e9e8:	f7eb fc3c 	bl	0x800a264                                        ; rf_data_handler(&local, &local)
+;; ---- Check RF audio gate flag for range 0x10..0x9F ----
+ 801e9ec:	f894 0063 	ldrb.w	r0, [r4, #99]	@ 0x63                         ; r0 = g_rf_state[0x63] (audio gate flag)
+ 801e9f0:	b150      	cbz	r0, 0x801ea08                                    ; flag clear → skip
+ 801e9f2:	9801      	ldr	r0, [sp, #4]                                     ; r0 = event value
+ 801e9f4:	3810      	subs	r0, #16                                          ; r0 -= 0x10
+ 801e9f6:	2890      	cmp	r0, #144	@ 0x90                                ; in range 0x10..0x9F?
+ 801e9f8:	d206      	bcs.n	0x801ea08                                       ; out of range → skip
  801e9fa:	2000      	movs	r0, #0
- 801e9fc:	f7e8 fb60 	bl	0x80070c0
+ 801e9fc:	f7e8 fb60 	bl	0x80070c0                                        ; audio_engine_call(0) - trigger audio update
  801ea00:	2000      	movs	r0, #0
- 801ea02:	9000      	str	r0, [sp, #0]
+ 801ea02:	9000      	str	r0, [sp, #0]                                     ; local[0] = 0
  801ea04:	20ff      	movs	r0, #255	@ 0xff
- 801ea06:	9001      	str	r0, [sp, #4]
- 801ea08:	9801      	ldr	r0, [sp, #4]
- 801ea0a:	28ff      	cmp	r0, #255	@ 0xff
- 801ea0c:	d004      	beq.n	0x801ea18
+ 801ea06:	9001      	str	r0, [sp, #4]                                     ; local[1] = 0xFF (consumed marker)
+;; ---- Forward unhandled events to display + RF state update ----
+ 801ea08:	9801      	ldr	r0, [sp, #4]                                     ; r0 = event value
+ 801ea0a:	28ff      	cmp	r0, #255	@ 0xff                                ; consumed (0xFF)?
+ 801ea0c:	d004      	beq.n	0x801ea18                                       ; → skip display update
  801ea0e:	4668      	mov	r0, sp
- 801ea10:	f004 fc1a 	bl	0x8023248
- 801ea14:	f7fc f8e4 	bl	0x801abe0
- 801ea18:	f7f5 fcba 	bl	0x8014390
- 801ea1c:	f7fc f94e 	bl	0x801acbc
- 801ea20:	bd1f      	pop	{r0, r1, r2, r3, r4, pc}
+ 801ea10:	f004 fc1a 	bl	0x8023248                                        ; display_subsystem_flag(&local)
+ 801ea14:	f7fc f8e4 	bl	0x801abe0                                        ; rf_state_update()
+;; ---- Always: tick delay check + sync ----
+ 801ea18:	f7f5 fcba 	bl	0x8014390                                        ; tick_delay_check()
+ 801ea1c:	f7fc f94e 	bl	0x801acbc                                        ; rf_sync_update()
+ 801ea20:	bd1f      	pop	{r0, r1, r2, r3, r4, pc}                         ; return
 
 ; --- DATA @ 0x0801EA22 --------------------------------------------
   0x0801EA20: 1F BD 00 00 B4 A3 00 20 10 B5 19 4C 60 88 00 28  |....... ...L`..(| [+4] 0x2000A3B4=g_rf_state
@@ -43635,55 +46093,76 @@
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  system_settings_handler                                                        ║
-; ║  0x0801EF54  size=66358                                         ║
+; ║  0x0801EF54  size=112                                         ║
 ; ║  Called by: main_task_dispatch                                              ║
 ; ║  Calls: memset_aligned, memset_zero_r2, struct_zero_fill, rf_state_flag_set, system_settings_handler (+4 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * system_settings_handler [SYSTEM] - System settings handler (large). Refs CRM (clock mgmt), g_config+g_display+g_rf+g_settings. Power ma...
- 801ef54:	b510      	push	{r4, lr}
- 801ef56:	4c1b      	ldr	r4, [pc, #108]	@ (0x801efc4)                    ; = 0x2000B160 (RAM+0xB160)
- 801ef58:	6840      	ldr	r0, [r0, #4]
- 801ef5a:	7821      	ldrb	r1, [r4, #0]
- 801ef5c:	2812      	cmp	r0, #18
- 801ef5e:	d017      	beq.n	0x801ef90
- 801ef60:	dc10      	bgt.n	0x801ef84
- 801ef62:	2803      	cmp	r0, #3
- 801ef64:	d020      	beq.n	0x801efa8
- 801ef66:	2807      	cmp	r0, #7
- 801ef68:	d01e      	beq.n	0x801efa8
- 801ef6a:	2810      	cmp	r0, #16
- 801ef6c:	d01c      	beq.n	0x801efa8
- 801ef6e:	2811      	cmp	r0, #17
- 801ef70:	d126      	bne.n	0x801efc0
- 801ef72:	2906      	cmp	r1, #6
- 801ef74:	d011      	beq.n	0x801ef9a
- 801ef76:	f7ff fea1 	bl	0x801ecbc
+; -- system_settings_handler ---------------------------------------------
+; Mode 4 dispatch handler (~110B entry dispatcher).
+; Manages power management, sleep, and system configuration.
+;
+; r4 = RAM[0x2000B160] (settings state struct)
+;   [0] = state flag (0-6, controls conditional branching)
+; r0 = sp[4] (sub-command), r1 = state flag
+;
+; Sub-command dispatch (binary search cascade):
+;   sub  3: tick_delay_check(0)        - timing sync
+;   sub  7: tick_delay_check(0)        - timing sync
+;   sub 16: tick_delay_check(0)        - timing sync
+;   sub 17: if flag==6 → rf_channel_clear(0) + display handler
+;           else → system_rf_config() + tick_delay_check(0)
+;   sub 18: rf_channel_clear(1)        - clear channel, redraw
+;   sub 19: if flag>=3 → settings_display_handler(0) + clear flag
+;           else → return
+;   sub 21: same as 19
+;   sub 29: rf_channel_clear(1)        - same as 18
+;   other:  return (pop, no action)
+; ------------------------------------------------------------------------
+ 801ef54:	b510      	push	{r4, lr} ;; -- SYSTEM_SETTINGS_HANDLER: mode 4 --
+ 801ef56:	4c1b      	ldr	r4, [pc, #108]	@ (0x801efc4)                    ; = 0x2000B160 (RAM+0xB160) ;; r4 = settings_state @ 0x2000B160
+ 801ef58:	6840      	ldr	r0, [r0, #4] ;; r0 = sp[4] (sub-command)
+ 801ef5a:	7821      	ldrb	r1, [r4, #0] ;; r1 = state_flag [0-6]
+ 801ef5c:	2812      	cmp	r0, #18 ;; -- BINARY SEARCH root: sub 18? --
+ 801ef5e:	d017      	beq.n	0x801ef90 ;; sub 18 → rf_channel_clear(1)
+ 801ef60:	dc10      	bgt.n	0x801ef84 ;; sub > 18 → check 19,21,29
+ 801ef62:	2803      	cmp	r0, #3 ;; sub 3?
+ 801ef64:	d020      	beq.n	0x801efa8 ;; sub 3 → tick_delay_check(0)
+ 801ef66:	2807      	cmp	r0, #7 ;; sub 7?
+ 801ef68:	d01e      	beq.n	0x801efa8 ;; sub 7 → tick_delay_check(0)
+ 801ef6a:	2810      	cmp	r0, #16 ;; sub 16?
+ 801ef6c:	d01c      	beq.n	0x801efa8 ;; sub 16 → tick_delay_check(0)
+ 801ef6e:	2811      	cmp	r0, #17 ;; sub 17?
+ 801ef70:	d126      	bne.n	0x801efc0 ;; sub != 17 → return
+ 801ef72:	2906      	cmp	r1, #6 ;; -- SUB 17: check flag==6 --
+ 801ef74:	d011      	beq.n	0x801ef9a ;; flag==6 → rf_channel_clear(0) + display
+ 801ef76:	f7ff fea1 	bl	0x801ecbc ;; flag!=6: system_rf_config()
  801ef7a:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  801ef7e:	2000      	movs	r0, #0
- 801ef80:	f7e8 b89e 	b.w	0x80070c0
- 801ef84:	2813      	cmp	r0, #19
- 801ef86:	d014      	beq.n	0x801efb2
- 801ef88:	2815      	cmp	r0, #21
- 801ef8a:	d012      	beq.n	0x801efb2
- 801ef8c:	281d      	cmp	r0, #29
- 801ef8e:	d117      	bne.n	0x801efc0
- 801ef90:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
+ 801ef80:	f7e8 b89e 	b.w	0x80070c0 ;; tail-call tick_delay_check(0)
+ 801ef84:	2813      	cmp	r0, #19 ;; sub 19?
+ 801ef86:	d014      	beq.n	0x801efb2 ;; sub 19 → settings display path
+ 801ef88:	2815      	cmp	r0, #21 ;; sub 21?
+ 801ef8a:	d012      	beq.n	0x801efb2 ;; sub 21 → settings display path
+ 801ef8c:	281d      	cmp	r0, #29 ;; sub 29?
+ 801ef8e:	d117      	bne.n	0x801efc0 ;; sub != 29 → return
+ 801ef90:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- SUBS 18,29: rf_channel_clear(1) --
  801ef94:	2001      	movs	r0, #1
- 801ef96:	f7ef bb71 	b.w	0x800e67c
- 801ef9a:	2000      	movs	r0, #0
- 801ef9c:	f7ef fb6e 	bl	0x800e67c
+ 801ef96:	f7ef bb71 	b.w	0x800e67c ;; tail-call rf_channel_clear(1)
+ 801ef9a:	2000      	movs	r0, #0 ;; -- SUB 17 (flag==6): rf_channel_clear(0) --
+ 801ef9c:	f7ef fb6e 	bl	0x800e67c ;; rf_channel_clear(0)
  801efa0:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
- 801efa4:	f7ef be72 	b.w	0x800ec8c
- 801efa8:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
+ 801efa4:	f7ef be72 	b.w	0x800ec8c ;; tail-call display update handler
+ 801efa8:	e8bd 4010 	ldmia.w	sp!, {r4, lr} ;; -- SUBS 3,7,16: tick_delay_check(0) --
  801efac:	2000      	movs	r0, #0
  801efae:	f7e8 b887 	b.w	0x80070c0
- 801efb2:	2903      	cmp	r1, #3
- 801efb4:	d304      	bcc.n	0x801efc0
+ 801efb2:	2903      	cmp	r1, #3 ;; -- SUBS 19,21: if flag >= 3 → settings display --
+ 801efb4:	d304      	bcc.n	0x801efc0 ;; flag < 3 → return (not ready)
  801efb6:	2000      	movs	r0, #0
- 801efb8:	f7ff ff84 	bl	0x801eec4
+ 801efb8:	f7ff ff84 	bl	0x801eec4 ;; settings_display_handler(0)
  801efbc:	2000      	movs	r0, #0
- 801efbe:	7020      	strb	r0, [r4, #0]
- 801efc0:	bd10      	pop	{r4, pc}
+ 801efbe:	7020      	strb	r0, [r4, #0] ;; state_flag = 0 (clear after display)
+ 801efc0:	bd10      	pop	{r4, pc} ;; -- DEFAULT: return (no action) --
  801efc2:	0000      	movs	r0, r0
  801efc4:	b160      	cbz	r0, 0x801efe0
  801efc6:	2000      	movs	r0, #0
@@ -45801,60 +48280,93 @@
 ; ║  Calls: byte_to_word_pattern, bt_flash_comms, bt_flash_comms, bt_flash_comms, display_text_render (+19 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * bt_flash_comms [COMMS] - BT/Flash communications (3.5KB). Refs SPI2 (flash) + USART1 (Bluetooth) + GPIOB. Config+RF+settings ...
+; -- bt_flash_comms ------------------------------------------------------
+; Mode 21 dispatch handler (3.5KB). BT/Flash communication protocol.
+; Handles Bluetooth data exchange and flash memory operations.
+;
+; r5 = RAM[0x2000A360] (comms buffer struct, for sub <= 24):
+;   [0] = state flag/countdown
+;   [4] = buffer count/position
+;   [18+] = data write area
+; r4 = RAM[0x2000E4FC] (state struct):
+;   [16] = status word
+; r5 = RAM[0x200002D0] (alt struct, for sub > 18):
+;   [12] = protocol state
+;   [20] = data pointer
+; r6 = 50 (chunk size constant)
+;
+; Sub-command dispatch (cascading binary search):
+;   sub  2: flash/BT data read handler
+;   sub 16: byte copy to buffer + increment count (max 64)
+;   sub 17: → flash protocol handler (0x8020D38)
+;   sub 18: buffer write (space char + countdown, display/state update)
+;   sub 19: BT protocol state check (r5[12])
+;   sub 21: BT data transfer handler
+;   sub 23: → BT command processor
+;   sub 24: → config read/write handler
+;   sub 28: → channel config handler
+;   sub 36: → EEPROM read handler
+;   sub 37: → flash sector handler
+;   sub 46: rf_channel_clear(1) - same path as sub 24
+;   sub 47: → flash write handler
+;   sub 48: → flash verify handler
+;   sub ≥160: cleanup and return
+;   default: tick_delay_check(0)
+; ------------------------------------------------------------------------
  80206c8:	b570      	push	{r4, r5, r6, lr}
- 80206ca:	6841      	ldr	r1, [r0, #4]
- 80206cc:	2918      	cmp	r1, #24
+ 80206ca:	6841      	ldr	r1, [r0, #4] ;; r1 = sub-command ID
+ 80206cc:	2918      	cmp	r1, #24 ;; branch: sub == 24 → config handler
  80206ce:	d07c      	beq.n	0x80207ca
- 80206d0:	dc19      	bgt.n	0x8020706
- 80206d2:	4d6b      	ldr	r5, [pc, #428]	@ (0x8020880)                    ; = 0x2000A360 (RAM+0xA360)
- 80206d4:	4c6b      	ldr	r4, [pc, #428]	@ (0x8020884)                    ; = 0x2000E4FC (RAM+0xE4FC)
- 80206d6:	f105 0312 	add.w	r3, r5, #18
+	80206d0:	dc19      	bgt.n	0x8020706 ;; sub > 24 → upper dispatch
+	80206d2:	4d6b      	ldr	r5, [pc, #428]	@ (0x8020880) ;; r5 = comms buffer @ 0x2000A360
+	80206d4:	4c6b      	ldr	r4, [pc, #428]	@ (0x8020884) ;; r4 = state struct @ 0x2000E4FC
+ 80206d6:	f105 0312 	add.w	r3, r5, #18 ;; r3 = write pointer (buf + 18)
  80206da:	686a      	ldr	r2, [r5, #4]
- 80206dc:	f04f 0632 	mov.w	r6, #50	@ 0x32
- 80206e0:	2912      	cmp	r1, #18
+	80206dc:	f04f 0632 	mov.w	r6, #50	@ 0x32 ;; r6 = chunk size (50 bytes)
+ 80206e0:	2912      	cmp	r1, #18 ;; sub == 18 → buffer backspace
  80206e2:	d029      	beq.n	0x8020738
- 80206e4:	dc06      	bgt.n	0x80206f4
- 80206e6:	2902      	cmp	r1, #2
+	80206e4:	dc06      	bgt.n	0x80206f4 ;; sub > 18 → BT protocol group
+ 80206e6:	2902      	cmp	r1, #2 ;; sub == 2 → flash read
  80206e8:	d070      	beq.n	0x80207cc
- 80206ea:	2910      	cmp	r1, #16
+ 80206ea:	2910      	cmp	r1, #16 ;; sub == 16 → byte copy to buffer
  80206ec:	d03a      	beq.n	0x8020764
- 80206ee:	2911      	cmp	r1, #17
+ 80206ee:	2911      	cmp	r1, #17 ;; sub == 17 → flash protocol
  80206f0:	d117      	bne.n	0x8020722
  80206f2:	e01d      	b.n	0x8020730
  80206f4:	4d64      	ldr	r5, [pc, #400]	@ (0x8020888)                    ; = 0x200002D0 (RAM+0x2D0)
- 80206f6:	2913      	cmp	r1, #19
+ 80206f6:	2913      	cmp	r1, #19 ;; sub == 19 → BT state check
  80206f8:	68e8      	ldr	r0, [r5, #12]
  80206fa:	d045      	beq.n	0x8020788
- 80206fc:	2915      	cmp	r1, #21
+ 80206fc:	2915      	cmp	r1, #21 ;; sub == 21 → BT data transfer
  80206fe:	d055      	beq.n	0x80207ac
- 8020700:	2917      	cmp	r1, #23
+ 8020700:	2917      	cmp	r1, #23 ;; sub == 23 → BT command processor
  8020702:	d10e      	bne.n	0x8020722
  8020704:	e067      	b.n	0x80207d6
- 8020706:	292e      	cmp	r1, #46	@ 0x2e
+ 8020706:	292e      	cmp	r1, #46 ;; sub == 46 → rf_channel_clear(1)	@ 0x2e
  8020708:	d039      	beq.n	0x802077e
  802070a:	dc06      	bgt.n	0x802071a
- 802070c:	291c      	cmp	r1, #28
+ 802070c:	291c      	cmp	r1, #28 ;; sub == 28 → channel config
  802070e:	d072      	beq.n	0x80207f6
- 8020710:	2924      	cmp	r1, #36	@ 0x24
+ 8020710:	2924      	cmp	r1, #36 ;; sub == 36 → EEPROM read	@ 0x24
  8020712:	d07d      	beq.n	0x8020810
- 8020714:	2925      	cmp	r1, #37	@ 0x25
+ 8020714:	2925      	cmp	r1, #37 ;; sub == 37 → flash sector handler	@ 0x25
  8020716:	d104      	bne.n	0x8020722
  8020718:	e0a4      	b.n	0x8020864
- 802071a:	292f      	cmp	r1, #47	@ 0x2f
+ 802071a:	292f      	cmp	r1, #47 ;; sub == 47 → flash write	@ 0x2f
  802071c:	d079      	beq.n	0x8020812
- 802071e:	2930      	cmp	r1, #48	@ 0x30
+ 802071e:	2930      	cmp	r1, #48 ;; sub == 48 → flash verify	@ 0x30
  8020720:	d078      	beq.n	0x8020814
- 8020722:	29a0      	cmp	r1, #160	@ 0xa0
+ 8020722:	29a0      	cmp	r1, #160 ;; sub >= 0xA0 → cleanup	@ 0xa0
  8020724:	d277      	bcs.n	0x8020816
  8020726:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 802072a:	2000      	movs	r0, #0
+ 802072a:	2000      	movs	r0, #0 ;; tick_delay_check(0) - default handler
  802072c:	f7e6 bcc8 	b.w	0x80070c0
- 8020730:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 8020734:	f000 bb00 	b.w	0x8020d38
- 8020738:	b17a      	cbz	r2, 0x802075a
+ 8020730:	e8bd 4070 	ldmia.w	sp ;; -- sub 17: flash protocol entry!, {r4, r5, r6, lr}
+ 8020734:	f000 bb00 	b.w	0x8020d38 ;; → flash_protocol_handler
+ 8020738:	b17a      	cbz	r2, 0x802075a ;; -- sub 18: buffer backspace. if count==0 → done
  802073a:	1e52      	subs	r2, r2, #1
  802073c:	606a      	str	r2, [r5, #4]
- 802073e:	2020      	movs	r0, #32
+ 802073e:	2020      	movs	r0, #32 ;; space char (erases last byte in buffer)
  8020740:	54d0      	strb	r0, [r2, r3]
  8020742:	6868      	ldr	r0, [r5, #4]
  8020744:	b120      	cbz	r0, 0x8020750
@@ -45867,11 +48379,11 @@
  802075a:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  802075e:	2001      	movs	r0, #1
  8020760:	f000 b8e4 	b.w	0x802092c
- 8020764:	7800      	ldrb	r0, [r0, #0]
+ 8020764:	7800      	ldrb	r0, [r0, #0] ;; -- sub 16: copy byte from input to buffer
  8020766:	54d0      	strb	r0, [r2, r3]
  8020768:	602e      	str	r6, [r5, #0]
  802076a:	6868      	ldr	r0, [r5, #4]
- 802076c:	2840      	cmp	r0, #64	@ 0x40
+ 802076c:	2840      	cmp	r0, #64 ;; max 64 bytes per buffer	@ 0x40
  802076e:	d201      	bcs.n	0x8020774
  8020770:	1c40      	adds	r0, r0, #1
  8020772:	6068      	str	r0, [r5, #4]
@@ -45881,7 +48393,7 @@
  802077e:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  8020782:	2001      	movs	r0, #1
  8020784:	f000 b8d2 	b.w	0x802092c
- 8020788:	6969      	ldr	r1, [r5, #20]
+ 8020788:	6969      	ldr	r1, [r5, #20] ;; -- sub 19: BT scroll forward (position += 2, clamp to max)
  802078a:	4288      	cmp	r0, r1
  802078c:	da09      	bge.n	0x80207a2
  802078e:	1c80      	adds	r0, r0, #2
@@ -45896,7 +48408,7 @@
  80207a2:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  80207a6:	2001      	movs	r0, #1
  80207a8:	f7e6 bc8a 	b.w	0x80070c0
- 80207ac:	6929      	ldr	r1, [r5, #16]
+ 80207ac:	6929      	ldr	r1, [r5, #16] ;; -- sub 21: BT scroll back (position -= 2, clamp to min)
  80207ae:	4288      	cmp	r0, r1
  80207b0:	dd09      	ble.n	0x80207c6
  80207b2:	1e80      	subs	r0, r0, #2
@@ -45914,7 +48426,7 @@
  80207cc:	e01a      	b.n	0x8020804
  80207ce:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  80207d2:	f7e6 bc75 	b.w	0x80070c0
- 80207d6:	7ae8      	ldrb	r0, [r5, #11]
+ 80207d6:	7ae8      	ldrb	r0, [r5, #11] ;; -- sub 23: toggle BT mode flag (bit 0)
  80207d8:	1c40      	adds	r0, r0, #1
  80207da:	f000 0001 	and.w	r0, r0, #1
  80207de:	72e8      	strb	r0, [r5, #11]
@@ -45922,13 +48434,13 @@
  80207e4:	7ae8      	ldrb	r0, [r5, #11]
  80207e6:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  80207ea:	f000 b84f 	b.w	0x802088c
- 80207ee:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+ 80207ee:	e8bd 4070 	ldmia.w	sp ;; -- sub 24: → channel config handler (0x8020CE4)!, {r4, r5, r6, lr}
  80207f2:	f000 ba77 	b.w	0x8020ce4
- 80207f6:	f7ff fc4b 	bl	0x8020090
+ 80207f6:	f7ff fc4b 	bl	0x8020090 ;; -- sub 28: channel config (calls setup fn)
  80207fa:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  80207fe:	2001      	movs	r0, #1
  8020800:	f7e6 bc5e 	b.w	0x80070c0
- 8020804:	f894 0024 	ldrb.w	r0, [r4, #36]	@ 0x24
+ 8020804:	f894 0024 	ldrb.w	r0, [r4, #36]	@ 0x24  ;; -- sub 2: flash read. check state[0x24]
  8020808:	2802      	cmp	r0, #2
  802080a:	d009      	beq.n	0x8020820
  802080c:	2007      	movs	r0, #7
@@ -45936,10 +48448,10 @@
  8020810:	e01b      	b.n	0x802084a
  8020812:	e022      	b.n	0x802085a
  8020814:	e02e      	b.n	0x8020874
- 8020816:	e032      	b.n	0x802087e
+ 8020816:	e032      	b.n	0x802087e ;; → cleanup return for sub ≥ 0xA0
  8020818:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  802081c:	f7e6 bc50 	b.w	0x80070c0
- 8020820:	68e0      	ldr	r0, [r4, #12]
+ 8020820:	68e0      	ldr	r0, [r4, #12] ;; state == 2: process flash data (full handler)
  8020822:	f000 fb0f 	bl	0x8020e44
  8020826:	2000      	movs	r0, #0
  8020828:	f884 0024 	strb.w	r0, [r4, #36]	@ 0x24
@@ -45952,23 +48464,23 @@
  8020840:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  8020844:	2001      	movs	r0, #1
  8020846:	f7e6 bc3b 	b.w	0x80070c0
- 802084a:	2000      	movs	r0, #0
+ 802084a:	2000      	movs	r0, #0 ;; -- sub 36: EEPROM read (flash_op(0))
  802084c:	f000 fa06 	bl	0x8020c5c
  8020850:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  8020854:	2002      	movs	r0, #2
  8020856:	f7e6 bc33 	b.w	0x80070c0
- 802085a:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+ 802085a:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- sub 47: flash_op(0) + return
  802085e:	2000      	movs	r0, #0
  8020860:	f000 b9fc 	b.w	0x8020c5c
- 8020864:	2001      	movs	r0, #1
+ 8020864:	2001      	movs	r0, #1 ;; -- sub 37: flash_op(1) + tick_delay
  8020866:	f000 f9f9 	bl	0x8020c5c
  802086a:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  802086e:	2001      	movs	r0, #1
  8020870:	f7e6 bc26 	b.w	0x80070c0
- 8020874:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+ 8020874:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- sub 48: flash_op(1) - verify
  8020878:	2001      	movs	r0, #1
  802087a:	f000 b9ef 	b.w	0x8020c5c
- 802087e:	bd70      	pop	{r4, r5, r6, pc}
+ 802087e:	bd70      	pop	{r4, r5, r6, pc} ;; -- sub ≥ 160: cleanup return
  8020880:	a360      	add	r3, pc, #384	@ (adr r3, 0x8020a04)
  8020882:	2000      	movs	r0, #0
  8020884:	e4fc      	b.n	0x8020280
@@ -46792,9 +49304,9 @@
  8021074:	b2c0      	uxtb	r0, r0
  8021076:	bd70      	pop	{r4, r5, r6, pc}
 
-; -── DATA @ 0x08021078 ────────────────────────────────────────────
+; --- DATA @ 0x08021078 --------------------------------------------
   0x08021070: FB F7 FF F8 C0 B2 70 BD 00 38 00 40 2D E9 F0 41  |......p..8.@-..A| [+8] 0x40003800=SPI2
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  spi_flash_cs_ctrl                                                        ║
@@ -46837,10 +49349,10 @@
  80210d8:	2001      	movs	r0, #1
  80210da:	f7e9 bc42 	b.w	0x800a962                                       ; -> delay_short
 
-; ─── DATA @ 0x080210DE ────────────────────────────────────────────
+; --- DATA @ 0x080210DE --------------------------------------------
   0x080210D0: F1 F7 6F FA BD E8 F0 41 01 20 E9 F7 42 BC 00 00  |..o....A. ..B...|
   0x080210E0: 00 0C 01 40 70 B5 02 28 1B D0 03 28 1B D0 05 24  |...@p..(...(...$| [+0] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  flash_spi_read_data                                                        ║
@@ -46878,9 +49390,9 @@
  8021126:	2415      	movs	r4, #21
  8021128:	e7e2      	b.n	0x80210f0
 
-; ─── DATA @ 0x0802112A ────────────────────────────────────────────
+; --- DATA @ 0x0802112A --------------------------------------------
   0x08021120: 70 BD 35 24 E4 E7 15 24 E2 E7 00 00 00 0C 01 40  |p.5$...$.......@| [+12] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  flash_spi_cmd_xfer                                                        ║
@@ -46926,7 +49438,7 @@
  8021182:	4630      	mov	r0, r6
  8021184:	e7e4      	b.n	0x8021150
 
-; ─── DATA @ 0x08021186 ────────────────────────────────────────────
+; --- DATA @ 0x08021186 --------------------------------------------
   0x08021180: F3 D0 30 46 E4 E7 00 00 00 38 00 40 2D E9 F0 47  |..0F.....8.@-..G| [+8] 0x40003800=SPI2
   0x08021190: 04 46 0E 46 17 46 42 F2 10 75 00 F0 6D F8 DF F8  |.F.F.FB..u..m...|
   0x080211A0: 6C 90 4F F4 80 58 41 46 48 46 F1 F7 00 FA 01 20  |l.O..XAFHF..... | [+12] 0x2001FA00=RAM+0x1FA00
@@ -46936,7 +49448,7 @@
   0x080211E0: BC 42 F7 D3 41 46 48 46 F1 F7 E3 F9 01 20 E9 F7  |.B..AFHF..... ..|
   0x080211F0: B8 FB 06 E0 02 20 E9 F7 B4 FB FF F7 35 FE 00 28  |..... ......5..(|
   0x08021200: 02 D0 6D 1E AD B2 F5 D2 BD E8 F0 87 00 0C 01 40  |..m............@| [+12] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  flash_spi_data_xfer                                                        ║
@@ -47009,9 +49521,9 @@
  80212a0:	2001      	movs	r0, #1
  80212a2:	f7e9 bb5e 	b.w	0x800a962                                       ; -> delay_short
 
-; ─── DATA @ 0x080212A6 ────────────────────────────────────────────
+; --- DATA @ 0x080212A6 --------------------------------------------
   0x080212A0: 01 20 E9 F7 5E BB 00 00 00 0C 01 40 70 B5 14 4C  |. ..^......@p..L| [+8] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  flash_spi_addr_set                                                        ║
@@ -47060,9 +49572,9 @@
  80212fc:	80c5      	strh	r5, [r0, #6]
  80212fe:	bd70      	pop	{r4, r5, r6, pc}
 
-; ─── DATA @ 0x08021300 ────────────────────────────────────────────
+; --- DATA @ 0x08021300 --------------------------------------------
   0x08021300: 08 E8 00 20 70 AF 00 20 02 48 00 21 82 68 51 20  |... p.. .H.!.hQ | [+0] 0x2000E808=RAM+0xE808; [+4] 0x2000AF70=RAM+0xAF70
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  bk4829_write_gpio_reg                                                        ║
@@ -47076,9 +49588,9 @@
  802130e:	2051      	movs	r0, #81	@ 0x51
  8021310:	4710      	bx	r2
 
-; ─── DATA @ 0x08021312 ────────────────────────────────────────────
+; --- DATA @ 0x08021312 --------------------------------------------
   0x08021310: 10 47 00 00 28 0C 00 20 1C B5 0A 46 00 21 00 91  |.G..(.. ...F.!..| [+4] 0x20000C28=RAM+0xC28
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  keypad_channel_copy                                                        ║
@@ -47131,9 +49643,9 @@
  8021362:	5484      	strb	r4, [r0, r2]
  8021364:	e7f4      	b.n	0x8021350
 
-; ─── DATA @ 0x08021366 ────────────────────────────────────────────
+; --- DATA @ 0x08021366 --------------------------------------------
   0x08021360: 3E BD 84 54 F4 E7 00 00 7F B5 04 46 11 4D 28 46  |>..T.......F.M(F|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  usart1_reconfig                                                    ║
@@ -47169,9 +49681,9 @@
  80213ac:	f000 ffac 	bl	0x8022308
  80213b0:	bd7f      	pop	{r0, r1, r2, r3, r4, r5, r6, pc}
 
-; ─── DATA @ 0x080213B2 ────────────────────────────────────────────
+; --- DATA @ 0x080213B2 --------------------------------------------
   0x080213B0: 7F BD 00 00 00 38 01 40 00 F4 E0 71 89 00 00 F0  |.....8.@...q....| [+4] 0x40013800=USART1
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_full_redraw_tail                                                        ║
@@ -47188,9 +49700,9 @@
  80213ca:	4310      	orrs	r0, r2
  80213cc:	4770      	bx	lr
 
-; ─── DATA @ 0x080213CE ────────────────────────────────────────────
+; --- DATA @ 0x080213CE --------------------------------------------
   0x080213C0: 38 02 52 00 00 F0 07 00 08 43 10 43 70 47 00 00  |8.R......C.CpG..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  channel_freq_calc                                                        ║
@@ -47246,7 +49758,7 @@
  8021448:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  802144c:	f7fa beca 	b.w	0x801c1e4
 
-; ─── DATA @ 0x08021450 ────────────────────────────────────────────
+; --- DATA @ 0x08021450 --------------------------------------------
   0x08021450: 1C A4 00 20 B0 A8 00 20 B4 A3 00 20 70 B5 4A 4D  |... ... ... p.JM| [+0] 0x2000A41C=RAM+0xA41C; [+4] 0x2000A8B0=RAM+0xA8B0; [+8] 0x2000A3B4=g_rf_state
   0x08021460: 95 F8 FA 00 00 EB 40 01 01 EB C0 00 05 EB C0 00  |......@.........|
   0x08021470: 90 F8 30 61 EC F7 E6 F8 95 F8 FA 00 43 4C 02 28  |..0a........CL.(|
@@ -47268,36 +49780,53 @@
   0x08021570: EE F7 20 FB BD E8 70 40 FA F7 34 BE 06 20 E5 F7  |.. ...p@..4.. ..|
   0x08021580: 9F FD E4 E7 3B 20 E0 E7 1C A4 00 20 B0 A8 00 20  |....; ..... ... | [+8] 0x2000A41C=RAM+0xA41C; [+12] 0x2000A8B0=RAM+0xA8B0
   0x08021590: 58 A8 00 20 B4 A3 00 20 70 B5 0E 4E 0E 4C 0F 4D  |X.. ... p..N.L.M| [+0] 0x2000A858=RAM+0xA858; [+4] 0x2000A3B4=g_rf_state
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_display_state_manager                                                        ║
-; ║  0x08021598  size=86736                                         ║
+; ║  0x08021598  size=76                                         ║
 ; ║  Called by: rf_display_state_manager, audio_dma_dispatch, display_mode_update                  ║
 ; ║  Calls: rf_cal_state_update, channel_type_get, rf_display_state_manager, rf_state_flag_set       ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_display_state_manager  [RF/DISPLAY] - RF display state - refs g_rf, g_cursor, g_rf_flags, g_hw_state, SCB
- 8021598:	b570      	push	{r4, r5, r6, lr}
- 802159a:	4e0e      	ldr	r6, [pc, #56]	@ (0x80215d4)                     ; = 0x200001F9 (RAM+0x1F9)
- 802159c:	4c0e      	ldr	r4, [pc, #56]	@ (0x80215d8)                     ; = 0x2000A41C (RAM+0xA41C)
- 802159e:	4d0f      	ldr	r5, [pc, #60]	@ (0x80215dc)                     ; = 0x2000A3B4 (g_rf_state)
- 80215a0:	2800      	cmp	r0, #0
- 80215a2:	d007      	beq.n	0x80215b4
- 80215a4:	7830      	ldrb	r0, [r6, #0]
- 80215a6:	f884 00fa 	strb.w	r0, [r4, #250]	@ 0xfa
- 80215aa:	f7eb ffc5 	bl	0x800d538
- 80215ae:	2000      	movs	r0, #0
- 80215b0:	7028      	strb	r0, [r5, #0]
+; -- rf_display_state_manager --------------------------------------------
+; RF display state save/restore function (76B).
+; Called when entering/exiting calibration or config modes.
+;
+; r0 == non-zero → SAVE current display state:
+;   1. Copy cursor position RAM[0x200001F9] → display_config[0xFA]
+;   2. rf_state_machine_step() - advance RF state machine one tick
+;   3. Clear g_rf_state[0] (reset mode to 0)
+;
+; r0 == 0 → RESTORE previous display state:
+;   1. rf_state_flag_set() - restore RF flags
+;   2. Reload cursor position from display_config[0xFA] → RAM[0x200001F9]
+;   3. Copy g_rf_state[0x33] → display_config[0xFA]
+;   4. channel_data_memset() - refresh channel data
+;
+; Common tail: channel_type_get() → tail-call display_refresh (0x800c304)
+; ------------------------------------------------------------------------
+ 8021598:	b570      	push	{r4, r5, r6, lr} ;; -- RF_DISPLAY_STATE_MANAGER --
+ 802159a:	4e0e      	ldr	r6, [pc, #56]	@ (0x80215d4)                     ; = 0x200001F9 (RAM+0x1F9) ;; r6 = cursor_pos @ 0x200001F9
+ 802159c:	4c0e      	ldr	r4, [pc, #56]	@ (0x80215d8)                     ; = 0x2000A41C (RAM+0xA41C) ;; r4 = display_config @ 0x2000A41C
+ 802159e:	4d0f      	ldr	r5, [pc, #60]	@ (0x80215dc)                     ; = 0x2000A3B4 (g_rf_state) ;; r5 = g_rf_state @ 0x2000A3B4
+ 80215a0:	2800      	cmp	r0, #0 ;; r0==0 → RESTORE path
+ 80215a2:	d007      	beq.n	0x80215b4 ;; branch to restore
+ 80215a4:	7830      	ldrb	r0, [r6, #0] ;; -- SAVE: r0 = current cursor position --
+ 80215a6:	f884 00fa 	strb.w	r0, [r4, #250]	@ 0xfa ;; display_config[0xFA] = cursor (save)
+ 80215aa:	f7eb ffc5 	bl	0x800d538 ;; rf_state_machine_step() - advance state
+ 80215ae:	2000      	movs	r0, #0 ;; clear value
+ 80215b0:	7028      	strb	r0, [r5, #0] ;; g_rf_state[0] = 0 (reset mode)
  80215b2:	e009      	b.n	0x80215c8
- 80215b4:	f7ec f846 	bl	0x800d644
- 80215b8:	f814 0ffa 	ldrb.w	r0, [r4, #250]!
- 80215bc:	7030      	strb	r0, [r6, #0]
- 80215be:	f895 0033 	ldrb.w	r0, [r5, #51]	@ 0x33
- 80215c2:	7020      	strb	r0, [r4, #0]
- 80215c4:	f7e7 f8a6 	bl	0x8008714
- 80215c8:	f7eb faf8 	bl	0x800cbbc
+ 80215b4:	f7ec f846 	bl	0x800d644 ;; -- RESTORE: rf_state_flag_set() --
+ 80215b8:	f814 0ffa 	ldrb.w	r0, [r4, #250]! ;; r0 = display_config[0xFA] (saved cursor)
+ 80215bc:	7030      	strb	r0, [r6, #0] ;; RAM[0x200001F9] = cursor (restore)
+ 80215be:	f895 0033 	ldrb.w	r0, [r5, #51]	@ 0x33 ;; r0 = g_rf_state[0x33] (RF param)
+ 80215c2:	7020      	strb	r0, [r4, #0] ;; display_config[0xFA] = RF param
+ 80215c4:	f7e7 f8a6 	bl	0x8008714 ;; channel_data_memset() - refresh data
+ 80215c8:	f7eb faf8 	bl	0x800cbbc ;; -- COMMON TAIL: channel_type_get() --
  80215cc:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80215d0:	f7ea be98 	b.w	0x800c304
+ 80215d0:	f7ea be98 	b.w	0x800c304 ;; tail-call display_refresh
  80215d4:	01f9      	lsls	r1, r7, #7
  80215d6:	2000      	movs	r0, #0
  80215d8:	a41c      	add	r4, pc, #112	@ (adr r4, 0x802164c)
@@ -47306,44 +49835,53 @@
  80215de:	2000      	movs	r0, #0
  80215e0:	f000 bd5a 	b.w	0x8022098
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  rcc_clock_init                                                        ║
+; ║  systick_config                                                      ║
 ; ║  0x080215E4  size=54                                            ║
-; ║  * rcc_clock_init  [SYSTEM/RCC]                                          ║
+; ║  * systick_config  [SYSTEM/TICK]                                     ║
 ; ║  Called by: hw_init_main                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ;; ═══════════════════════════════════════════════════════════════════
-;; RCC_CLOCK_INIT - System clock tree configuration
-;; First function called in boot - sets up PLL from HSE/HSI
-;; AT32F403A: up to 120MHz HCLK, APB1 max 60MHz, APB2 max 120MHz
+;; SYSTICK_CONFIG - SysTick timer initialization (1ms tick)
+;;
+;; NOTE: Previously mislabeled "rcc_clock_init". This function does NOT
+;; configure RCC/PLL clocks. It only programs the ARM SysTick timer.
+;; The actual RCC/PLL configuration happens in startup code before
+;; oem_main is called (SystemCoreClock already = 120MHz at this point).
+;;
+;; Reads SystemCoreClock from RAM+0x0 (set by startup code)
+;; Computes reload = (SystemCoreClock / 1000) - 1 = 119999 for 1ms
+;; Programs SysTick LOAD, VAL, CTRL registers
+;; Sets SysTick IRQ priority to lowest (0xF0)
+;; On failure (ticks >= 16M): infinite hang
 ;; ═══════════════════════════════════════════════════════════════════
  80215e4:	480d      	ldr	r0, [pc, #52]	@ (0x802161c)                     ; = 0x20000000 (RAM+0x0)
- 80215e6:	f44f 717a 	mov.w	r1, #1000	@ 0x3e8
- 80215ea:	6800      	ldr	r0, [r0, #0]
- 80215ec:	fbb0 f0f1 	udiv	r0, r0, r1
- 80215f0:	1e40      	subs	r0, r0, #1
- 80215f2:	f1b0 7f80 	cmp.w	r0, #16777216	@ 0x1000000
- 80215f6:	d301      	bcc.n	0x80215fc
- 80215f8:	2001      	movs	r0, #1
- 80215fa:	e00a      	b.n	0x8021612
- 80215fc:	f04f 21e0 	mov.w	r1, #3758153728	@ 0xe000e000
- 8021600:	6148      	str	r0, [r1, #20]
+ 80215e6:	f44f 717a 	mov.w	r1, #1000	@ 0x3e8                          ;; divisor = 1000 (for 1ms period)
+ 80215ea:	6800      	ldr	r0, [r0, #0]                                     ;; r0 = SystemCoreClock (120000000)
+ 80215ec:	fbb0 f0f1 	udiv	r0, r0, r1                                   ;; r0 = 120000000 / 1000 = 120000
+ 80215f0:	1e40      	subs	r0, r0, #1                                   ;; r0 = 119999 (reload value)
+ 80215f2:	f1b0 7f80 	cmp.w	r0, #16777216	@ 0x1000000                  ;; SysTick is 24-bit: max 0xFFFFFF
+ 80215f6:	d301      	bcc.n	0x80215fc                                    ;; if (ticks < 16M) → OK
+ 80215f8:	2001      	movs	r0, #1                                       ;; else: error = 1
+ 80215fa:	e00a      	b.n	0x8021612                                        ;; goto error_check
+ 80215fc:	f04f 21e0 	mov.w	r1, #3758153728	@ 0xe000e000             ;; r1 = SysTick base (0xE000E000)
+ 8021600:	6148      	str	r0, [r1, #20]                                    ;; STK_LOAD (0xE000E014) = 119999
  8021602:	4a07      	ldr	r2, [pc, #28]	@ (0x8021620)                     ; = 0xE000ED23
- 8021604:	20f0      	movs	r0, #240	@ 0xf0
- 8021606:	7010      	strb	r0, [r2, #0]
+ 8021604:	20f0      	movs	r0, #240	@ 0xf0                               ;; priority = 0xF0 (lowest urgency)
+ 8021606:	7010      	strb	r0, [r2, #0]                                     ;; SCB->SHPR3[SysTick] = 0xF0
  8021608:	2000      	movs	r0, #0
- 802160a:	6188      	str	r0, [r1, #24]
- 802160c:	2007      	movs	r0, #7
- 802160e:	6108      	str	r0, [r1, #16]
- 8021610:	2000      	movs	r0, #0
- 8021612:	2800      	cmp	r0, #0
- 8021614:	d000      	beq.n	0x8021618
- 8021616:	e7fe      	b.n	0x8021616
- 8021618:	4770      	bx	lr
+ 802160a:	6188      	str	r0, [r1, #24]                                    ;; STK_VAL (0xE000E018) = 0 (clear counter)
+ 802160c:	2007      	movs	r0, #7                                       ;; CTRL = ENABLE|TICKINT|CLKSOURCE
+ 802160e:	6108      	str	r0, [r1, #16]                                    ;; STK_CTRL (0xE000E010) = 7 → start
+ 8021610:	2000      	movs	r0, #0                                       ;; error = 0 (success)
+ 8021612:	2800      	cmp	r0, #0                                           ;; check error
+ 8021614:	d000      	beq.n	0x8021618                                    ;; if OK → return
+ 8021616:	e7fe      	b.n	0x8021616                                        ;; FATAL: infinite hang on error
+ 8021618:	4770      	bx	lr                                               ;; return (SysTick now running at 1kHz)
 
-; ─── DATA @ 0x0802161A ────────────────────────────────────────────
+; --- DATA @ 0x0802161A --------------------------------------------
   0x08021610: 00 20 00 28 00 D0 FE E7 70 47 00 00 00 00 00 20  |. .(....pG..... | [+12] 0x20000000=RAM+0x0
   0x08021620: 23 ED 00 E0 1C B5 05 46 04 20 E8 F7 EB FB 00 24  |#......F. .....$|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_info_draw                                                        ║
@@ -47417,7 +49955,7 @@
  80216b6:	f7f3 bdef 	b.w	0x8015298
  80216ba:	4770      	bx	lr
 
-; ─── DATA @ 0x080216BC ────────────────────────────────────────────
+; --- DATA @ 0x080216BC --------------------------------------------
   0x080216B0: 80 F8 4C 10 00 20 F3 F7 EF BD 70 47 B4 A3 00 20  |..L.. ....pG... | [+12] 0x2000A3B4=g_rf_state
   0x080216C0: 05 48 90 F8 4C 10 00 29 05 D1 01 21 00 F8 4C 1F  |.H..L..)...!..L.|
   0x080216D0: 4F F4 FA 71 41 80 70 47 B4 A3 00 20 10 B5 14 48  |O..qA.pG... ...H| [+8] 0x2000A3B4=g_rf_state
@@ -47428,117 +49966,143 @@
   0x08021720: FE F7 B6 F9 02 49 4F F0 00 60 80 39 08 60 10 BD  |.....IO..`.9.`..|
   0x08021730: 88 ED 00 E0 00 10 02 40 0C 00 FF E8 FF FF F6 FE  |.......@........| [+4] 0x40021000=RCC
   0x08021740: FF FF 00 17 00 FF FE FE 2D E9 F0 41 00 20 F3 F7  |........-..A. ..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_comm_handler                                                        ║
 ; ║  0x08021748  size=372                                           ║
 ; ║  Calls: uart_playback_nop, programming_handler, uart_comm_handler, tick_get, usart1_hw_init (+32 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * uart_comm_handler [COMMS] - UART comm handler (372B). Called from oem_main. Handles UART4/CPS or USART3/GPS data.
- 8021748:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
+; * uart_comm_handler [COMMS] - Radio subsystem init + PTT check (372B). Called once from oem_main boot step [6].
+;; UART_COMM_HANDLER - One-shot radio + peripheral init after hw_init_main
+;;
+;; Despite its name, this is mostly a RADIO SUBSYSTEM INITIALIZER, not just UART.
+;; It runs once during boot (step 6 of oem_main) and performs:
+;;   PHASE 1: LCD interface init (data/command, ctrl pins, parallel write)
+;;   PHASE 2: EEPROM/flash data load (validate, write CRC, read config)
+;;   PHASE 3: Memory + flash init, 200ms settle delay
+;;   PHASE 4: Audio path setup (speaker mute, RF transceiver, DSP)
+;;   PHASE 5: Validate band mode (0-2), copy to g_rf_state
+;;   PHASE 6: PTT button check (PE3=PTT1, PE2=PTT2 on GPIOE)
+;;   PHASE 7: RF timing delay ((state % 15 + 1) * 200 µs)
+;;   PHASE 8: Clear state buffers, init channel data
+;;   PHASE 9: Status LED control (PB9) based on BT/mode config
+;;
+;; C pseudocode:
+;;   void uart_comm_handler(void) {
+;;     lcd_dc_ctrl(0); lcd_ctrl_pin_set(0); lcd_parallel_write(0);
+;;     uart_flash_verify_cmd(); eeprom_data_validate(); uart_flash_write_verify();
+;;     uart_eeprom_write_cmd(); if (g_config[0]==1) uart_playback_nop();
+;;     eeprom_block_write(); uart_protocol_handler(); uart_eeprom_read_cmd();
+;;     spi_flash_cs_ctrl(0xA000, buf); flash_init_sequence();
+;;     uart_spi_bitbang_init(); delay_ms(200);
+;;     spk_mute_on_ptt(); tick_get(4); bk4829_reg_write();
+;;     programming_handler(); uart_flash_transfer(); spk_mute_on_ptt();
+;;     // ... PTT check + channel init + LED control ...
+;;   }
+ 8021748:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr} ;; ---- PHASE 1: LCD INTERFACE INIT ----
  802174c:	2000      	movs	r0, #0
- 802174e:	f7f3 fdc5 	bl	0x80152dc
+ 802174e:	f7f3 fdc5 	bl	0x80152dc ;; lcd_dc_ctrl(0) - LCD command mode
  8021752:	2000      	movs	r0, #0
- 8021754:	f7f3 fda0 	bl	0x8015298
+ 8021754:	f7f3 fda0 	bl	0x8015298 ;; lcd_ctrl_pin_set(0) - LCD control pins
  8021758:	2000      	movs	r0, #0
- 802175a:	f7fe fb6f 	bl	0x801fe3c
- 802175e:	f7ee f841 	bl	0x800f7e4
- 8021762:	f7ed fd31 	bl	0x800f1c8
- 8021766:	f7ed ffad 	bl	0x800f6c4
- 802176a:	4d54      	ldr	r5, [pc, #336]	@ (0x80218bc)                    ; = 0x2000A8B0 (RAM+0xA8B0)
- 802176c:	4e54      	ldr	r6, [pc, #336]	@ (0x80218c0)                    ; = 0x2000A3B4 (g_rf_state)
- 802176e:	7ee8      	ldrb	r0, [r5, #27]
- 8021770:	f886 0063 	strb.w	r0, [r6, #99]	@ 0x63
- 8021774:	f7ed fc48 	bl	0x800f008
+ 802175a:	f7fe fb6f 	bl	0x801fe3c ;; lcd_parallel_write(0) - init 8080 parallel bus
+ 802175e:	f7ee f841 	bl	0x800f7e4 ;; ---- PHASE 2: EEPROM/FLASH CONFIG LOAD ----
+ 8021762:	f7ed fd31 	bl	0x800f1c8 ;; eeprom_data_validate() - verify EEPROM integrity
+ 8021766:	f7ed ffad 	bl	0x800f6c4 ;; uart_flash_write_verify()
+ 802176a:	4d54      	ldr	r5, [pc, #336]	@ (0x80218bc)                    ; = 0x2000A8B0 (g_comm_state - comm/BT state buffer)
+ 802176c:	4e54      	ldr	r6, [pc, #336]	@ (0x80218c0)                    ; = 0x2000A3B4 (g_rf_state) ;; r6 = g_rf_state base (used throughout)
+ 802176e:	7ee8      	ldrb	r0, [r5, #27] ;; r0 = g_comm_state[27] (BT/comm mode byte)
+ 8021770:	f886 0063 	strb.w	r0, [r6, #99]	@ 0x63 ;; g_rf_state[99] = comm mode (copy to RF state)
+ 8021774:	f7ed fc48 	bl	0x800f008 ;; uart_eeprom_write_cmd() - write config to EEPROM
  8021778:	4852      	ldr	r0, [pc, #328]	@ (0x80218c4)                    ; = 0x2000ADD0 (g_config)
  802177a:	7800      	ldrb	r0, [r0, #0]
- 802177c:	2801      	cmp	r0, #1
+ 802177c:	2801      	cmp	r0, #1 ;; if (g_config[0] == 1) ...
  802177e:	d101      	bne.n	0x8021784
- 8021780:	f7df f82c 	bl	0x80007dc
- 8021784:	f7ed ff3c 	bl	0x800f600
- 8021788:	f7ee fe78 	bl	0x801047c
- 802178c:	f7ee f800 	bl	0x800f790
- 8021790:	220a      	movs	r2, #10
+ 8021780:	f7df f82c 	bl	0x80007dc ;; uart_playback_nop() - state machine progression
+ 8021784:	f7ed ff3c 	bl	0x800f600 ;; eeprom_block_write() - write EEPROM with CRC
+ 8021788:	f7ee fe78 	bl	0x801047c ;; uart_protocol_handler() - UART protocol init
+ 802178c:	f7ee f800 	bl	0x800f790 ;; uart_eeprom_read_cmd() - read EEPROM via UART
+ 8021790:	220a      	movs	r2, #10 ;; ---- PHASE 3: MEMORY + FLASH INIT ----
  8021792:	494d      	ldr	r1, [pc, #308]	@ (0x80218c8)                    ; = 0x2000B05C (RAM+0xB05C)
- 8021794:	0310      	lsls	r0, r2, #12
- 8021796:	f7ff fc71 	bl	0x802107c
- 802179a:	f7ea f8c5 	bl	0x800b928
+ 8021794:	0310      	lsls	r0, r2, #12 ;; r0 = 10 << 12 = 0xA000 (40960 bytes)
+ 8021796:	f7ff fc71 	bl	0x802107c ;; spi_flash_cs_ctrl(0xA000, 0x2000B05C)
+ 802179a:	f7ea f8c5 	bl	0x800b928 ;; flash_init_sequence() - SPI flash setup
  802179e:	20c8      	movs	r0, #200	@ 0xc8
- 80217a0:	f003 faec 	bl	0x8024d7c                                        ; delay_ms
- 80217a4:	f7f8 fc72 	bl	0x801a08c
+ 80217a0:	f003 faec 	bl	0x8024d7c                                        ; delay_ms ;; delay_ms(200) - settle time after flash init
+ 80217a4:	f7f8 fc72 	bl	0x801a08c ;; ---- PHASE 4: AUDIO + RF PATH SETUP ----
  80217a8:	f7f7 fd54 	bl	0x8019254                                        ; spk_mute_on_ptt
- 80217ac:	2004      	movs	r0, #4
- 80217ae:	f7e5 fcb1 	bl	0x8007114
- 80217b2:	f7f8 ff33 	bl	0x801a61c
- 80217b6:	f7e5 f957 	bl	0x8006a68
- 80217ba:	f7e6 fbc9 	bl	0x8007f50
- 80217be:	f7f7 fd49 	bl	0x8019254                                        ; spk_mute_on_ptt
- 80217c2:	2024      	movs	r0, #36	@ 0x24
- 80217c4:	f001 fa6e 	bl	0x8022ca4
- 80217c8:	f7f8 fc60 	bl	0x801a08c
- 80217cc:	7e28      	ldrb	r0, [r5, #24]
- 80217ce:	2400      	movs	r4, #0
- 80217d0:	2802      	cmp	r0, #2
+ 80217ac:	2004      	movs	r0, #4 ;; r0 = 4 (mode/channel param)
+ 80217ae:	f7e5 fcb1 	bl	0x8007114 ;; tick_get(4)
+ 80217b2:	f7f8 ff33 	bl	0x801a61c ;; bk4829_reg_write() - configure RF transceiver
+ 80217b6:	f7e5 f957 	bl	0x8006a68 ;; programming_handler() - load channel programming
+ 80217ba:	f7e6 fbc9 	bl	0x8007f50 ;; uart_flash_transfer() - DSP/audio config from flash
+ 80217be:	f7f7 fd49 	bl	0x8019254                                        ; spk_mute_on_ptt ;; mute again after RF init
+ 80217c2:	2024      	movs	r0, #36	@ 0x24 ;; r0 = 0x24 (config param)
+ 80217c4:	f001 fa6e 	bl	0x8022ca4 ;; uart_byte_send(0x24) - send config byte
+ 80217c8:	f7f8 fc60 	bl	0x801a08c ;; uart_spi_bitbang_init() - finalize SPI bus
+ 80217cc:	7e28      	ldrb	r0, [r5, #24] ;; ---- PHASE 5: BAND MODE VALIDATE ----
+ 80217ce:	2400      	movs	r4, #0 ;; r4 = 0 (used as zero constant throughout)
+ 80217d0:	2802      	cmp	r0, #2 ;; if (band_mode > 2) band_mode = 0
  80217d2:	d900      	bls.n	0x80217d6
- 80217d4:	762c      	strb	r4, [r5, #24]
+ 80217d4:	762c      	strb	r4, [r5, #24] ;; clamp band_mode to 0 (invalid → reset)
  80217d6:	493d      	ldr	r1, [pc, #244]	@ (0x80218cc)                    ; = 0x2000A41C (RAM+0xA41C)
- 80217d8:	7e28      	ldrb	r0, [r5, #24]
- 80217da:	f881 00fa 	strb.w	r0, [r1, #250]	@ 0xfa
+ 80217d8:	7e28      	ldrb	r0, [r5, #24] ;; re-read validated band_mode
+ 80217da:	f881 00fa 	strb.w	r0, [r1, #250]	@ 0xfa ;; g_channel_state[250] = band_mode
  80217de:	483c      	ldr	r0, [pc, #240]	@ (0x80218d0)                    ; = 0x2000B066 (RAM+0xB066)
- 80217e0:	7444      	strb	r4, [r0, #17]
- 80217e2:	f7ee f84d 	bl	0x800f880
- 80217e6:	f7e6 ff59 	bl	0x800869c
- 80217ea:	f7e5 fa8b 	bl	0x8006d04
- 80217ee:	4f39      	ldr	r7, [pc, #228]	@ (0x80218d4)                    ; = 0x40011800 (GPIOE)
- 80217f0:	2108      	movs	r1, #8
+ 80217e0:	7444      	strb	r4, [r0, #17] ;; RAM[0x2000B077] = 0 (clear comm flag)
+ 80217e2:	f7ee f84d 	bl	0x800f880 ;; uart_flash_read_cmd() - read flash config
+ 80217e6:	f7e6 ff59 	bl	0x800869c ;; flash_display_sync() - sync display state
+ 80217ea:	f7e5 fa8b 	bl	0x8006d04 ;; uart_spi_flash_cmd() - SPI flash command
+ 80217ee:	4f39      	ldr	r7, [pc, #228]	@ (0x80218d4)                    ; = 0x40011800 (GPIOE) ;; ---- PHASE 6: PTT BUTTON CHECK ----
+ 80217f0:	2108      	movs	r1, #8 ;; bit 3 → PE3 (PTT1 button)
  80217f2:	4638      	mov	r0, r7
  80217f4:	f7f0 fed1 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOE -> PE3/PTT1
- 80217f8:	b940      	cbnz	r0, 0x802180c
- 80217fa:	2104      	movs	r1, #4
+ 80217f8:	b940      	cbnz	r0, 0x802180c ;; if PTT1 pressed → skip to PTT recheck
+ 80217fa:	2104      	movs	r1, #4 ;; bit 2 → PE2 (PTT2 button)
  80217fc:	4638      	mov	r0, r7
  80217fe:	f7f0 fecc 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOE -> PE2/PTT2
- 8021802:	b918      	cbnz	r0, 0x802180c
- 8021804:	f7f1 fbf8 	bl	0x8012ff8
- 8021808:	2814      	cmp	r0, #20
+ 8021802:	b918      	cbnz	r0, 0x802180c ;; if PTT2 pressed → skip to PTT recheck
+ 8021804:	f7f1 fbf8 	bl	0x8012ff8 ;; gpio_output_control() - keypad scan tick
+ 8021808:	2814      	cmp	r0, #20 ;; if scan result == 20 → set TX mode 0
  802180a:	d005      	beq.n	0x8021818
  802180c:	2108      	movs	r1, #8
  802180e:	4638      	mov	r0, r7
  8021810:	f7f0 fec3 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOE -> PE3/PTT1
- 8021814:	b120      	cbz	r0, 0x8021820
- 8021816:	e00f      	b.n	0x8021838
- 8021818:	2000      	movs	r0, #0
- 802181a:	f7e6 fac7 	bl	0x8007dac
+ 8021814:	b120      	cbz	r0, 0x8021820 ;; if PE3 NOT pressed → check PE2
+ 8021816:	e00f      	b.n	0x8021838 ;; PTT1 active → skip to post-PTT
+ 8021818:	2000      	movs	r0, #0 ;; -- TIMEOUT PATH: no PTT --
+ 802181a:	f7e6 fac7 	bl	0x8007dac ;; channel_memory_handler(0) - set TX mode 0
  802181e:	e00b      	b.n	0x8021838
  8021820:	2104      	movs	r1, #4
  8021822:	4638      	mov	r0, r7
  8021824:	f7f0 feb9 	bl	0x801259a                                        ; gpio_input_data_bit_read ;; READ GPIOE -> PE2/PTT2
- 8021828:	b930      	cbnz	r0, 0x8021838
+ 8021828:	b930      	cbnz	r0, 0x8021838 ;; if PE2 pressed → PTT2 active
  802182a:	f7f1 fbe5 	bl	0x8012ff8
- 802182e:	280c      	cmp	r0, #12
+ 802182e:	280c      	cmp	r0, #12 ;; if scan result == 12 → set TX mode 1
  8021830:	d102      	bne.n	0x8021838
  8021832:	2001      	movs	r0, #1
- 8021834:	f7e6 faba 	bl	0x8007dac
- 8021838:	f7f6 ff5e 	bl	0x80186f8
+ 8021834:	f7e6 faba 	bl	0x8007dac ;; channel_memory_handler(1) - set TX mode 1
+ 8021838:	f7f6 ff5e 	bl	0x80186f8 ;; ---- PHASE 7: RF TIMING + STATE CLEAR ----
  802183c:	4826      	ldr	r0, [pc, #152]	@ (0x80218d8)                    ; = 0x2000A8D0 (RAM+0xA8D0)
- 802183e:	210f      	movs	r1, #15
- 8021840:	7900      	ldrb	r0, [r0, #4]
- 8021842:	fbb0 f2f1 	udiv	r2, r0, r1
- 8021846:	fb01 0012 	mls	r0, r1, r2, r0
- 802184a:	1c40      	adds	r0, r0, #1
- 802184c:	21c8      	movs	r1, #200	@ 0xc8
- 802184e:	4348      	muls	r0, r1
+ 802183e:	210f      	movs	r1, #15 ;; divisor for modulo
+ 8021840:	7900      	ldrb	r0, [r0, #4] ;; r0 = RAM[0x2000A8D4] (timing seed byte)
+ 8021842:	fbb0 f2f1 	udiv	r2, r0, r1 ;; r2 = r0 / 15
+ 8021846:	fb01 0012 	mls	r0, r1, r2, r0 ;; r0 = r0 % 15 (remainder)
+ 802184a:	1c40      	adds	r0, r0, #1 ;; r0 = (r0 % 15) + 1 → range [1..15]
+ 802184c:	21c8      	movs	r1, #200	@ 0xc8 ;; r1 = 200 µs multiplier
+ 802184e:	4348      	muls	r0, r1 ;; delay = [200..3000] µs (RF settling)
  8021850:	f7e9 f879 	bl	0x800a946                                        ; delay_us_maybe
- 8021854:	2000      	movs	r0, #0
- 8021856:	f7e8 fad5 	bl	0x8009e04
- 802185a:	f7e9 fe9d 	bl	0x800b598
- 802185e:	f7f7 fe8b 	bl	0x8019578
+ 8021854:	2000      	movs	r0, #0 ;; ---- PHASE 8: STATE BUFFERS CLEAR ----
+ 8021856:	f7e8 fad5 	bl	0x8009e04 ;; display_text_format(0) - reset display state
+ 802185a:	f7e9 fe9d 	bl	0x800b598 ;; channel_data_read() - load active channel
+ 802185e:	f7f7 fe8b 	bl	0x8019578 ;; uart_comm_settings_clear() - clear comm state
  8021862:	481e      	ldr	r0, [pc, #120]	@ (0x80218dc)                    ; = 0x2000022E (RAM+0x22E)
- 8021864:	7004      	strb	r4, [r0, #0]
- 8021866:	8374      	strh	r4, [r6, #26]
- 8021868:	f7f9 fa28 	bl	0x801acbc
- 802186c:	f7f2 fd90 	bl	0x8014390
- 8021870:	f7f9 f9c0 	bl	0x801abf4
+ 8021864:	7004      	strb	r4, [r0, #0] ;; RAM[0x2000022E] = 0 (clear status flag)
+ 8021866:	8374      	strh	r4, [r6, #26] ;; g_rf_state[26] = 0 (clear RF state halfword)
+ 8021868:	f7f9 fa28 	bl	0x801acbc ;; rf_flag_read() - read RF flags
+ 802186c:	f7f2 fd90 	bl	0x8014390 ;; display_color_set() - set display colors
+ 8021870:	f7f9 f9c0 	bl	0x801abf4 ;; rf_state_clear() - reset RF state machine
  8021874:	481a      	ldr	r0, [pc, #104]	@ (0x80218e0)                    ; = 0x2000A2D4 (RAM+0xA2D4)
  8021876:	6004      	str	r4, [r0, #0]
  8021878:	6044      	str	r4, [r0, #4]
@@ -47548,32 +50112,32 @@
  8021880:	6044      	str	r4, [r0, #4]
  8021882:	6084      	str	r4, [r0, #8]
  8021884:	60c4      	str	r4, [r0, #12]
- 8021886:	f7f2 fba1 	bl	0x8013fcc
- 802188a:	f886 4047 	strb.w	r4, [r6, #71]	@ 0x47
- 802188e:	7f68      	ldrb	r0, [r5, #29]
- 8021890:	28ff      	cmp	r0, #255	@ 0xff
+ 8021886:	f7f2 fba1 	bl	0x8013fcc ;; usart3_audio_init() - USART3 audio interface
+ 802188a:	f886 4047 	strb.w	r4, [r6, #71]	@ 0x47 ;; ---- PHASE 9: STATUS LED (PB9) ----
+ 802188e:	7f68      	ldrb	r0, [r5, #29] ;; r0 = g_comm_state[29] (LED/BT mode byte)
+ 8021890:	28ff      	cmp	r0, #255	@ 0xff ;; if mode == 0xFF → invalid, reset to 0
  8021892:	d100      	bne.n	0x8021896
  8021894:	776c      	strb	r4, [r5, #29]
- 8021896:	7f6a      	ldrb	r2, [r5, #29]
- 8021898:	4d13      	ldr	r5, [pc, #76]	@ (0x80218e8)                     ; = 0x40010C00 (GPIOB)
- 802189a:	f44f 7400 	mov.w	r4, #512	@ 0x200
- 802189e:	b13a      	cbz	r2, 0x80218b0
- 80218a0:	f7e5 fe24 	bl	0x80074ec
+ 8021896:	7f6a      	ldrb	r2, [r5, #29] ;; r2 = validated LED mode
+ 8021898:	4d13      	ldr	r5, [pc, #76]	@ (0x80218e8)                     ; = 0x40010C00 (GPIOB)  ;; r5 = GPIOB base
+ 802189a:	f44f 7400 	mov.w	r4, #512	@ 0x200 ;; r4 = 0x200 = bit 9 → PB9 (status LED)
+ 802189e:	b13a      	cbz	r2, 0x80218b0 ;; if mode == 0 → LED OFF path
+ 80218a0:	f7e5 fe24 	bl	0x80074ec ;; usart1_hw_init() - re-init USART1 (BT active)
  80218a4:	4621      	mov	r1, r4
  80218a6:	4628      	mov	r0, r5
  80218a8:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 80218ac:	f7f0 be81 	b.w	0x80125b2                                       ; -> gpio_bits_set
+ 80218ac:	f7f0 be81 	b.w	0x80125b2                                       ; -> gpio_bits_set ;; TAIL: PB9=HIGH → LED ON (BT active)
  80218b0:	4621      	mov	r1, r4
  80218b2:	4628      	mov	r0, r5
  80218b4:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
- 80218b8:	f7f0 be79 	b.w	0x80125ae                                       ; -> gpio_bits_reset
+ 80218b8:	f7f0 be79 	b.w	0x80125ae                                       ; -> gpio_bits_reset ;; TAIL: PB9=LOW → LED OFF
 
-; ─── DATA @ 0x080218BC ────────────────────────────────────────────
+; --- DATA @ 0x080218BC --------------------------------------------
   0x080218B0: 21 46 28 46 BD E8 F0 41 F0 F7 79 BE B0 A8 00 20  |!F(F...A..y.... | [+12] 0x2000A8B0=RAM+0xA8B0
   0x080218C0: B4 A3 00 20 D0 AD 00 20 5C B0 00 20 1C A4 00 20  |... ... \.. ... | [+0] 0x2000A3B4=g_rf_state; [+4] 0x2000ADD0=g_config; [+8] 0x2000B05C=RAM+0xB05C; [+12] 0x2000A41C=RAM+0xA41C
   0x080218D0: 66 B0 00 20 00 18 01 40 D0 A8 00 20 2E 02 00 20  |f.. ...@... ... | [+0] 0x2000B066=RAM+0xB066; [+4] 0x40011800=GPIOE; [+8] 0x2000A8D0=RAM+0xA8D0; [+12] 0x2000022E=RAM+0x22E
   0x080218E0: D4 A2 00 20 90 B0 00 20 00 0C 01 40 10 B5 04 46  |... ... ...@...F| [+0] 0x2000A2D4=RAM+0xA2D4; [+4] 0x2000B090=RAM+0xB090; [+8] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  tx_debug_info                                                        ║
@@ -47610,10 +50174,10 @@
  8021928:	f7fd ff18 	bl	0x801f75c
  802192c:	e7ed      	b.n	0x802190a
 
-; ─── DATA @ 0x0802192E ────────────────────────────────────────────
+; --- DATA @ 0x0802192E --------------------------------------------
   0x08021920: FD F7 66 FF F1 E7 20 46 FD F7 18 FF ED E7 00 00  |..f... F........|
   0x08021930: 5D 02 00 20 2C B1 00 20 10 B5 01 23 8B 40 04 8C  |].. ,.. ...#.@..| [+0] 0x2000025D=RAM+0x25D; [+4] 0x2000B12C=RAM+0xB12C
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  reg_halfword_bit_modify                                                        ║
@@ -47829,12 +50393,12 @@
  8021b06:	f7f8 ba13 	b.w	0x8019f30
  8021b0a:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x08021B0C ────────────────────────────────────────────
+; --- DATA @ 0x08021B0C --------------------------------------------
   0x08021B00: BD E8 10 40 00 21 F8 F7 13 BA 10 BD 00 2C 01 40  |...@.!.......,.@| [+12] 0x40012C00=TIM1
   0x08021B10: 00 04 00 40 00 08 00 40 00 0C 00 40 00 10 00 40  |...@...@...@...@| [+0] 0x40000400=TIM3; [+4] 0x40000800=TIM4; [+8] 0x40000C00=TIM5; [+12] 0x40001000=TIM6
   0x08021B20: 00 14 00 40 00 34 01 40 00 4C 01 40 00 50 01 40  |...@.4.@.L.@.P.@| [+0] 0x40001400=TIM7; [+8] 0x40014C00=TIM8
   0x08021B30: 00 54 01 40 82 88 22 F0 70 02 82 80 82 88 0A 43  |.T.@..".p......C|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  tim_config_clkdiv                                                   ║
@@ -47899,7 +50463,7 @@
  8021b90:	8281      	strh	r1, [r0, #20]
  8021b92:	4770      	bx	lr
 
-; ─── DATA @ 0x08021B94 ────────────────────────────────────────────
+; --- DATA @ 0x08021B94 --------------------------------------------
   0x08021B90: 81 82 70 47 00 2C 01 40 00 08 00 40 00 0C 00 40  |..pG.,.@...@...@| [+4] 0x40012C00=TIM1; [+8] 0x40000800=TIM4; [+12] 0x40000C00=TIM5
   0x08021BA0: 00 34 01 40 00 04 00 40 2D E9 F0 4F 87 B0 F9 F7  |.4.@...@-..O....| [+4] 0x40000400=TIM3
   0x08021BB0: DB FA AA 4C AA 4D AB 4E 20 79 DF F8 AC A2 DF F8  |...L.M.N y......|
@@ -47966,38 +50530,72 @@
   0x08021F80: A0 86 01 00 99 26 03 00 07 48 40 78 01 28 0A D1  |.....&...H@x.(..|
   0x08021F90: 06 49 88 78 00 28 06 D0 48 78 00 28 03 D1 88 70  |.I.x.(..Hx.(...p|
   0x08021FA0: 08 70 E9 F7 9D BA 70 47 D0 AD 00 20 88 0C 01 20  |.p....pG... ... | [+8] 0x2000ADD0=g_config; [+12] 0x20010C88=RAM+0x10C88
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_dma_display_update                                                        ║
 ; ║  0x08021FB0  size=76                                            ║
 ; ║  Called by: audio_dma_dispatch                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_dma_display_update  [AUDIO/DISPLAY] - Updates display from audio DMA - called by audio_dma_dispatch
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_dma_display_update(void)                       │
+; │                                                                     │
+; │ Updates display refresh flags based on RF mode and audio state.    │
+; │ Called by audio_dma_dispatch (state 2). No hardware register       │
+; │ writes - purely flag management in g_rf_state and g_display.       │
+; │                                                                     │
+; │   if (g_display[0x27] == 0) return;    // display not ready        │
+; │   if (g_rf_state[1] == 11) return;     // skip in monitor mode     │
+; │   if (g_rf_state[0x64] == 1) { set flag 0x66=25; return; }       │
+; │   if (g_rf_state[0] == 1)   { set flag 0x66=25; return; }        │
+; │   if (g_rf_state[0x1E] == 1) { set flag 0x66=25; return; }       │
+; │   if (g_rf_state[0x66] != 0) return;                              │
+; │   g_rf_state[0x65] = 1;               // trigger display update   │
+; │   tail-call → bk4829_spi_write_dispatch();                        │
+; └---------------------------------------------------------------------┘
+; * audio_dma_display_update  [AUDIO/DISPLAY] - Display flag sync from audio DMA state
+; -- audio_dma_display_update --------------------------------------------
+; DMA-to-display synchronization gate (76B). Conditionally triggers a
+; display refresh based on g_rf_state fields. Called from audio DMA path.
+;
+; Guard checks (any true → skip/block):
+;   1. g_config[0x27] == 0 → EQ not enabled, skip all
+;   2. g_rf_state[1] == 11 → mode 11 active, skip
+;   3. g_rf_state[0x64] == 1 → display already pending, set block flag
+;   4. g_rf_state[0] == 1 → main RF busy, set block flag
+;   5. g_rf_state[0x1E] == 1 → sub-mode busy, set block flag
+;   6. g_rf_state[0x66] != 0 → display blocked, skip
+;
+; If all guards pass:
+;   g_rf_state[0x65] = 1 (trigger display update)
+;   TAIL-CALL → bk4829_spi_write_dispatch (refresh RF display data)
+;
+; Block flag: g_rf_state[0x66] = 25 (0x19) = display-busy counter
+; ------------------------------------------------------------------------
  8021fb0:	4812      	ldr	r0, [pc, #72]	@ (0x8021ffc)                     ; = 0x2000A8D0 (RAM+0xA8D0)
- 8021fb2:	f890 0027 	ldrb.w	r0, [r0, #39]	@ 0x27
+ 8021fb2:	f890 0027 	ldrb.w	r0, [r0, #39] ;; g_config[0x27] = EQ enable flag	@ 0x27
  8021fb6:	2800      	cmp	r0, #0
  8021fb8:	d019      	beq.n	0x8021fee
  8021fba:	4811      	ldr	r0, [pc, #68]	@ (0x8022000)                     ; = 0x2000A3B4 (g_rf_state)
  8021fbc:	7841      	ldrb	r1, [r0, #1]
- 8021fbe:	290b      	cmp	r1, #11
+ 8021fbe:	290b      	cmp	r1, #11 ;; guard: mode 11 (rf_status_query) active?
  8021fc0:	d015      	beq.n	0x8021fee
- 8021fc2:	f890 2064 	ldrb.w	r2, [r0, #100]	@ 0x64
- 8021fc6:	2119      	movs	r1, #25
+ 8021fc2:	f890 2064 	ldrb.w	r2, [r0, #100] ;; g_rf_state[0x64] = display pending	@ 0x64
+ 8021fc6:	2119      	movs	r1, #25 ;; block counter = 25 (display-busy)
  8021fc8:	2a01      	cmp	r2, #1
  8021fca:	d00e      	beq.n	0x8021fea
- 8021fcc:	7802      	ldrb	r2, [r0, #0]
+ 8021fcc:	7802      	ldrb	r2, [r0, #0] ;; g_rf_state[0] = main RF state
  8021fce:	2a01      	cmp	r2, #1
  8021fd0:	d00e      	beq.n	0x8021ff0
- 8021fd2:	7f82      	ldrb	r2, [r0, #30]
+ 8021fd2:	7f82      	ldrb	r2, [r0, #30] ;; g_rf_state[0x1E] = sub-mode flag
  8021fd4:	2a01      	cmp	r2, #1
  8021fd6:	d00e      	beq.n	0x8021ff6
- 8021fd8:	f890 1066 	ldrb.w	r1, [r0, #102]	@ 0x66
+ 8021fd8:	f890 1066 	ldrb.w	r1, [r0, #102] ;; g_rf_state[0x66] = display block	@ 0x66
  8021fdc:	2900      	cmp	r1, #0
  8021fde:	d106      	bne.n	0x8021fee
  8021fe0:	2101      	movs	r1, #1
- 8021fe2:	f880 1065 	strb.w	r1, [r0, #101]	@ 0x65
- 8021fe6:	f7fa b8fd 	b.w	0x801c1e4
+ 8021fe2:	f880 1065 	strb.w	r1, [r0, #101] ;; g_rf_state[0x65] = 1 → trigger refresh	@ 0x65
+ 8021fe6:	f7fa b8fd 	b.w	0x801c1e4 ;; TAIL-CALL bk4829_spi_write_dispatch
  8021fea:	f880 1066 	strb.w	r1, [r0, #102]	@ 0x66
  8021fee:	4770      	bx	lr
  8021ff0:	f880 1066 	strb.w	r1, [r0, #102]	@ 0x66
@@ -48005,21 +50603,40 @@
  8021ff6:	f880 1066 	strb.w	r1, [r0, #102]	@ 0x66
  8021ffa:	4770      	bx	lr
 
-; ─── DATA @ 0x08021FFC ────────────────────────────────────────────
+; --- DATA @ 0x08021FFC --------------------------------------------
   0x08021FF0: 80 F8 66 10 70 47 80 F8 66 10 70 47 D0 A8 00 20  |..f.pG..f.pG... | [+12] 0x2000A8D0=RAM+0xA8D0
   0x08022000: B4 A3 00 20 10 B5 0C 48 40 78 15 28 12 D1 FF 20  |... ...H@x.(... | [+0] 0x2000A3B4=g_rf_state
   0x08022010: FE F7 80 FD 09 48 0A 4C 02 7A 21 79 82 38 FE F7  |.....H.L.z!y.8..|
   0x08022020: B3 F9 20 79 40 1C C0 B2 05 21 B0 FB F1 F2 01 FB  |.. y@....!......|
   0x08022030: 12 00 20 71 10 BD 00 00 B4 A3 00 20 FC E4 00 20  |.. q....... ... | [+8] 0x2000A3B4=g_rf_state; [+12] 0x2000E4FC=RAM+0xE4FC
   0x08022040: 34 02 00 20 12 48 90 F8 26 00 00 28 1E D0 11 49  |4.. .H..&..(...I| [+0] 0x20000234=RAM+0x234
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_dma_lcd_sync                                                        ║
 ; ║  0x08022044  size=74                                            ║
 ; ║  Called by: audio_dma_dispatch                                              ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_dma_lcd_sync  [AUDIO] - Audio DMA LCD sync - 74B, ←audio_dma_dispatch, ->lcd_ctrl_pin_set
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_dma_lcd_sync(void)                             │
+; │                                                                     │
+; │ LCD refresh synchronization from audio DMA timing. Uses audio DMA  │
+; │ rate as timebase for LCD update scheduling.                        │
+; │ Called by audio_dma_dispatch (state 7).                            │
+; │                                                                     │
+; │   if (g_display[0x26] == 0) return;      // LCD sync disabled     │
+; │   if (g_rf_state[0x4C] == 0) return;     // no pending update     │
+; │   if (g_rf_state[0] == 1) return;        // active flag set       │
+; │   if (g_rf_state[0x14] == 4) return;     // special mode          │
+; │   // ... additional state checks ...                               │
+; │   counter = g_phase[2];                   // @ 0x20000236          │
+; │   if (++counter >= 500) {                 // ~500 DMA cycles      │
+; │       counter = 0;                                                  │
+; │       lcd_ctrl_pin_set();                 // trigger LCD refresh   │
+; │   }                                                                 │
+; │   g_phase[2] = counter;                                            │
+; └---------------------------------------------------------------------┘
+; * audio_dma_lcd_sync  [AUDIO/LCD] - LCD refresh sync from DMA timing (500-cycle interval)
  8022044:	4812      	ldr	r0, [pc, #72]	@ (0x8022090)                     ; = 0x2000A8D0 (RAM+0xA8D0)
  8022046:	f890 0026 	ldrb.w	r0, [r0, #38]	@ 0x26
  802204a:	2800      	cmp	r0, #0
@@ -48050,11 +50667,11 @@
  8022088:	f7f3 b906 	b.w	0x8015298
  802208c:	4770      	bx	lr
 
-; ─── DATA @ 0x0802208E ────────────────────────────────────────────
+; --- DATA @ 0x0802208E --------------------------------------------
   0x08022080: 01 20 F3 F7 09 B9 00 20 F3 F7 06 B9 70 47 00 00  |. ..... ....pG..| [+4] 0x2000B909=RAM+0xB909
   0x08022090: D0 A8 00 20 B4 A3 00 20 02 49 01 20 08 61 E7 F7  |... ... .I. .a..| [+0] 0x2000A8D0=RAM+0xA8D0; [+4] 0x2000A3B4=g_rf_state; [+8] 0x20014902=RAM+0x14902
   0x080220A0: AD BC 00 00 EC A2 00 20 70 B5 1E 4D 28 78 02 28  |....... p..M(x.(| [+4] 0x2000A2EC=RAM+0xA2EC
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lcd_bk4829_init_seq                                                        ║
@@ -48113,10 +50730,10 @@
  802211e:	2001      	movs	r0, #1
  8022120:	bd70      	pop	{r4, r5, r6, pc}
 
-; ─── DATA @ 0x08022122 ────────────────────────────────────────────
+; --- DATA @ 0x08022122 --------------------------------------------
   0x08022120: 70 BD 00 00 B4 A3 00 20 B0 A8 00 20 24 02 00 20  |p...... ... $.. | [+4] 0x2000A3B4=g_rf_state; [+8] 0x2000A8B0=RAM+0xA8B0; [+12] 0x20000224=RAM+0x224
   0x08022130: 1C A4 00 20 2D E9 F0 41 06 46 0D 46 14 46 28 46  |... -..A.F.F.F(F| [+0] 0x2000A41C=RAM+0xA41C
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  string_buffer_copy                                                        ║
@@ -48184,10 +50801,10 @@
  80221b8:	4803      	ldr	r0, [pc, #12]	@ (0x80221c8)                     ; = 0x40010C00 (GPIOB)
  80221ba:	f7f0 b9fa 	b.w	0x80125b2                                       ; -> gpio_bits_set
 
-; ─── DATA @ 0x080221BE ────────────────────────────────────────────
+; --- DATA @ 0x080221BE --------------------------------------------
   0x080221B0: BD E8 10 40 4F F4 80 71 03 48 F0 F7 FA B9 00 00  |...@O..q.H......|
   0x080221C0: B4 A3 00 20 B0 A8 00 20 00 0C 01 40 10 B5 FD F7  |... ... ...@....| [+0] 0x2000A3B4=g_rf_state; [+4] 0x2000A8B0=RAM+0xA8B0; [+8] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_dma_init                                                        ║
@@ -48210,9 +50827,9 @@
  80221ec:	7020      	strb	r0, [r4, #0]
  80221ee:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x080221F0 ────────────────────────────────────────────
+; --- DATA @ 0x080221F0 --------------------------------------------
   0x080221F0: B4 A3 00 20 10 B5 F8 F7 FD FC EB F7 23 FA 24 4C  |... ........#.$L| [+0] 0x2000A3B4=g_rf_state
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_cal_state_update                                                        ║
@@ -48273,12 +50890,12 @@
  802228c:	2001      	movs	r0, #1
  802228e:	e7cf      	b.n	0x8022230
 
-; ─── DATA @ 0x08022290 ────────────────────────────────────────────
+; --- DATA @ 0x08022290 --------------------------------------------
   0x08022290: 1C A4 00 20 10 B5 08 4C 40 F2 25 51 20 46 00 F0  |... ...L@.%Q F..| [+0] 0x2000A41C=RAM+0xA41C
   0x080222A0: 3F F8 00 28 07 D0 20 46 00 F0 0E F9 BD E8 10 40  |?..(.. F.......@|
   0x080222B0: C0 B2 E7 F7 3B B9 10 BD 00 4C 00 40 E5 F7 78 B9  |....;....L.@..x.| [+8] 0x40004C00=UART4
   0x080222C0: 70 47 00 F0 4D B8 00 00 70 B5 0D 4D A8 68 01 28  |pG..M...p..M.h.(|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  bt_protocol_handler                                                        ║
@@ -48364,13 +50981,13 @@
  802235c:	4013      	ands	r3, r2
  802235e:	e7f0      	b.n	0x8022342
 
-; ─── DATA @ 0x08022360 ────────────────────────────────────────────
+; --- DATA @ 0x08022360 --------------------------------------------
   0x08022360: 10 B5 10 4C 40 F2 25 51 20 46 FF F7 D9 FF 00 28  |...L@.%Q F.....(|
   0x08022370: 16 D0 20 46 00 F0 A8 F8 C1 B2 0B 48 82 68 00 2A  |.. F.......H.h.*|
   0x08022380: 0E D1 0A 4A 52 78 01 2A 0A D1 03 68 00 F1 0C 02  |...JRx.*...h....|
   0x08022390: 99 54 01 68 49 1C C1 F3 08 01 01 60 00 21 41 60  |.T.hI......`.!A`|
   0x080223A0: 10 BD 00 00 00 48 00 40 7C 0A 01 20 D0 AD 00 20  |.....H.@|.. ... | [+4] 0x40004800=USART3; [+8] 0x20010A7C=RAM+0x10A7C; [+12] 0x2000ADD0=g_config
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_scan_uart_config                                                        ║
@@ -48394,9 +51011,9 @@
  80223cc:	6081      	str	r1, [r0, #8]
  80223ce:	4770      	bx	lr
 
-; ─── DATA @ 0x080223D0 ────────────────────────────────────────────
+; --- DATA @ 0x080223D0 --------------------------------------------
   0x080223D0: 7C 0A 01 20 10 B5 40 F6 6A 13 C1 F3 42 13 01 F0  ||.. ..@.j...B...| [+0] 0x20010A7C=RAM+0x10A7C
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_status_clear                                                        ║
@@ -48429,9 +51046,9 @@
  8022406:	6002      	str	r2, [r0, #0]
  8022408:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x0802240A ────────────────────────────────────────────
+; --- DATA @ 0x0802240A --------------------------------------------
   0x08022400: F6 E7 02 68 8A 43 02 60 10 BD 00 00 30 B5 85 B0  |...h.C.`....0...|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  usart1_config                                                        ║
@@ -48512,9 +51129,9 @@
  80224be:	b005      	add	sp, #20
  80224c0:	bd30      	pop	{r4, r5, pc}
 
-; ─── DATA @ 0x080224C2 ────────────────────────────────────────────
+; --- DATA @ 0x080224C2 --------------------------------------------
   0x080224C0: 30 BD 00 00 00 38 01 40 80 88 C0 F3 08 00 70 47  |0....8.@......pG| [+4] 0x40013800=USART1
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  usart_flag_read                                                        ║
@@ -48622,11 +51239,11 @@
  80225ae:	f7f7 bca3 	b.w	0x8019ef8
  80225b2:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x080225B4 ────────────────────────────────────────────
+; --- DATA @ 0x080225B4 --------------------------------------------
   0x080225B0: A3 BC 10 BD 00 38 01 40 00 44 00 40 00 48 00 40  |.....8.@.D.@.H.@| [+4] 0x40013800=USART1; [+8] 0x40004400=USART2; [+12] 0x40004800=USART3
   0x080225C0: 00 4C 00 40 00 50 00 40 00 60 01 40 00 64 01 40  |.L.@.P.@.`.@.d.@| [+0] 0x40004C00=UART4; [+4] 0x40005000=UART5
   0x080225D0: 00 68 01 40 4F F4 16 51 01 60 00 21 81 80 C1 80  |.h.@O..Q.`.!....|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_irq_config                                                        ║
@@ -48681,9 +51298,9 @@
  8022616:	d3f9      	bcc.n	0x802260c
  8022618:	bd70      	pop	{r4, r5, r6, pc}
 
-; ─── DATA @ 0x0802261A ────────────────────────────────────────────
+; --- DATA @ 0x0802261A --------------------------------------------
   0x08022610: FF FA 64 1C B4 42 F9 D3 70 BD 00 00 70 B5 04 46  |..d..B..p...p..F|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  peripheral_clock_enable                                                        ║
@@ -48734,9 +51351,9 @@
  8022678:	60ca      	str	r2, [r1, #12]
  802267a:	e7d3      	b.n	0x8022624
 
-; ─── DATA @ 0x0802267C ────────────────────────────────────────────
+; --- DATA @ 0x0802267C --------------------------------------------
   0x08022670: 81 01 C8 60 D6 E7 52 1C CA 60 D3 E7 E0 E5 00 20  |...`..R..`..... | [+12] 0x2000E5E0=RAM+0xE5E0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_pos_and_params                                                        ║
@@ -48774,10 +51391,10 @@
  80226c6:	e8bd 40fe 	ldmia.w	sp!, {r1, r2, r3, r4, r5, r6, r7, lr}
  80226ca:	f7f2 bc53 	b.w	0x8014f74
 
-; ─── DATA @ 0x080226CE ────────────────────────────────────────────
+; --- DATA @ 0x080226CE --------------------------------------------
   0x080226C0: 0E 21 F2 F7 79 F9 BD E8 FE 40 F2 F7 53 BC 00 00  |.!..y....@..S...|
   0x080226D0: 49 AE 00 20 FE E7 00 00 38 B5 68 46 EF F7 6B FF  |I.. ....8.hF..k.| [+0] 0x2000AE49=RAM+0xAE49
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_gpio_backlight                                                        ║
@@ -48804,9 +51421,9 @@
  8022702:	f7ef ff54 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOB -> 0x0400
  8022706:	bd38      	pop	{r3, r4, r5, pc}
 
-; ─── DATA @ 0x08022708 ────────────────────────────────────────────
+; --- DATA @ 0x08022708 --------------------------------------------
   0x08022700: 28 46 EF F7 54 FF 38 BD 00 0C 01 40 08 B5 68 46  |(F..T.8....@..hF| [+8] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  tmr_gpio_config                                                        ║
@@ -48829,9 +51446,9 @@
  802272c:	f7ef fcb8 	bl	0x80120a0
  8022730:	bd08      	pop	{r3, pc}
 
-; ─── DATA @ 0x08022732 ────────────────────────────────────────────
+; --- DATA @ 0x08022732 --------------------------------------------
   0x08022730: 08 BD 00 00 00 0C 01 40 10 B5 86 B0 05 A8 EF F7  |.......@........| [+4] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  gpio_uart4_adc_init                                                        ║
@@ -48846,46 +51463,49 @@
 ;; UART4 is our debug UART in custom firmware
 ;; ═══════════════════════════════════════════════════════════════════
  8022738:	b510      	push	{r4, lr}
- 802273a:	b086      	sub	sp, #24
+ 802273a:	b086      	sub	sp, #24 ;; alloc gpio + uart structs
  802273c:	a805      	add	r0, sp, #20
- 802273e:	f7ef ff3a 	bl	0x80125b6
- 8022742:	2002      	movs	r0, #2
- 8022744:	f88d 0016 	strb.w	r0, [sp, #22]
- 8022748:	0280      	lsls	r0, r0, #10
- 802274a:	f8ad 0014 	strh.w	r0, [sp, #20]
- 802274e:	2048      	movs	r0, #72	@ 0x48
- 8022750:	f88d 0017 	strb.w	r0, [sp, #23]
+ 802273e:	f7ef ff3a 	bl	0x80125b6 ;; gpio_init_struct(defaults)
+;; --- PC11 pin config (UART4_RX, floating input) ---
+ 8022742:	2002      	movs	r0, #2 ;; mode = AF_PP
+ 8022744:	f88d 0016 	strb.w	r0, [sp, #22] ;; struct.mode = AF_PP (alternate function)
+ 8022748:	0280      	lsls	r0, r0, #10 ;; r0 = 2<<10 = 0x800 = GPIO_PIN_11 (PC11)
+ 802274a:	f8ad 0014 	strh.w	r0, [sp, #20] ;; struct.pin = PC11 (UART4_RX)
+ 802274e:	2048      	movs	r0, #72	@ 0x48 ;; 0x48 = floating input
+ 8022750:	f88d 0017 	strb.w	r0, [sp, #23] ;; struct.speed = floating input
  8022754:	a905      	add	r1, sp, #20
  8022756:	4813      	ldr	r0, [pc, #76]	@ (0x80227a4)                     ; = 0x40011000 (GPIOC)
- 8022758:	f7ef fca2 	bl	0x80120a0
+ 8022758:	f7ef fca2 	bl	0x80120a0 ;; gpio_af_config(GPIOC, {PC11, AF, float})
+;; --- UART4 config: 115200 baud, 8N1, TX+RX ---
  802275c:	a801      	add	r0, sp, #4
- 802275e:	f7ff ff39 	bl	0x80225d4
- 8022762:	f44f 30e1 	mov.w	r0, #115200	@ 0x1c200
- 8022766:	9001      	str	r0, [sp, #4]
+ 802275e:	f7ff ff39 	bl	0x80225d4 ;; usart_init_struct(defaults)
+ 8022762:	f44f 30e1 	mov.w	r0, #115200	@ 0x1c200 ;; baudrate = 115200
+ 8022766:	9001      	str	r0, [sp, #4] ;; struct.baud = 115200
  8022768:	2000      	movs	r0, #0
- 802276a:	f8ad 0008 	strh.w	r0, [sp, #8]
- 802276e:	f8ad 000a 	strh.w	r0, [sp, #10]
- 8022772:	f8ad 000c 	strh.w	r0, [sp, #12]
- 8022776:	f8ad 0010 	strh.w	r0, [sp, #16]
- 802277a:	200c      	movs	r0, #12
- 802277c:	f8ad 000e 	strh.w	r0, [sp, #14]
+ 802276a:	f8ad 0008 	strh.w	r0, [sp, #8] ;; word_len = 8 bit
+ 802276e:	f8ad 000a 	strh.w	r0, [sp, #10] ;; stop_bits = 1
+ 8022772:	f8ad 000c 	strh.w	r0, [sp, #12] ;; parity = none
+ 8022776:	f8ad 0010 	strh.w	r0, [sp, #16] ;; hw_flow = none
+ 802277a:	200c      	movs	r0, #12 ;; mode = TX|RX
+ 802277c:	f8ad 000e 	strh.w	r0, [sp, #14] ;; struct.mode = TX_RX
  8022780:	4c09      	ldr	r4, [pc, #36]	@ (0x80227a8)                     ; = 0x40004C00 (UART4)
  8022782:	a901      	add	r1, sp, #4
  8022784:	4620      	mov	r0, r4
- 8022786:	f7ff fe41 	bl	0x802240c
+ 8022786:	f7ff fe41 	bl	0x802240c ;; usart_config(UART4, {115200,8N1,TX_RX})
+;; --- Enable UART4 interrupts + peripheral ---
  802278a:	2201      	movs	r2, #1
- 802278c:	f240 5125 	movw	r1, #1317	@ 0x525
+ 802278c:	f240 5125 	movw	r1, #1317	@ 0x525 ;; USART_INT_RDBF|USART_INT_IDLE
  8022790:	4620      	mov	r0, r4
- 8022792:	f7ff fe1f 	bl	0x80223d4
+ 8022792:	f7ff fe1f 	bl	0x80223d4 ;; usart_irq_config(UART4, RDBF|IDLE, enable)
  8022796:	2101      	movs	r1, #1
  8022798:	4620      	mov	r0, r4
- 802279a:	f7ff fdb5 	bl	0x8022308
+ 802279a:	f7ff fdb5 	bl	0x8022308 ;; usart_enable(UART4, 1) → debug UART active
  802279e:	b006      	add	sp, #24
  80227a0:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x080227A2 ────────────────────────────────────────────
+; --- DATA @ 0x080227A2 --------------------------------------------
   0x080227A0: 10 BD 00 00 00 10 01 40 00 4C 00 40 10 B5 86 B0  |.......@.L.@....| [+4] 0x40011000=GPIOC; [+8] 0x40004C00=UART4
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  adc2_init (was system_init)                                                         ║
@@ -48896,62 +51516,66 @@
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * adc2_convert_read [ADC] - ADC2 conversion read (128B). Refs ADC2 base. Reads battery/signal ADC values.
 ;; ═══════════════════════════════════════════════════════════════════
-;; SYSTEM_INIT - Full MCU initialization
-;; Configures RCC clocks, GPIO modes, peripheral enables
-;; This is where ALL pin modes are set - critical for understanding
-;; which pins are inputs vs outputs and their initial states
+;; ADC2_CONVERT_READ - ADC2 setup + first conversion
+;; Configures ADC2 at 0x40012800 for battery/signal level monitoring
+;; Enables RCC clock for ADC2, init struct, channel config, calibrate
+;; then triggers first conversion and reads result
 ;; ═══════════════════════════════════════════════════════════════════
- 80227ac:	b510      	push	{r4, lr}
- 80227ae:	b086      	sub	sp, #24
- 80227b0:	f44f 4000 	mov.w	r0, #32768	@ 0x8000
- 80227b4:	f7f7 fb78 	bl	0x8019ea8
- 80227b8:	2101      	movs	r1, #1
- 80227ba:	f44f 60c0 	mov.w	r0, #1536	@ 0x600
- 80227be:	f7f7 fba9 	bl	0x8019f14
+ 80227ac:	b510      	push	{r4, lr} ;; save context
+ 80227ae:	b086      	sub	sp, #24 ;; alloc adc_init struct
+;; --- Reset and enable ADC2 clock ---
+ 80227b0:	f44f 4000 	mov.w	r0, #32768	@ 0x8000 ;; r0 = 0x8000 = ADC2 RCC bit
+ 80227b4:	f7f7 fb78 	bl	0x8019ea8 ;; rcc_ahb_periph_reset(ADC2) - reset ADC2
+ 80227b8:	2101      	movs	r1, #1 ;; enable = 1
+ 80227ba:	f44f 60c0 	mov.w	r0, #1536	@ 0x600 ;; r0 = 0x600 = ADC1+ADC2 periph bits
+ 80227be:	f7f7 fba9 	bl	0x8019f14 ;; rcc_apb2_periph_enable(ADC1|ADC2, 1)
+;; --- ADC2 init struct setup ---
  80227c2:	a801      	add	r0, sp, #4
- 80227c4:	f7e0 fd8a 	bl	0x80032dc
- 80227c8:	2000      	movs	r0, #0
- 80227ca:	9001      	str	r0, [sp, #4]
- 80227cc:	f88d 0008 	strb.w	r0, [sp, #8]
- 80227d0:	f88d 0009 	strb.w	r0, [sp, #9]
- 80227d4:	f44f 2160 	mov.w	r1, #917504	@ 0xe0000
- 80227d8:	9103      	str	r1, [sp, #12]
- 80227da:	9004      	str	r0, [sp, #16]
- 80227dc:	2001      	movs	r0, #1
- 80227de:	f88d 0014 	strb.w	r0, [sp, #20]
+ 80227c4:	f7e0 fd8a 	bl	0x80032dc ;; adc_init_struct(defaults)
+ 80227c8:	2000      	movs	r0, #0 ;; zero for struct fields
+ 80227ca:	9001      	str	r0, [sp, #4] ;; adc.mode = independent
+ 80227cc:	f88d 0008 	strb.w	r0, [sp, #8] ;; adc.continuous = 0 (single shot)
+ 80227d0:	f88d 0009 	strb.w	r0, [sp, #9] ;; adc.scan = 0 (single channel)
+ 80227d4:	f44f 2160 	mov.w	r1, #917504	@ 0xe0000 ;; r1 = 0xE0000 = external trigger config
+ 80227d8:	9103      	str	r1, [sp, #12] ;; adc.ext_trigger = software trigger
+ 80227da:	9004      	str	r0, [sp, #16] ;; adc.data_align = right-aligned
+ 80227dc:	2001      	movs	r0, #1 ;; channels = 1
+ 80227de:	f88d 0014 	strb.w	r0, [sp, #20] ;; adc.channel_count = 1
  80227e2:	4c12      	ldr	r4, [pc, #72]	@ (0x802282c)                     ; = 0x40012800 (ADC2)
  80227e4:	a901      	add	r1, sp, #4
  80227e6:	4620      	mov	r0, r4
- 80227e8:	f7e0 fd04 	bl	0x80031f4
- 80227ec:	2307      	movs	r3, #7
- 80227ee:	2202      	movs	r2, #2
- 80227f0:	2101      	movs	r1, #1
+ 80227e8:	f7e0 fd04 	bl	0x80031f4 ;; adc_config(ADC2, adc_struct)
+;; --- Channel 2 config + enable ---
+ 80227ec:	2307      	movs	r3, #7 ;; sample_time = 7 (239.5 cycles, slowest)
+ 80227ee:	2202      	movs	r2, #2 ;; channel = 2
+ 80227f0:	2101      	movs	r1, #1 ;; rank = 1 (first in sequence)
  80227f2:	4620      	mov	r0, r4
- 80227f4:	f7e0 fd22 	bl	0x800323c
+ 80227f4:	f7e0 fd22 	bl	0x800323c ;; adc_regular_channel_config(ADC2, ch2, rank1, slow)
  80227f8:	2101      	movs	r1, #1
- 80227fa:	4620      	mov	r0, r4
- 80227fc:	f7e0 fcbe 	bl	0x800317c
+ 80227fa:	4620      	mov	r0, r4 ;; r0 = ADC2
+ 80227fc:	f7e0 fcbe 	bl	0x800317c ;; adc_enable(ADC2, 1)
+;; --- Calibrate ADC2 + first conversion ---
  8022800:	4620      	mov	r0, r4
- 8022802:	f7e0 fd55 	bl	0x80032b0
+ 8022802:	f7e0 fd55 	bl	0x80032b0 ;; adc_calibration_init(ADC2) - start cal
  8022806:	4620      	mov	r0, r4
- 8022808:	f7e0 fced 	bl	0x80031e6
+ 8022808:	f7e0 fced 	bl	0x80031e6 ;; adc_calibration_status(ADC2)
  802280c:	2800      	cmp	r0, #0
- 802280e:	d1fa      	bne.n	0x8022806
+ 802280e:	d1fa      	bne.n	0x8022806 ;; loop until calibration complete
  8022810:	4620      	mov	r0, r4
- 8022812:	f7e0 fd5e 	bl	0x80032d2
+ 8022812:	f7e0 fd5e 	bl	0x80032d2 ;; adc_sw_trigger(ADC2) - start conversion
  8022816:	4620      	mov	r0, r4
- 8022818:	f7e0 fcd4 	bl	0x80031c4
+ 8022818:	f7e0 fcd4 	bl	0x80031c4 ;; adc_eoc_status(ADC2) - check done
  802281c:	2800      	cmp	r0, #0
- 802281e:	d1fa      	bne.n	0x8022816
+ 802281e:	d1fa      	bne.n	0x8022816 ;; loop until conversion complete
  8022820:	2101      	movs	r1, #1
  8022822:	4620      	mov	r0, r4
- 8022824:	f7e0 fd49 	bl	0x80032ba
+ 8022824:	f7e0 fd49 	bl	0x80032ba ;; adc_read_data(ADC2) - read result (battery?)
  8022828:	b006      	add	sp, #24
  802282a:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x0802282C ────────────────────────────────────────────
+; --- DATA @ 0x0802282C --------------------------------------------
   0x08022820: 01 21 20 46 E0 F7 49 FD 06 B0 10 BD 00 28 01 40  |.! F..I......(.@| [+12] 0x40012800=ADC2
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_flash_rf_info                                                        ║
@@ -49013,9 +51637,9 @@
  802289c:	6b44      	ldr	r4, [r0, #52]	@ 0x34
  802289e:	e7ef      	b.n	0x8022880
 
-; ─── DATA @ 0x080228A0 ────────────────────────────────────────────
+; --- DATA @ 0x080228A0 --------------------------------------------
   0x080228A0: B4 A3 00 20 20 B0 00 20 40 77 1B 00 80 CB A4 00  |...  .. @w......| [+0] 0x2000A3B4=g_rf_state; [+4] 0x2000B020=RAM+0xB020
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_channel_timed_update                                                        ║
@@ -49108,11 +51732,11 @@
  80229b4:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  80229b8:	f7f9 bc14 	b.w	0x801c1e4
 
-; ─── DATA @ 0x080229BC ────────────────────────────────────────────
+; --- DATA @ 0x080229BC --------------------------------------------
   0x080229B0: EA F7 1E FA BD E8 F0 41 F9 F7 14 BC 1C A4 00 20  |.......A....... | [+12] 0x2000A41C=RAM+0xA41C
   0x080229C0: C0 F9 02 08 B4 A3 00 20 00 85 CF 00 C0 30 46 00  |....... .....0F.| [+0] 0x0802F9C0=flash+0x2F9C0; [+4] 0x2000A3B4=g_rf_state
   0x080229D0: 20 B0 00 20 10 B5 10 4C 94 F8 FA 00 00 EB C0 01  | .. ...L........| [+0] 0x2000B020=RAM+0xB020
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_timed_debug_print                                                        ║
@@ -49142,7 +51766,7 @@
  8022a10:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  8022a14:	f7ed bb40 	b.w	0x8010098
 
-; ─── DATA @ 0x08022A18 ────────────────────────────────────────────
+; --- DATA @ 0x08022A18 --------------------------------------------
   0x08022A10: BD E8 10 40 ED F7 40 BB 1C A4 00 20 70 B5 04 46  |...@..@.... p..F| [+8] 0x2000A41C=RAM+0xA41C
   0x08022A20: F8 F7 00 FA E8 F7 D2 FE 61 68 04 F1 11 00 08 5C  |........ah.....\|
   0x08022A30: 30 38 C6 B2 31 48 C0 79 E8 B3 30 46 E5 F7 70 F9  |08..1H.y..0F..p.|
@@ -49159,7 +51783,7 @@
   0x08022AE0: 2D 1A D9 E7 05 21 48 20 00 F0 EA F8 F9 F7 7A FB  |-....!H ......z.|
   0x08022AF0: BD E8 70 40 EA F7 7C B9 70 BD 00 00 B0 A8 00 20  |..p@..|.p...... | [+12] 0x2000A8B0=RAM+0xA8B0
   0x08022B00: 1C A4 00 20 D4 F9 02 08 2D E9 F0 41 06 46 39 4D  |... ....-..A.F9M| [+0] 0x2000A41C=RAM+0xA41C; [+4] 0x0802F9D4=flash+0x2F9D4
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_cal_channel_update                                                        ║
@@ -49243,10 +51867,10 @@
  8022bec:	e8bd 41f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, lr}
  8022bf0:	f7f9 baf8 	b.w	0x801c1e4
 
-; ─── DATA @ 0x08022BF4 ────────────────────────────────────────────
+; --- DATA @ 0x08022BF4 --------------------------------------------
   0x08022BF0: F9 F7 F8 BA 1C A4 00 20 C0 F9 02 08 B4 A3 00 20  |....... ....... | [+4] 0x2000A41C=RAM+0xA41C; [+8] 0x0802F9C0=flash+0x2F9C0; [+12] 0x2000A3B4=g_rf_state
   0x08022C00: 80 CB A4 00 40 77 1B 00 20 B0 00 20 3E B5 0C 46  |....@w.. .. >..F| [+8] 0x2000B020=RAM+0xB020
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_timed_debug_print                                                        ║
@@ -49281,10 +51905,10 @@
  8022c3e:	d3f8      	bcc.n	0x8022c32
  8022c40:	bd3e      	pop	{r1, r2, r3, r4, r5, pc}
 
-; ─── DATA @ 0x08022C42 ────────────────────────────────────────────
+; --- DATA @ 0x08022C42 --------------------------------------------
   0x08022C40: 3E BD 00 00 25 30 36 64 00 00 00 00 25 30 38 64  |>...%06d....%08d|
   0x08022C50: 00 00 00 00 00 22 00 21 02 EB 82 02 43 5C 03 EB  |.....".!....C\..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  checksum_byte_xor                                                        ║
@@ -49305,9 +51929,9 @@
  8022c6e:	0040      	lsls	r0, r0, #1
  8022c70:	4770      	bx	lr
 
-; ─── DATA @ 0x08022C72 ────────────────────────────────────────────
+; --- DATA @ 0x08022C72 --------------------------------------------
   0x08022C70: 70 47 00 00 00 28 0F D0 08 49 CA 79 00 2A 0B D0  |pG...(...I.y.*..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_byte_send                                                        ║
@@ -49335,10 +51959,10 @@
  8022c96:	7048      	strb	r0, [r1, #1]
  8022c98:	4770      	bx	lr
 
-; ─── DATA @ 0x08022C9A ────────────────────────────────────────────
+; --- DATA @ 0x08022C9A --------------------------------------------
   0x08022C90: C8 70 8A 70 00 20 48 70 70 47 00 00 B0 A8 00 20  |.p.p. HppG..... | [+12] 0x2000A8B0=RAM+0xA8B0
   0x08022CA0: 58 E8 00 20 10 B5 FF F7 E5 FF 04 4C 01 E0 00 F0  |X.. .......L....| [+0] 0x2000E858=g_beep_state
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  uart_byte_send                                                        ║
@@ -49357,9 +51981,9 @@
  8022cb6:	d1fa      	bne.n	0x8022cae
  8022cb8:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x08022CBA ────────────────────────────────────────────
+; --- DATA @ 0x08022CBA --------------------------------------------
   0x08022CB0: 2F F8 20 78 00 28 FA D1 10 BD 00 00 58 E8 00 20  |/. x.(......X.. | [+12] 0x2000E858=g_beep_state
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_status_query                                                        ║
@@ -49376,9 +52000,9 @@
  8022cce:	4608      	mov	r0, r1
  8022cd0:	f7e4 b9f6 	b.w	0x80070c0
 
-; ─── DATA @ 0x08022CD4 ────────────────────────────────────────────
+; --- DATA @ 0x08022CD4 --------------------------------------------
   0x08022CD0: E4 F7 F6 B9 B0 A8 00 20 04 4A D2 79 00 2A 02 D0  |....... .J.y.*..| [+4] 0x2000A8B0=RAM+0xA8B0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lcd_write_wrapper                                                        ║
@@ -49395,11 +52019,11 @@
  8022ce6:	4608      	mov	r0, r1
  8022ce8:	f7e4 ba14 	b.w	0x8007114
 
-; ─── DATA @ 0x08022CEC ────────────────────────────────────────────
+; --- DATA @ 0x08022CEC --------------------------------------------
   0x08022CE0: 08 B1 FF F7 DF BF 08 46 E4 F7 14 BA B0 A8 00 20  |.......F....... | [+12] 0x2000A8B0=RAM+0xA8B0
   0x08022CF0: 10 B5 04 20 FD F7 A2 F8 00 21 08 46 E7 F7 04 FC  |... .....!.F....|
   0x08022D00: 02 48 00 21 01 70 81 70 41 70 10 BD 58 E8 00 20  |.H.!.p.pAp..X.. | [+12] 0x2000E858=g_beep_state
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  multi_init_dispatch                                                        ║
@@ -49408,44 +52032,61 @@
 ; ║  Calls: dac_enable, delay_us_maybe, flash_display_tx_data, display_tx_status, lcd_parallel_write  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * multi_init_dispatch [SYSTEM] - Multi-init dispatcher (120B, 4 callers, 14 subcalls). Initializes multiple subsystems.
- 8022d10:	b570      	push	{r4, r5, r6, lr}
- 8022d12:	4c1d      	ldr	r4, [pc, #116]	@ (0x8022d88)                    ; = 0x2000E858 (g_beep_state)
- 8022d14:	7820      	ldrb	r0, [r4, #0]
- 8022d16:	2801      	cmp	r0, #1
- 8022d18:	d103      	bne.n	0x8022d22
- 8022d1a:	7860      	ldrb	r0, [r4, #1]
- 8022d1c:	b128      	cbz	r0, 0x8022d2a
- 8022d1e:	f7f6 f92f 	bl	0x8018f80
- 8022d22:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 8022d26:	f7ff bacf 	b.w	0x80222c8
- 8022d2a:	78a0      	ldrb	r0, [r4, #2]
- 8022d2c:	b148      	cbz	r0, 0x8022d42
- 8022d2e:	1e40      	subs	r0, r0, #1
+; -- multi_init_dispatch -------------------------------------------------
+; Called every main loop iteration. Two paths:
+;   PATH A (beep sequence active): g_beep_state[0]==1 && g_beep_state[1]!=0
+;     → flash_multi_init() then bt_protocol_handler()
+;   PATH B (beep sequence playing notes): g_beep_state[0]==1 && g_beep_state[1]==0
+;     → Walk through note table at g_beep_state[3..], play each via display_tx_status
+;     → 0xFF notes = delay-only (no tone). Decrement count in g_beep_state[2].
+;     → When count hits 0: stop DAC, LCD refresh, set g_rf_state[9]=8
+;   PATH C (no beep): g_beep_state[0]!=1
+;     → tail-call bt_protocol_handler() directly
+;
+; g_beep_state @ 0x2000E858:
+;   [0] = active flag (1=beep seq running)
+;   [1] = sub-state (0=playing notes, nonzero=flash init needed)
+;   [2] = remaining note count (decrements each iteration)
+;   [3..] = note values (0xFF=pause, others=tone index for display_tx_status)
+; ------------------------------------------------------------------------
+ 8022d10:	b570      	push	{r4, r5, r6, lr} ;; -- MULTI_INIT_DISPATCH: beep seq + BT protocol --
+ 8022d12:	4c1d      	ldr	r4, [pc, #116]	@ (0x8022d88)                    ; = 0x2000E858 (g_beep_state) ;; r4 = g_beep_state @ 0x2000E858
+ 8022d14:	7820      	ldrb	r0, [r4, #0] ;; r0 = g_beep_state[0] (active flag)
+ 8022d16:	2801      	cmp	r0, #1 ;; beep sequence active?
+ 8022d18:	d103      	bne.n	0x8022d22 ;; if not → PATH C: bt_protocol_handler only
+ 8022d1a:	7860      	ldrb	r0, [r4, #1] ;; r0 = g_beep_state[1] (sub-state)
+ 8022d1c:	b128      	cbz	r0, 0x8022d2a ;; if sub-state==0 → PATH B: play notes
+ 8022d1e:	f7f6 f92f 	bl	0x8018f80 ;; PATH A: flash_multi_init() - SPI flash init during beep
+ 8022d22:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- PATH C: no beep, run BT protocol --
+ 8022d26:	f7ff bacf 	b.w	0x80222c8 ;; tail-call bt_protocol_handler()
+ 8022d2a:	78a0      	ldrb	r0, [r4, #2] ;; -- PATH B: play next note from sequence --
+ 8022d2c:	b148      	cbz	r0, 0x8022d42 ;; if remaining_count==0 → sequence complete
+ 8022d2e:	1e40      	subs	r0, r0, #1 ;; remaining_count--
  8022d30:	b2c0      	uxtb	r0, r0
  8022d32:	70a0      	strb	r0, [r4, #2]
  8022d34:	4420      	add	r0, r4
  8022d36:	4d15      	ldr	r5, [pc, #84]	@ (0x8022d8c)                     ; = 0x20000BE0 (RAM+0xBE0)
- 8022d38:	78c0      	ldrb	r0, [r0, #3]
- 8022d3a:	7068      	strb	r0, [r5, #1]
- 8022d3c:	28ff      	cmp	r0, #255	@ 0xff
- 8022d3e:	d015      	beq.n	0x8022d6c
+ 8022d38:	78c0      	ldrb	r0, [r0, #3] ;; r0 = note byte from g_beep_state[3+offset]
+ 8022d3a:	7068      	strb	r0, [r5, #1] ;; RAM[0x20000BE1] = current note
+ 8022d3c:	28ff      	cmp	r0, #255	@ 0xff ;; note == 0xFF (pause/delay)?
+ 8022d3e:	d015      	beq.n	0x8022d6c ;; if 0xFF → delay only, skip tone
  8022d40:	e01e      	b.n	0x8022d80
- 8022d42:	2000      	movs	r0, #0
- 8022d44:	7020      	strb	r0, [r4, #0]
+ 8022d42:	2000      	movs	r0, #0 ;; -- SEQUENCE COMPLETE: stop DAC, refresh LCD --
+ 8022d44:	7020      	strb	r0, [r4, #0] ;; g_beep_state[0] = 0 (clear active flag)
  8022d46:	4912      	ldr	r1, [pc, #72]	@ (0x8022d90)                     ; = 0x2000A3B4 (g_rf_state)
- 8022d48:	2008      	movs	r0, #8
+ 8022d48:	2008      	movs	r0, #8 ;; g_rf_state[9] = 8 (restore RF state)
  8022d4a:	f8a1 0009 	strh.w	r0, [r1, #9]
- 8022d4e:	2004      	movs	r0, #4
- 8022d50:	f7fd f874 	bl	0x801fe3c
+ 8022d4e:	2004      	movs	r0, #4 ;; LCD command = 4
+ 8022d50:	f7fd f874 	bl	0x801fe3c ;; lcd_parallel_write(4) - LCD reset command
  8022d54:	201e      	movs	r0, #30
  8022d56:	f7e7 fdf6 	bl	0x800a946                                        ; delay_us_maybe
  8022d5a:	2100      	movs	r1, #0
  8022d5c:	4608      	mov	r0, r1
- 8022d5e:	f7e7 fbd3 	bl	0x800a508                                        ; dac_enable
+ 8022d5e:	f7e7 fbd3 	bl	0x800a508                                        ; dac_enable ;; dac_enable(0, 0) - disable DAC (stop audio out)
  8022d62:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 8022d66:	2001      	movs	r0, #1
- 8022d68:	f7f7 bc5c 	b.w	0x801a624
- 8022d6c:	201e      	movs	r0, #30
+ 8022d66:	2001      	movs	r0, #1 ;; cmd = 1 (refresh)
+ 8022d68:	f7f7 bc5c 	b.w	0x801a624 ;; tail-call lcd_cmd_dispatch(1) - refresh display
+ 8022d6c:	201e      	movs	r0, #30 ;; -- 0xFF NOTE: delay only (no tone) --
  8022d6e:	f7e7 fdea 	bl	0x800a946                                        ; delay_us_maybe
  8022d72:	78a0      	ldrb	r0, [r4, #2]
  8022d74:	1e40      	subs	r0, r0, #1
@@ -49454,11 +52095,11 @@
  8022d7a:	4420      	add	r0, r4
  8022d7c:	78c0      	ldrb	r0, [r0, #3]
  8022d7e:	7068      	strb	r0, [r5, #1]
- 8022d80:	7868      	ldrb	r0, [r5, #1]
- 8022d82:	f7f6 f947 	bl	0x8019014
- 8022d86:	e7cc      	b.n	0x8022d22
+ 8022d80:	7868      	ldrb	r0, [r5, #1] ;; r0 = current note value
+ 8022d82:	f7f6 f947 	bl	0x8019014 ;; display_tx_status(note) - render + play tone
+ 8022d86:	e7cc      	b.n	0x8022d22 ;; → PATH C (bt_protocol_handler tail-call)
 
-; ─── DATA @ 0x08022D88 ────────────────────────────────────────────
+; --- DATA @ 0x08022D88 --------------------------------------------
   0x08022D80: 68 78 F6 F7 47 F9 CC E7 58 E8 00 20 E0 0B 00 20  |hx..G...X.. ... | [+8] 0x2000E858=g_beep_state; [+12] 0x20000BE0=RAM+0xBE0
   0x08022D90: B4 A3 00 20 70 B5 1C 4D 28 7A 00 28 10 D0 1B 4C  |... p..M(z.(...L| [+0] 0x2000A3B4=g_rf_state
   0x08022DA0: 0F 26 20 7D 04 28 09 D0 F7 F7 1A FA 01 28 01 D1  |.& }.(.......(..|
@@ -49471,7 +52112,7 @@
   0x08022E10: B0 A8 00 20 3C F7 02 08 10 B5 08 48 01 7A 00 29  |... <......H.z.)| [+0] 0x2000A8B0=RAM+0xA8B0; [+4] 0x0802F73C=flash+0x2F73C
   0x08022E20: 08 D0 00 21 01 72 E9 F7 C9 FE BD E8 10 40 03 20  |...!.r.......@. |
   0x08022E30: E4 F7 46 B9 01 21 01 72 F5 E7 00 00 D0 A8 00 20  |..F..!.r....... | [+12] 0x2000A8D0=RAM+0xA8D0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lcd_bk4829_init_seq                                                        ║
@@ -49550,10 +52191,10 @@
  8022ee6:	2000      	movs	r0, #0
  8022ee8:	f7f7 bb9c 	b.w	0x801a624
 
-; ─── DATA @ 0x08022EEC ────────────────────────────────────────────
+; --- DATA @ 0x08022EEC --------------------------------------------
   0x08022EE0: 1B FB BD E8 F0 41 00 20 F7 F7 9C BB DA 01 00 20  |.....A. ....... | [+4] 0x200041F0=RAM+0x41F0; [+12] 0x200001DA=RAM+0x1DA
   0x08022EF0: 00 18 01 40 D0 A8 00 20 A7 F6 02 08 10 B5 04 46  |...@... .......F| [+0] 0x40011800=GPIOE; [+4] 0x2000A8D0=RAM+0xA8D0; [+8] 0x0802F6A7=flash+0x2F6A7
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_flag_dispatch                                                        ║
@@ -49585,9 +52226,9 @@
  8022f2a:	f7e4 b8c9 	b.w	0x80070c0
  8022f2e:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x08022F30 ────────────────────────────────────────────
+; --- DATA @ 0x08022F30 --------------------------------------------
   0x08022F30: D0 A8 00 20 B4 A3 00 20 70 B5 04 46 0B 4B 59 79  |... ... p..F.KYy| [+0] 0x2000A8D0=RAM+0xA8D0; [+4] 0x2000A3B4=g_rf_state
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_flag_dispatch                                                        ║
@@ -49617,10 +52258,10 @@
  8022f66:	f7e4 b8ab 	b.w	0x80070c0
  8022f6a:	bd70      	pop	{r4, r5, r6, pc}
 
-; ─── DATA @ 0x08022F6C ────────────────────────────────────────────
+; --- DATA @ 0x08022F6C --------------------------------------------
   0x08022F60: BD E8 70 40 01 20 E4 F7 AB B8 70 BD D0 A8 00 20  |..p@. ....p.... | [+12] 0x2000A8D0=RAM+0xA8D0
   0x08022F70: B4 A3 00 20 30 B5 87 B0 00 24 04 94 05 94 06 94  |... 0....$......| [+0] 0x2000A3B4=g_rf_state
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  aprs_lcd_flag_read                                                        ║
@@ -49667,9 +52308,9 @@
  8022fd0:	b007      	add	sp, #28
  8022fd2:	bd30      	pop	{r4, r5, pc}
 
-; ─── DATA @ 0x08022FD4 ────────────────────────────────────────────
+; --- DATA @ 0x08022FD4 --------------------------------------------
   0x08022FD0: 07 B0 30 BD D0 A8 00 20 57 58 2D 25 30 32 64 00  |..0.... WX-%02d.| [+4] 0x2000A8D0=RAM+0xA8D0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  aprs_position_format                                                        ║
@@ -49703,9 +52344,9 @@
  8023018:	e8bd 401c 	ldmia.w	sp!, {r2, r3, r4, lr}
  802301c:	f7ff bfaa 	b.w	0x8022f74
 
-; ─── DATA @ 0x08023020 ────────────────────────────────────────────
+; --- DATA @ 0x08023020 --------------------------------------------
   0x08023020: 76 E7 03 08 01 49 51 F8 20 00 70 47 5C FA 02 08  |v....IQ. .pG\...| [+0] 0x0803E776=flash+0x3E776; [+12] 0x0802FA5C=flash+0x2FA5C
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  aprs_lcd_flag_read                                                        ║
@@ -49717,9 +52358,9 @@
  8023026:	f851 0020 	ldr.w	r0, [r1, r0, lsl #2]
  802302a:	4770      	bx	lr
 
-; ─── DATA @ 0x0802302C ────────────────────────────────────────────
+; --- DATA @ 0x0802302C --------------------------------------------
   0x08023020: 76 E7 03 08 01 49 51 F8 20 00 70 47 5C FA 02 08  |v....IQ. .pG\...| [+0] 0x0803E776=flash+0x3E776; [+12] 0x0802FA5C=flash+0x2FA5C
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lcd_cmd_tmr_config                                                        ║
@@ -49747,10 +52388,10 @@
  8023056:	b007      	add	sp, #28
  8023058:	bd00      	pop	{pc}
 
-; ─── DATA @ 0x0802305A ────────────────────────────────────────────
+; --- DATA @ 0x0802305A --------------------------------------------
   0x08023050: 19 46 F7 F7 51 FA 07 B0 00 BD 00 00 B0 A8 00 20  |.F..Q.......... | [+12] 0x2000A8B0=RAM+0xA8B0
   0x08023060: 5C FA 02 08 70 B5 40 68 11 28 08 D0 0C DC 02 28  |\...p.@h.(.....(| [+0] 0x0802FA5C=flash+0x2FA5C
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_status_query                                                        ║
@@ -49759,104 +52400,161 @@
 ; ║  Calls: tick_delay_check, rf_state_flag_set, rf_state_clear, rf_status_query, dac_state_dispatch  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * rf_status_query [RF] - RF status query (286B). Refs g_rf. Returns RF subsystem state.
- 8023064:	b570      	push	{r4, r5, r6, lr}
- 8023066:	6840      	ldr	r0, [r0, #4]
- 8023068:	2811      	cmp	r0, #17
- 802306a:	d008      	beq.n	0x802307e
- 802306c:	dc0c      	bgt.n	0x8023088
- 802306e:	2802      	cmp	r0, #2
- 8023070:	d01e      	beq.n	0x80230b0
- 8023072:	2807      	cmp	r0, #7
- 8023074:	d003      	beq.n	0x802307e
- 8023076:	280c      	cmp	r0, #12
- 8023078:	d040      	beq.n	0x80230fc
- 802307a:	2810      	cmp	r0, #16
- 802307c:	d143      	bne.n	0x8023106
- 802307e:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+; -- rf_status_query -----------------------------------------------------
+; Mode 11 dispatch handler (286B). RF status monitoring and APRS control.
+; Uses binary search cascade on sp[4] with 9 handled sub-commands.
+;
+; r4 = RAM[0x2000022E] (RF status control block, loaded for sub > 18):
+;   [0] = state (0=idle, 1=active)
+;   [1] = monitor flag (0=off, 1=listening)
+;   [2:3] = halfword counter (cleared on transitions)
+;
+; Sub-command dispatch table:
+;   sub  2: display_attr_config() - setup display attributes
+;   sub  7: tick_delay_check(0) - no-op timing sync
+;   sub 12: rf_status_update(1) - update RF status flags
+;   sub 16: tick_delay_check(0) - no-op (same as default)
+;   sub 17: tick_delay_check(0) - no-op
+;   sub 18: rf_status_update(1) - same as 12
+;   sub 19: if monitor_flag → SET flag[1]=1, tick_delay,
+;           clear counter, rf_flag_dispatch, rf_signal_measure
+;           else → rf_aprs_data_read_a(0) (APRS read path)
+;   sub 21: if monitor_flag → CLR flag[1]=0, tick_delay(1),
+;           clear counter, rf_flag_dispatch, rf_signal_measure
+;           else → rf_aprs_data_read_b(0) (APRS read path)
+;   sub 28: if flag[0]!=0 → inline handler @ 0x8023140
+;           else → inline handler @ 0x8023160
+;   other: return (pop, no action)
+; ------------------------------------------------------------------------
+ 8023064:	b570      	push	{r4, r5, r6, lr} ;; -- RF_STATUS_QUERY: mode 11 handler --
+ 8023066:	6840      	ldr	r0, [r0, #4] ;; r0 = sp[4] (sub-command)
+ 8023068:	2811      	cmp	r0, #17 ;; sub 17? (binary search root)
+ 802306a:	d008      	beq.n	0x802307e ;; sub 17 → tick_delay_check(0)
+ 802306c:	dc0c      	bgt.n	0x8023088 ;; sub > 17 → check 18,19,21,28
+ 802306e:	2802      	cmp	r0, #2 ;; sub 2?
+ 8023070:	d01e      	beq.n	0x80230b0 ;; sub 2 → display_attr_config
+ 8023072:	2807      	cmp	r0, #7 ;; sub 7?
+ 8023074:	d003      	beq.n	0x802307e ;; sub 7 → tick_delay_check(0)
+ 8023076:	280c      	cmp	r0, #12 ;; sub 12?
+ 8023078:	d040      	beq.n	0x80230fc ;; sub 12 → rf_status_update(1)
+ 802307a:	2810      	cmp	r0, #16 ;; sub 16?
+ 802307c:	d143      	bne.n	0x8023106 ;; sub != 16 → return (no match)
+ 802307e:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- SUBS 7,16,17: tick_delay_check(0) --
  8023082:	2000      	movs	r0, #0
  8023084:	f7e4 b81c 	b.w	0x80070c0
- 8023088:	2812      	cmp	r0, #18
- 802308a:	d037      	beq.n	0x80230fc
- 802308c:	4c1e      	ldr	r4, [pc, #120]	@ (0x8023108)                    ; = 0x2000022E (RAM+0x22E)
- 802308e:	2500      	movs	r5, #0
- 8023090:	2813      	cmp	r0, #19
- 8023092:	7821      	ldrb	r1, [r4, #0]
- 8023094:	d010      	beq.n	0x80230b8
- 8023096:	2815      	cmp	r0, #21
- 8023098:	d01f      	beq.n	0x80230da
- 802309a:	281c      	cmp	r0, #28
- 802309c:	d133      	bne.n	0x8023106
- 802309e:	b119      	cbz	r1, 0x80230a8
+ 8023088:	2812      	cmp	r0, #18 ;; sub 18?
+ 802308a:	d037      	beq.n	0x80230fc ;; sub 18 → rf_status_update(1)
+ 802308c:	4c1e      	ldr	r4, [pc, #120]	@ (0x8023108)                    ; = 0x2000022E (RAM+0x22E) ;; r4 = RF status ctrl @ 0x2000022E
+ 802308e:	2500      	movs	r5, #0 ;; r5 = 0 (for clearing fields)
+ 8023090:	2813      	cmp	r0, #19 ;; sub 19?
+ 8023092:	7821      	ldrb	r1, [r4, #0] ;; r1 = status_ctrl[0] (state)
+ 8023094:	d010      	beq.n	0x80230b8 ;; sub 19 → MONITOR START path
+ 8023096:	2815      	cmp	r0, #21 ;; sub 21?
+ 8023098:	d01f      	beq.n	0x80230da ;; sub 21 → MONITOR STOP path
+ 802309a:	281c      	cmp	r0, #28 ;; sub 28?
+ 802309c:	d133      	bne.n	0x8023106 ;; sub != 28 → return
+ 802309e:	b119      	cbz	r1, 0x80230a8 ;; -- SUB 28: if state==0 → handler_b --
  80230a0:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80230a4:	f000 b84c 	b.w	0x8023140
+ 80230a4:	f000 b84c 	b.w	0x8023140 ;; tail-call handler_a (state active)
  80230a8:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80230ac:	f000 b858 	b.w	0x8023160
- 80230b0:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80230b4:	f7f1 b862 	b.w	0x801417c
- 80230b8:	b151      	cbz	r1, 0x80230d0
- 80230ba:	2001      	movs	r0, #1
- 80230bc:	7060      	strb	r0, [r4, #1]
- 80230be:	f7e3 ffff 	bl	0x80070c0
- 80230c2:	8065      	strh	r5, [r4, #2]
- 80230c4:	f000 f822 	bl	0x802310c
+ 80230ac:	f000 b858 	b.w	0x8023160 ;; tail-call handler_b (state idle)
+ 80230b0:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- SUB 2: display_attr_config --
+ 80230b4:	f7f1 b862 	b.w	0x801417c ;; tail-call display_attr_config
+ 80230b8:	b151      	cbz	r1, 0x80230d0 ;; -- SUB 19: MONITOR START --
+ 80230ba:	2001      	movs	r0, #1 ;; state active: flag = 1
+ 80230bc:	7060      	strb	r0, [r4, #1] ;; status_ctrl[1] = 1 (monitoring ON)
+ 80230be:	f7e3 ffff 	bl	0x80070c0 ;; tick_delay_check(1)
+ 80230c2:	8065      	strh	r5, [r4, #2] ;; status_ctrl[2:3] = 0 (clear counter)
+ 80230c4:	f000 f822 	bl	0x802310c ;; rf_flag_dispatch() - process flags
  80230c8:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80230cc:	f7e8 bcf0 	b.w	0x800bab0
- 80230d0:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+ 80230cc:	f7e8 bcf0 	b.w	0x800bab0 ;; tail-call rf_signal_measure()
+ 80230d0:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; sub 19 state==0: APRS read path
  80230d4:	2000      	movs	r0, #0
- 80230d6:	f7ff bf2f 	b.w	0x8022f38
- 80230da:	b151      	cbz	r1, 0x80230f2
- 80230dc:	7065      	strb	r5, [r4, #1]
- 80230de:	2001      	movs	r0, #1
- 80230e0:	f7e3 ffee 	bl	0x80070c0
- 80230e4:	8065      	strh	r5, [r4, #2]
- 80230e6:	f000 f811 	bl	0x802310c
+ 80230d6:	f7ff bf2f 	b.w	0x8022f38 ;; tail-call rf_aprs_data_read_a(0)
+ 80230da:	b151      	cbz	r1, 0x80230f2 ;; -- SUB 21: MONITOR STOP --
+ 80230dc:	7065      	strb	r5, [r4, #1] ;; status_ctrl[1] = 0 (monitoring OFF)
+ 80230de:	2001      	movs	r0, #1 ;; delay = 1
+ 80230e0:	f7e3 ffee 	bl	0x80070c0 ;; tick_delay_check(1)
+ 80230e4:	8065      	strh	r5, [r4, #2] ;; status_ctrl[2:3] = 0 (clear counter)
+ 80230e6:	f000 f811 	bl	0x802310c ;; rf_flag_dispatch()
  80230ea:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
- 80230ee:	f7e8 bcdf 	b.w	0x800bab0
- 80230f2:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+ 80230ee:	f7e8 bcdf 	b.w	0x800bab0 ;; tail-call rf_signal_measure()
+ 80230f2:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; sub 21 state==0: APRS read path
  80230f6:	2000      	movs	r0, #0
- 80230f8:	f7ff bf00 	b.w	0x8022efc
- 80230fc:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
+ 80230f8:	f7ff bf00 	b.w	0x8022efc ;; tail-call rf_aprs_data_read_b(0)
+ 80230fc:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr} ;; -- SUBS 12,18: rf_status_update(1) --
  8023100:	2001      	movs	r0, #1
- 8023102:	f7eb bad1 	b.w	0x800e6a8
- 8023106:	bd70      	pop	{r4, r5, r6, pc}
+ 8023102:	f7eb bad1 	b.w	0x800e6a8 ;; tail-call rf_status_update(1)
+ 8023106:	bd70      	pop	{r4, r5, r6, pc} ;; -- DEFAULT: return (no action) --
  8023108:	022e      	lsls	r6, r5, #8
  802310a:	2000      	movs	r0, #0
 ; ╔══════════════════════════════════════════════════════════════════════╗
-; ║  dac_state_dispatch                                                        ║
+; ║  rf_flag_dispatch                                                  ║
 ; ║  0x0802310C  size=48                                            ║
 ; ║  Called by: rf_status_query, dac_state_dispatch                                ║
-; ║  Calls: rf_flag_dispatch, rf_flag_read, rf_flag_dispatch, rf_flag_dispatch       ║
+; ║  Calls: rf_flag_set, rf_flag_process_a, rf_flag_process_b, rf_flag_set_alt  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * rf_flag_dispatch  [RF] - RF flag check+dispatch - called by rf_status_query
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: rf_flag_dispatch(void)                               │
+; │                                                                     │
+; │ RF flag state processor with re-entrancy protection.               │
+; │ Uses 4-byte control block at 0x2000022E.                           │
+; │                                                                     │
+; │   struct { uint8_t state; uint8_t idx; uint16_t counter; }        │
+; │       *ctl = (void*)0x2000022E;                                    │
+; │                                                                     │
+; │   if (ctl->counter != 0) return;  // locked, still processing     │
+; │                                                                     │
+; │   if (ctl->idx == 1) {                                             │
+; │       rf_flag_set_alt(1);  // @ 0x8022F38 - alternate path        │
+; │   } else {                                                         │
+; │       rf_flag_set(1);      // @ 0x8022EFC - primary path          │
+; │   }                                                                 │
+; │   rf_flag_process_a();     // @ 0x801ACB0                          │
+; │   rf_flag_process_b();     // @ 0x801ACBC                          │
+; │   ctl->state = 1;          // mark active                          │
+; │   ctl->counter = 2;        // lock for 2 cycles                    │
+; └---------------------------------------------------------------------┘
+; * rf_flag_dispatch  [RF] - RF flag state processor with re-entrancy lock
+; -- rf_flag_dispatch ----------------------------------------------------
+; RF flag state processor with re-entrancy lock (48B).
+; Controls @ 0x2000022E: {state[0], monitor_flag[1], counter[2:3]}
+;
+; Logic:
+;   if counter > 0: return (locked, decrement happens elsewhere)
+;   if monitor_flag == 1: rf_flag_alt_process(1) → process_a → process_b
+;   else: rf_flag_set(1) → process_a → process_b
+;   then: state = 1, counter = 2 (lock for 2 polls)
+; ------------------------------------------------------------------------
  802310c:	b510      	push	{r4, lr}
  802310e:	4c0b      	ldr	r4, [pc, #44]	@ (0x802313c)                     ; = 0x2000022E (RAM+0x22E)
- 8023110:	8860      	ldrh	r0, [r4, #2]
+ 8023110:	8860      	ldrh	r0, [r4, #2] ;; counter (re-entrancy lock)
  8023112:	2800      	cmp	r0, #0
- 8023114:	d10d      	bne.n	0x8023132
- 8023116:	7860      	ldrb	r0, [r4, #1]
+ 8023114:	d10d      	bne.n	0x8023132 ;; locked → return
+ 8023116:	7860      	ldrb	r0, [r4, #1] ;; monitor_flag
  8023118:	2801      	cmp	r0, #1
  802311a:	d00b      	beq.n	0x8023134
- 802311c:	2001      	movs	r0, #1
+ 802311c:	2001      	movs	r0, #1 ;; rf_flag_set(1) - normal path
  802311e:	f7ff feed 	bl	0x8022efc
- 8023122:	f7f7 fdc5 	bl	0x801acb0
- 8023126:	f7f7 fdc9 	bl	0x801acbc
- 802312a:	2001      	movs	r0, #1
+ 8023122:	f7f7 fdc5 	bl	0x801acb0 ;; rf_flag_process_a()
+ 8023126:	f7f7 fdc9 	bl	0x801acbc ;; rf_flag_process_b()
+ 802312a:	2001      	movs	r0, #1 ;; state = 1 (active)
  802312c:	7020      	strb	r0, [r4, #0]
- 802312e:	2002      	movs	r0, #2
+ 802312e:	2002      	movs	r0, #2 ;; counter = 2 (lock for 2 cycles)
  8023130:	8060      	strh	r0, [r4, #2]
  8023132:	bd10      	pop	{r4, pc}
- 8023134:	2001      	movs	r0, #1
+ 8023134:	2001      	movs	r0, #1 ;; rf_flag_alt_process(1) - monitor path
  8023136:	f7ff feff 	bl	0x8022f38
  802313a:	e7f2      	b.n	0x8023122
 
-; ─── DATA @ 0x0802313C ────────────────────────────────────────────
+; --- DATA @ 0x0802313C --------------------------------------------
   0x08023130: 60 80 10 BD 01 20 FF F7 FF FE F2 E7 2E 02 00 20  |`.... ......... | [+12] 0x2000022E=RAM+0x22E
   0x08023140: 10 B5 06 21 28 20 FF F7 BB FD 03 49 00 20 08 70  |...!( .....I. .p|
   0x08023150: 48 80 02 49 08 75 10 BD 2E 02 00 20 B4 A3 00 20  |H..I.u..... ... | [+8] 0x2000022E=RAM+0x22E; [+12] 0x2000A3B4=g_rf_state
   0x08023160: 10 B5 EA F7 6F FA F7 F7 45 FD 06 48 01 21 01 70  |....o...E..H.!.p|
   0x08023170: 04 22 42 80 41 70 03 21 BD E8 10 40 27 20 FF F7  |."B.Ap.!...@' ..|
   0x08023180: AB BD 00 00 2E 02 00 20 2D E9 F0 41 2A 49 48 78  |....... -..A*IHx| [+4] 0x2000022E=RAM+0x22E
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  dac_state_dispatch                                                        ║
@@ -49864,52 +52562,117 @@
 ; ║  Called by: audio_dma_dispatch                                              ║
 ; ║  Calls: state_check, dac_state_dispatch                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * dac_state_dispatch  [AUDIO] - DAC state machine dispatch - called by dac_dma_audio_engine
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: dac_state_dispatch(void)                             │
+; │                                                                     │
+; │ DAC RX audio gate state machine. Only active when RF mode == 11   │
+; │ (RX monitor mode). Controls audio gating during RX squelch/signal │
+; │ transitions via 6-state machine.                                    │
+; │                                                                     │
+; │   if (g_rf_state[1] != 11) return;  // only in RX monitor mode    │
+; │                                                                     │
+; │   state_ctrl = (struct*) 0x2000022E;  // {state[0], flag[1], ctr[2:3]} │
+; │   phase_acc  = (struct*) 0x20000234;  // {byte at +2 = retry_cnt} │
+; │   audio_cfg  = (struct*) 0x2000A8B0;  // {byte at +10 = sub_mode} │
+; │                                                                     │
+; │   switch (state_ctrl->state) {  // 6 states via tbb               │
+; │   case 0: // INIT - check rf_audio_gate_ctrl result               │
+; │       result = rf_audio_gate_ctrl();   // @ 0x0801A1E0            │
+; │       if (result != 1) { rf_flag_dispatch(); retry=0; return; }   │
+; │       // Fall through to debounce                                   │
+; │   case 1: // DEBOUNCE - wait for 3 stable readings                │
+; │       if (++retry < 3) return;                                     │
+; │       sub_mode = audio_cfg[10];                                    │
+; │       if (sub_mode == 0) { state=2; timer=50; }  // normal gate   │
+; │       if (sub_mode == 1) { state=3; timer=50; }  // alt gate      │
+; │       if (sub_mode == 2) { state=5; timer=10; }  // fast gate     │
+; │       break;                                                        │
+; │   case 2: // GATE OPEN - normal audio gate                        │
+; │       if (sub_mode==1 && rf_audio_gate_ctrl()==1) timer=50;       │
+; │       rf_flag_dispatch(); retry=0; break;                          │
+; │   case 3: // GATE MONITOR - check gate, extend timer              │
+; │       if (rf_audio_gate_ctrl()) timer=50;                          │
+; │       else if (timer==0) state=4; break;                           │
+; │   case 4: // GATE TIMEOUT                                         │
+; │       rf_flag_dispatch(); retry=0; break;                          │
+; │   case 5: // GATE CLOSE - reset all state                         │
+; │       state=0; timer=0; g_rf_state[20]=0; retry=0; break;         │
+; │   }                                                                 │
+; │                                                                     │
+; │ KEY FUNCTION: rf_audio_gate_ctrl @ 0x0801A1E0 - controls whether  │
+; │ audio passes through based on squelch/signal detection.            │
+; │                                                                     │
+; │ RAM STATE:                                                          │
+; │   0x2000022E: state byte (0-5)                                     │
+; │   0x2000022F: flag byte                                            │
+; │   0x20000230: timer/counter (halfword)                             │
+; │   0x20000236: retry counter (byte at 0x20000234+2)                │
+; └---------------------------------------------------------------------┘
+; * dac_state_dispatch  [AUDIO] - DAC RX audio gate state machine (6 states, mode 11 only)
+; -- dac_state_dispatch --------------------------------------------------
+; DAC RX audio gate state machine (176B, 6 states).
+; Only active when g_rf_state[1] == 11 (RF status query mode).
+;
+; State struct @ 0x2000022E:
+;   [0] = current state (0-5)
+;   [2:3] = timer/counter (halfword, counts down)
+; Retry counter @ 0x20000236 (0x20000234+2)
+;
+; TBB table (6 states at 0x80231AA):
+;   State 0: RF RSSI check → if squelch open, transition based on
+;            audio_mode (settings[10]): mode 0→st2, mode 1→st3, mode 2→st5
+;   State 1: retry check (3 attempts) → same mode dispatch
+;   State 2: monitor RSSI (mode 0), if still open → reset timer
+;            if timer expired → state 4
+;   State 3: monitor RSSI (mode 1), if open → reset timer
+;   State 4: timeout → reset timer, stay in state 4
+;   State 5: cleanup → reset all state + counter + flag
+; ------------------------------------------------------------------------
  8023188:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
  802318c:	492a      	ldr	r1, [pc, #168]	@ (0x8023238)                    ; = 0x2000A3B4 (g_rf_state)
- 802318e:	7848      	ldrb	r0, [r1, #1]
- 8023190:	280b      	cmp	r0, #11
+ 802318e:	7848      	ldrb	r0, [r1, #1] ;; r0 = dispatch mode
+ 8023190:	280b      	cmp	r0, #11 ;; only active in mode 11
  8023192:	d114      	bne.n	0x80231be
  8023194:	4c29      	ldr	r4, [pc, #164]	@ (0x802323c)                    ; = 0x2000022E (RAM+0x22E)
  8023196:	2600      	movs	r6, #0
  8023198:	f8df 80a4 	ldr.w	r8, [pc, #164]	@ 0x8023240                    ; = 0x2000A8B0 (RAM+0xA8B0)
- 802319c:	7820      	ldrb	r0, [r4, #0]
+ 802319c:	7820      	ldrb	r0, [r4, #0] ;; r0 = current state (0-5)
  802319e:	2732      	movs	r7, #50	@ 0x32
  80231a0:	4d28      	ldr	r5, [pc, #160]	@ (0x8023244)                    ; = 0x20000234 (RAM+0x234)
- 80231a2:	2806      	cmp	r0, #6
+ 80231a2:	2806      	cmp	r0, #6 ;; 6 states max
  80231a4:	d20b      	bcs.n	0x80231be
- 80231a6:	e8df f000 	tbb	[pc, r0]
+ 80231a6:	e8df f000 	tbb	[pc, r0] ;; state dispatch table
  80231aa:	030a      	lsls	r2, r1, #12
  80231ac:	3326      	adds	r3, #38	@ 0x26
  80231ae:	423e      	tst	r6, r7
- 80231b0:	f7f7 f816 	bl	0x801a1e0
- 80231b4:	2801      	cmp	r0, #1
+ 80231b0:	f7f7 f816 	bl	0x801a1e0 ;; -- state 0: rf_rssi_check()
+ 80231b4:	2801      	cmp	r0, #1 ;; squelch open?
  80231b6:	d004      	beq.n	0x80231c2
- 80231b8:	f7ff ffa8 	bl	0x802310c
+ 80231b8:	f7ff ffa8 	bl	0x802310c ;; no → rf_flag_dispatch (reset)
  80231bc:	70ae      	strb	r6, [r5, #2]
  80231be:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}
- 80231c2:	78a8      	ldrb	r0, [r5, #2]
- 80231c4:	2803      	cmp	r0, #3
+ 80231c2:	78a8      	ldrb	r0, [r5, #2] ;; -- state 1: check retry count
+ 80231c4:	2803      	cmp	r0, #3 ;; max 3 retries
  80231c6:	d202      	bcs.n	0x80231ce
  80231c8:	1c40      	adds	r0, r0, #1
  80231ca:	70a8      	strb	r0, [r5, #2]
  80231cc:	e7f7      	b.n	0x80231be
- 80231ce:	f898 000a 	ldrb.w	r0, [r8, #10]
+ 80231ce:	f898 000a 	ldrb.w	r0, [r8, #10] ;; audio_mode = settings[10]
  80231d2:	b140      	cbz	r0, 0x80231e6
  80231d4:	2801      	cmp	r0, #1
  80231d6:	d00a      	beq.n	0x80231ee
  80231d8:	2802      	cmp	r0, #2
  80231da:	d1f0      	bne.n	0x80231be
- 80231dc:	2005      	movs	r0, #5
+ 80231dc:	2005      	movs	r0, #5 ;; mode 2 → state 5 (cleanup)
  80231de:	7020      	strb	r0, [r4, #0]
  80231e0:	200a      	movs	r0, #10
  80231e2:	8060      	strh	r0, [r4, #2]
  80231e4:	e7eb      	b.n	0x80231be
- 80231e6:	2002      	movs	r0, #2
+ 80231e6:	2002      	movs	r0, #2 ;; mode 0 → state 2 (monitor)
  80231e8:	7020      	strb	r0, [r4, #0]
  80231ea:	8067      	strh	r7, [r4, #2]
  80231ec:	e7e7      	b.n	0x80231be
- 80231ee:	2003      	movs	r0, #3
+ 80231ee:	2003      	movs	r0, #3 ;; mode 1 → state 3 (monitor)
  80231f0:	7020      	strb	r0, [r4, #0]
  80231f2:	8067      	strh	r7, [r4, #2]
  80231f4:	e7e3      	b.n	0x80231be
@@ -49923,29 +52686,29 @@
  8023208:	f7ff ff80 	bl	0x802310c
  802320c:	70ae      	strb	r6, [r5, #2]
  802320e:	e7d6      	b.n	0x80231be
- 8023210:	f7f6 ffe6 	bl	0x801a1e0
+ 8023210:	f7f6 ffe6 	bl	0x801a1e0 ;; -- state 3: rf_rssi_check()
  8023214:	b108      	cbz	r0, 0x802321a
  8023216:	8067      	strh	r7, [r4, #2]
  8023218:	e7d1      	b.n	0x80231be
  802321a:	8860      	ldrh	r0, [r4, #2]
  802321c:	2800      	cmp	r0, #0
  802321e:	d1ce      	bne.n	0x80231be
- 8023220:	2004      	movs	r0, #4
+ 8023220:	2004      	movs	r0, #4 ;; timer expired → state 4
  8023222:	7020      	strb	r0, [r4, #0]
  8023224:	e7cb      	b.n	0x80231be
- 8023226:	f7ff ff71 	bl	0x802310c
+ 8023226:	f7ff ff71 	bl	0x802310c ;; -- state 4: rf_flag_dispatch (timeout)
  802322a:	70ae      	strb	r6, [r5, #2]
  802322c:	e7c7      	b.n	0x80231be
- 802322e:	7026      	strb	r6, [r4, #0]
+ 802322e:	7026      	strb	r6, [r4, #0] ;; -- state 5: reset state to 0
  8023230:	8066      	strh	r6, [r4, #2]
  8023232:	750e      	strb	r6, [r1, #20]
  8023234:	70ae      	strb	r6, [r5, #2]
  8023236:	e7c2      	b.n	0x80231be
 
-; ─── DATA @ 0x08023238 ────────────────────────────────────────────
+; --- DATA @ 0x08023238 --------------------------------------------
   0x08023230: 66 80 0E 75 AE 70 C2 E7 B4 A3 00 20 2E 02 00 20  |f..u.p..... ... | [+8] 0x2000A3B4=g_rf_state; [+12] 0x2000022E=RAM+0x22E
   0x08023240: B0 A8 00 20 34 02 00 20 01 46 01 20 EB F7 A0 B8  |... 4.. .F. ....| [+0] 0x2000A8B0=RAM+0xA8B0; [+4] 0x20000234=RAM+0x234; [+8] 0x20014601=RAM+0x14601
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_subsystem_flag                                                        ║
@@ -49953,7 +52716,7 @@
 ; ║  Called by: audio_dma_dispatch, rf_channel_display_init, display_subsystem_flag                  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * display_subsystem_flag  [DISPLAY] - Display subsystem flag - ←rf_channel_display_init
- 8023248:	4601      	mov	r1, r0
+ 8023248:	4601      	mov	r1, r0 ;; display_subsystem_flag(event): trampoline → 0x800E390(1, event)
  802324a:	2001      	movs	r0, #1
  802324c:	f7eb b8a0 	b.w	0x800e390
 ; ╔══════════════════════════════════════════════════════════════════════╗
@@ -50017,9 +52780,9 @@
  80232b6:	2005      	moveq	r0, #5
  80232b8:	4770      	bx	lr
 
-; ─── DATA @ 0x080232BA ────────────────────────────────────────────
+; --- DATA @ 0x080232BA --------------------------------------------
   0x080232B0: 02 00 01 28 08 BF 05 20 70 47 00 00 10 EE 10 0A  |...(... pG......|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  codec_decode                                                        ║
@@ -50307,14 +53070,14 @@
  8023604:	eeb7 0a00 	vmovcc.f32	s0, #112	@ 0x3f800000  1.0
  8023608:	bd08      	popcc	{r3, pc}
 
-; ─── DATA @ 0x0802360A ────────────────────────────────────────────
+; --- DATA @ 0x0802360A --------------------------------------------
   0x08023600: 7F 4F 3C BF B7 EE 00 0A 08 BD 07 D1 4F F0 01 00  |.O<.........O...|
   0x08023610: DD F7 D8 FD BD E8 08 40 01 F0 9C B9 BD E8 08 40  |.......@.......@|
   0x08023620: 01 F0 92 B9 B6 1F 92 7E 33 6D 4C 39 DA 82 08 3C  |.......~3mL9...<|
   0x08023630: A0 AA 2A BE 49 0E 49 46 83 F9 22 3F 00 00 00 4B  |..*.I.IF.."?...K|
   0x08023640: 00 00 C9 3F 00 A0 FD 39 00 20 A2 33 1A 61 34 2C  |...?...9. .3.a4,|
   0x08023650: B9 3A B2 BA CA 9F 2A 3D DD FF FF BE 10 B5 10 EE  |.:....*=........|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  codec_encode                                                        ║
@@ -50535,9 +53298,9 @@
  80238ec:	e8bd 4010 	ldmia.w	sp!, {r4, lr}
  80238f0:	f001 b830 	b.w	0x8024954
 
-; ─── DATA @ 0x080238F4 ────────────────────────────────────────────
+; --- DATA @ 0x080238F4 --------------------------------------------
   0x080238F0: 01 F0 30 B8 00 00 00 00 30 B5 40 F2 FF 74 2D ED  |..0.....0.@..t-.|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_shift_tail                                                        ║
@@ -50606,9 +53369,9 @@
  80239ba:	ecbd 8b04 	vpop	{d8-d9}
  80239be:	bd30      	pop	{r4, r5, pc}
 
-; ─── DATA @ 0x080239C0 ────────────────────────────────────────────
+; --- DATA @ 0x080239C0 --------------------------------------------
   0x080239C0: 00 00 00 00 00 00 00 00 2D E9 F0 4D 2D ED 04 0B  |........-..M-...|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  protocol_parser                                                        ║
@@ -51361,7 +54124,7 @@
  80242dc:	5720      	ldrsb	r0, [r4, r4]
  80242de:	0003      	movs	r3, r0
 
-; ─── DATA @ 0x080242E0 ────────────────────────────────────────────
+; --- DATA @ 0x080242E0 --------------------------------------------
   0x080242E0: 03 F0 CC FA 53 EC 1A 2B 02 F0 4A FE 9D ED 06 0B  |....S..+..J.....|
   0x080242F0: 41 EC 1A 0B 53 EC 10 2B 9D ED 00 0B 51 EC 10 0B  |A...S..+....Q...|
   0x08024300: 03 F0 BC FA CD E9 0C 01 9D ED 0C 0B 51 EC 1A 0B  |............Q...|
@@ -51414,7 +54177,7 @@
   0x080245F0: 00 00 00 00 43 2E E6 3F 39 6C A8 0C 61 5C 20 BE  |....C..?9l..a\ .|
   0x08024600: EF 39 FA FE 42 2E E6 3F 78 54 03 00 00 00 00 00  |.9..B..?xT......|
   0x08024610: 00 00 00 00 00 00 00 40 00 B5 10 EE 10 1A 2D ED  |.......@......-.| [+4] 0x40000000=TIM2
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  protocol_state_machine                                                        ║
@@ -51637,7 +54400,7 @@
  802489a:	ec41 0b10 	vmov	d0, r0, r1
  802489e:	bd70      	pop	{r4, r5, r6, pc}
 
-; ─── DATA @ 0x080248A0 ────────────────────────────────────────────
+; --- DATA @ 0x080248A0 --------------------------------------------
   0x080248A0: 9F ED 07 0B 10 B5 53 EC 10 2B 9F ED 07 0B 51 EC  |......S..+....Q.|
   0x080248B0: 10 0B 02 F0 A5 FC 41 EC 10 0B 10 BD 00 00 00 00  |......A.........|
   0x080248C0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 F0 3F  |...............?|
@@ -51645,7 +54408,7 @@
   0x080248E0: 10 0B 10 BD 00 00 00 00 9F ED 05 0B 10 B5 53 EC  |..............S.|
   0x080248F0: 10 2B 51 EC 10 0B 02 F0 83 FC 41 EC 10 0B 10 BD  |.+Q.......A.....|
   0x08024900: 00 00 00 00 00 00 00 00 9F ED 05 0B 10 B5 53 EC  |..............S.|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_shift_util                                                        ║
@@ -51662,9 +54425,9 @@
  802491a:	ec41 0b10 	vmov	d0, r0, r1
  802491e:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x08024920 ────────────────────────────────────────────
+; --- DATA @ 0x08024920 --------------------------------------------
   0x08024920: 00 00 00 00 00 00 00 70 9F ED 05 0B 10 B5 53 EC  |.......p......S.|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_shift_dispatch_a                                                        ║
@@ -51681,12 +54444,12 @@
  802493a:	ec41 0b10 	vmov	d0, r0, r1
  802493e:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x08024940 ────────────────────────────────────────────
+; --- DATA @ 0x08024940 --------------------------------------------
   0x08024940: 00 00 00 00 00 00 00 10 30 EE 00 0A 70 47 30 EE  |........0...pG0.|
   0x08024950: 20 0A 70 47 DF ED 02 0A 80 EE A0 0A 70 47 00 00  | .pG........pG..|
   0x08024960: 00 00 00 00 9F ED 02 0A 20 EE 00 0A 70 47 00 00  |........ ...pG..|
   0x08024970: 00 00 00 70 9F ED 02 0A 20 EE 00 0A 70 47 00 00  |...p.... ...pG..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  codec_decode_step                                                        ║
@@ -51698,10 +54461,10 @@
  8024978:	ee20 0a00 	vmul.f32	s0, s0, s0
  802497c:	4770      	bx	lr
 
-; ─── DATA @ 0x0802497E ────────────────────────────────────────────
+; --- DATA @ 0x0802497E --------------------------------------------
   0x08024970: 00 00 00 70 9F ED 02 0A 20 EE 00 0A 70 47 00 00  |...p.... ...pG..|
   0x08024980: 00 00 00 10 00 00 00 00 30 B5 04 46 2D ED 04 8B  |........0..F-...|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_convert_tail                                                        ║
@@ -51764,10 +54527,10 @@
  8024a28:	ecbd 8b04 	vpop	{d8-d9}
  8024a2c:	bd30      	pop	{r4, r5, pc}
 
-; ─── DATA @ 0x08024A2E ────────────────────────────────────────────
+; --- DATA @ 0x08024A2E --------------------------------------------
   0x08024A20: 10 0A 84 ED 00 8A 01 B0 BD EC 04 8B 30 BD 00 00  |............0...|
   0x08024A30: 00 00 00 00 00 00 00 00 00 00 80 FF 00 00 80 7F  |................|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lib_protocol_state_data                                                        ║
@@ -51784,7 +54547,7 @@
  8024a54:	e8bd 01f0 	ldmials.w	sp!, {r4, r5, r6, r7, r8}
  8024a58:	4770      	bxls	lr
 
-; ─── DATA @ 0x08024A5A ────────────────────────────────────────────
+; --- DATA @ 0x08024A5A --------------------------------------------
   0x08024A50: FF 31 01 60 BD E8 F0 01 70 47 4F F0 00 42 42 EA  |.1.`....pGO..BB.|
   0x08024A60: 01 23 C1 F3 C7 52 78 3A 55 11 12 F0 1F 0C 43 4C  |.#...Rx:U.....CL|
   0x08024A70: CC F1 20 06 7C 44 C1 F3 C7 52 A2 F1 78 02 4F EA  |.. .|D...R..x.O.|
@@ -51806,7 +54569,7 @@
   0x08024B70: 01 60 BD E8 F0 01 B1 EE 40 0A 70 47 18 4F 03 00  |.`......@.pG.O..|
   0x08024B80: 00 00 00 36 00 00 80 2C 22 AA FD 29 DB 0F C9 2F  |...6...,"..).../|
   0x08024B90: 00 00 C9 2F 10 B5 04 46 90 ED 00 0B 08 46 FE F7  |.../...F.....F..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_shift_entry_b                                                        ║
@@ -51836,9 +54599,9 @@
  8024bb2:	2000      	movs	r0, #0
  8024bb4:	4770      	bx	lr
 
-; ─── DATA @ 0x08024BB6 ────────────────────────────────────────────
+; --- DATA @ 0x08024BB6 --------------------------------------------
   0x08024BB0: 70 47 00 20 70 47 FE E7 01 F0 D8 BB 2D E9 F0 4F  |pG. pG......-..O| [+0] 0x20004770=RAM+0x4770
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  flash_display_tx_data                                                        ║
@@ -51916,10 +54679,10 @@
  8024c78:	4640      	mov	r0, r8
  8024c7a:	e8bd 8ff0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl, fp, pc}
 
-; ─── DATA @ 0x08024C7E ────────────────────────────────────────────
+; --- DATA @ 0x08024C7E --------------------------------------------
   0x08024C70: B4 DC 03 48 43 80 04 70 40 46 BD E8 F0 8F 00 00  |...HC..p@F......|
   0x08024C80: E0 0B 00 20 C0 BB 05 08 00 F8 FF FF 02 48 00 21  |... .........H.!| [+0] 0x20000BE0=RAM+0xBE0; [+4] 0x0805BBC0=flash+0x5BBC0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_tx_status_tail                                                        ║
@@ -51933,9 +54696,9 @@
  8024c92:	7001      	strb	r1, [r0, #0]
  8024c94:	4770      	bx	lr
 
-; ─── DATA @ 0x08024C96 ────────────────────────────────────────────
+; --- DATA @ 0x08024C96 --------------------------------------------
   0x08024C90: 41 80 01 70 70 47 00 00 E0 0B 00 20 10 B5 03 46  |A..ppG..... ...F| [+8] 0x20000BE0=RAM+0xBE0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  usart1_data_write                                                        ║
@@ -51969,9 +54732,9 @@
  8024cbe:	d5fc      	bpl.n	0x8024cba
  8024cc0:	4770      	bx	lr
 
-; ─── DATA @ 0x08024CC2 ────────────────────────────────────────────
+; --- DATA @ 0x08024CC2 --------------------------------------------
   0x08024CC0: 70 47 00 00 04 38 01 40 FE B5 06 46 00 25 00 20  |pG...8.@...F.%. | [+12] 0x20002500=RAM+0x2500
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_route_string_fmt                                                        ║
@@ -52046,9 +54809,9 @@
  8024d54:	4800      	ldr	r0, [pc, #0]	@ (0x8024d58)                      ; = 0x20000256 (RAM+0x256)
  8024d56:	bdfe      	pop	{r1, r2, r3, r4, r5, r6, r7, pc}
 
-; ─── DATA @ 0x08024D58 ────────────────────────────────────────────
+; --- DATA @ 0x08024D58 --------------------------------------------
   0x08024D50: 07 28 F8 D9 00 48 FE BD 56 02 00 20 88 42 01 DC  |.(...H..V.. .B..| [+8] 0x20000256=RAM+0x256
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_info_cursor_read                                                        ║
@@ -52074,9 +54837,9 @@
  8024d70:	ee20 0a20 	vmul.f32	s0, s0, s1
  8024d74:	4770      	bx	lr
 
-; ─── DATA @ 0x08024D76 ────────────────────────────────────────────
+; --- DATA @ 0x08024D76 --------------------------------------------
   0x08024D70: 20 EE 20 0A 70 47 00 00 35 FA 8E 3C 10 B5 05 4C  | . .pG..5..<...L|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  delay_ms                                                            ║
@@ -52098,9 +54861,9 @@
  8024d8e:	d1fa      	bne.n	0x8024d86
  8024d90:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x08024D92 ────────────────────────────────────────────
+; --- DATA @ 0x08024D92 --------------------------------------------
   0x08024D90: 10 BD 00 00 EC A2 00 20 0F B4 2D E9 F0 41 BE B0  |....... ..-..A..| [+4] 0x2000A2EC=RAM+0xA2EC
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_route_name_copy                                                        ║
@@ -52269,12 +55032,12 @@
  8024ee2:	f04f 30ff 	mov.w	r0, #4294967295	@ 0xffffffff
  8024ee6:	4770      	bx	lr
 
-; ─── DATA @ 0x08024EE8 ────────────────────────────────────────────
+; --- DATA @ 0x08024EE8 --------------------------------------------
   0x08024EE0: 14 FB 4F F0 FF 30 70 47 0A 4A 21 23 13 70 00 23  |..O..0pG.J!#.p.#|
   0x08024EF0: 53 70 00 28 01 D0 08 20 50 70 19 B1 50 78 40 F0  |Sp.(... Pp..Px@.|
   0x08024F00: 04 00 50 70 03 4B 01 22 DB 1D D9 1F 02 20 01 F0  |..Pp.K."..... ..|
   0x08024F10: 4C BB 00 00 9E 01 00 20 2D E9 FC 47 07 46 0E 46  |L...... -..G.F.F| [+4] 0x2000019E=RAM+0x19E
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  crc_calculate                                                        ║
@@ -53075,10 +55838,10 @@
  8025640:	2001      	movs	r0, #1
  8025642:	e504      	b.n	0x802504e
 
-; ─── DATA @ 0x08025644 ────────────────────────────────────────────
+; --- DATA @ 0x08025644 --------------------------------------------
   0x08025640: 01 20 04 E5 44 52 2D 37 34 30 30 00 44 52 2D 37  |. ..DR-7400.DR-7|
   0x08025650: 38 30 30 00 55 6E 6B 6E 6F 77 6E 00 2D E9 F0 47  |800.Unknown.-..G|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_display_detail                                                        ║
@@ -53149,9 +55912,9 @@
  802571c:	7160      	strb	r0, [r4, #5]
  802571e:	e7f6      	b.n	0x802570e
 
-; ─── DATA @ 0x08025720 ────────────────────────────────────────────
+; --- DATA @ 0x08025720 --------------------------------------------
   0x08025720: 00 F0 24 BE 00 00 00 00 10 B5 82 B0 14 46 CD E9  |..$..........F..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_shift_util                                                        ║
@@ -53202,11 +55965,11 @@
  8025798:	ed9d 0b00 	vldr	d0, [sp]
  802579c:	e7f8      	b.n	0x8025790
 
-; ─── DATA @ 0x0802579E ────────────────────────────────────────────
+; --- DATA @ 0x0802579E --------------------------------------------
   0x08025790: 02 B0 51 EC 10 0B 10 BD 9D ED 00 0B F8 E7 00 00  |..Q.............|
   0x080257A0: 00 00 F0 7F 00 00 00 00 00 00 00 00 00 00 50 43  |..............PC|
   0x080257B0: 02 FC FF FF 30 B4 02 46 19 48 13 78 52 78 A3 F1  |....0..F.H.xRx..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  font_glyph_bitmap_medium                                                        ║
@@ -53254,10 +56017,10 @@
  8025818:	2218      	movs	r2, #24
  802581a:	f7fb bc2f 	b.w	0x802107c
 
-; ─── DATA @ 0x0802581E ────────────────────────────────────────────
+; --- DATA @ 0x0802581E --------------------------------------------
   0x08025810: 42 02 00 EB C2 00 30 BC 18 22 FB F7 2F BC 00 00  |B.....0.."../...|
   0x08025820: 80 9E 19 00 02 46 4F F4 AE 10 12 78 20 3A 5E 2A  |.....FO....x :^*|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  font_glyph_addr_small                                                        ║
@@ -53317,9 +56080,9 @@
  802589a:	2220      	movs	r2, #32
  802589c:	f7fb bbee 	b.w	0x802107c
 
-; ─── DATA @ 0x080258A0 ────────────────────────────────────────────
+; --- DATA @ 0x080258A0 --------------------------------------------
   0x080258A0: 00 CF 15 00 30 B4 02 46 4F F4 60 20 13 78 52 78  |....0..FO.` .xRx|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  font_glyph_bitmap_large                                                        ║
@@ -53382,9 +56145,9 @@
  8025924:	220c      	movs	r2, #12
  8025926:	f7fb bba9 	b.w	0x802107c
 
-; ─── DATA @ 0x0802592A ────────────────────────────────────────────
+; --- DATA @ 0x0802592A --------------------------------------------
   0x08025920: 00 EB 82 00 0C 22 FB F7 A9 BB 00 00 40 3C 1C 00  |....."......@<..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  font_glyph_render                                                        ║
@@ -53424,9 +56187,9 @@
  802596e:	d3ee      	bcc.n	0x802594e
  8025970:	bd70      	pop	{r4, r5, r6, pc}
 
-; ─── DATA @ 0x08025972 ────────────────────────────────────────────
+; --- DATA @ 0x08025972 --------------------------------------------
   0x08025970: 70 BD 00 00 C0 86 19 00 0F B4 10 B5 92 B0 04 46  |p..............F|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_route_copy                                                        ║
@@ -53465,7 +56228,15 @@
 ; ║  Called by: aprs_protocol_handler                                              ║
 ; ║  Calls: delay_short, gpio_input_data_bit_read, gpio_bits_reset, gpio_bits_set, aprs_protocol_handler  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * aprs_tone_modulate  [APRS] - APRS GPIO tone modulation - calls gpio_bits_set/reset
+; * si4732_i2c_read_byte  [SI4732/I2C] - Bit-bang I2C read byte (194B)
+;
+;   Reads 8 bits from SDA (PB7) while clocking SCL (PB6).
+;   I2C protocol: clock SCL for each bit, sample SDA on rising edge.
+;   PB6 = SCL (output), PB7 = SDA (bidirectional)
+;   GPIOB base = 0x40010C00
+;
+;   RENAME: was aprs_tone_modulate - actually SI4732 I2C bit-bang read byte
+;   Called by: aprs_protocol_handler (→ si4732_i2c_read_response)
  80259b4:	e92d 41f0 	stmdb	sp!, {r4, r5, r6, r7, r8, lr}
  80259b8:	4607      	mov	r7, r0
  80259ba:	2400      	movs	r4, #0
@@ -53540,9 +56311,9 @@
  8025a70:	f7ec fd9d 	bl	0x80125ae                                        ; gpio_bits_reset ;; CLR GPIOB -> PB6
  8025a74:	e7e9      	b.n	0x8025a4a
 
-; ─── DATA @ 0x08025A76 ────────────────────────────────────────────
+; --- DATA @ 0x08025A76 --------------------------------------------
   0x08025A70: EC F7 9D FD E9 E7 00 00 00 0C 01 40 70 B5 04 46  |...........@p..F| [+8] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  aprs_modulate_dispatch                                                        ║
@@ -53550,7 +56321,14 @@
 ; ║  Called by: aprs_protocol_handler, display_bar_modulate                                ║
 ; ║  Calls: delay_short, gpio_bits_reset, gpio_bits_set, aprs_protocol_handler    ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * aprs_gpio_modulate_b  [APRS] - APRS GPIO modulation variant B - refs GPIOB
+; * si4732_i2c_start_send_addr  [SI4732/I2C] - I2C START + send address byte (218B)
+;
+;   Sequence: SDA=HIGH, SCL=HIGH → SDA=LOW (START) → SCL=LOW → send addr byte
+;   I2C address 0x11: write=0x22 (0x11<<1|0), read=0x23 (0x11<<1|1)
+;   PB6 = SCL, PB7 = SDA, GPIOB @ 0x40010C00
+;
+;   RENAME: was aprs_gpio_modulate_b - actually SI4732 I2C START condition + address
+;   Called by: si4732_i2c_read_response, display_bar_modulate (I2C master)
  8025a7c:	b570      	push	{r4, r5, r6, lr}
  8025a7e:	4604      	mov	r4, r0
  8025a80:	460d      	mov	r5, r1
@@ -53634,7 +56412,7 @@
  8025b50:	200a      	movs	r0, #10
  8025b52:	f7e4 bf06 	b.w	0x800a962                                       ; -> delay_short
 
-; ─── DATA @ 0x08025B56 ────────────────────────────────────────────
+; --- DATA @ 0x08025B56 --------------------------------------------
   0x08025B50: 0A 20 E4 F7 06 BF 00 00 00 0C 01 40 10 B5 17 4C  |. .........@...L| [+8] 0x40010C00=GPIOB
   0x08025B60: 01 22 80 21 20 46 ED F7 C5 FE 0A 20 E4 F7 F9 FE  |.".! F..... ....|
   0x08025B70: 40 21 20 46 EC F7 1B FD 05 20 E4 F7 F2 FE 80 21  |@! F..... .....!|
@@ -53642,7 +56420,7 @@
   0x08025B90: EC F7 0F FD 05 20 E4 F7 E4 FE 80 21 20 46 EC F7  |..... .....! F..|
   0x08025BA0: 08 FD 05 20 E4 F7 DD FE 40 21 20 46 EC F7 FF FC  |... ....@! F....|
   0x08025BB0: BD E8 10 40 05 20 E4 F7 D4 BE 00 00 00 0C 01 40  |...@. .........@| [+12] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  aprs_modulate_dispatch                                                        ║
@@ -53650,7 +56428,14 @@
 ; ║  Called by: display_bar_modulate                                              ║
 ; ║  Calls: delay_short, gpio_bits_reset, gpio_bits_set, aprs_protocol_handler    ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * aprs_ptt_modulate  [APRS/GPIO] - APRS PTT modulation - 156B, refs GPIOB, GPIO toggle
+; * si4732_i2c_write_byte  [SI4732/I2C] - I2C write byte (156B)
+;
+;   Sends 8 bits on SDA (PB7) while clocking SCL (PB6).
+;   Bit-bang: for each bit, set SDA, pulse SCL high→low.
+;   PB6 = SCL, PB7 = SDA, GPIOB @ 0x40010C00
+;
+;   RENAME: was aprs_ptt_modulate - actually SI4732 I2C bit-bang write byte
+;   Called by: si4732_i2c_send_cmd (command transmission)
  8025bc0:	b570      	push	{r4, r5, r6, lr}
  8025bc2:	4605      	mov	r5, r0
  8025bc4:	2407      	movs	r4, #7
@@ -53712,9 +56497,9 @@
  8025c56:	200a      	movs	r0, #10
  8025c58:	f7e4 be83 	b.w	0x800a962                                       ; -> delay_short
 
-; ─── DATA @ 0x08025C5C ────────────────────────────────────────────
+; --- DATA @ 0x08025C5C --------------------------------------------
   0x08025C50: 51 FE BD E8 70 40 0A 20 E4 F7 83 BE 00 0C 01 40  |Q...p@. .......@| [+12] 0x40010C00=GPIOB
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  crc_calc_tail_a                                                        ║
@@ -53787,7 +56572,7 @@
  8025cb8:	2000      	movs	r0, #0
  8025cba:	4770      	bx	lr
 
-; ─── DATA @ 0x08025CBC ────────────────────────────────────────────
+; --- DATA @ 0x08025CBC --------------------------------------------
   0x08025CB0: 19 28 01 D8 01 20 70 47 00 20 70 47 10 B5 00 28  |.(... pG. pG...(|
   0x08025CC0: 07 D0 00 EB 80 02 0B A1 0C 48 DA F7 C1 FD 0B 48  |.........H.....H|
   0x08025CD0: 10 BD 0B 48 00 7A 01 28 05 D0 0A A2 0A A1 07 48  |...H.z.(.......H|
@@ -53802,7 +56587,7 @@
   0x08025D60: 0C 38 F6 E7 30 E6 00 20 B0 A8 00 20 70 05 00 20  |.8..0.. ... p.. | [+4] 0x2000E630=RAM+0xE630; [+8] 0x2000A8B0=RAM+0xA8B0; [+12] 0x20000570=RAM+0x570
   0x08025D70: 10 B5 E7 F7 AD FF 0B 49 03 20 A1 F8 01 00 01 20  |.......I. ..... | [+12] 0x20010001=RAM+0x10001
   0x08025D80: 08 70 09 48 82 7B A1 F8 07 20 00 7A 01 28 06 D0  |.p.H.{... .z.(..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  oem_main                                                        ║
@@ -54210,17 +56995,22 @@
  8026180:	f7f0 b8b6 	b.w	0x80162f0
  8026184:	a8d0      	add	r0, sp, #832	@ 0x340
  8026186:	2000      	movs	r0, #0
- 8026188:	b510      	push	{r4, lr}
- 802618a:	f44f 5140 	mov.w	r1, #12288	@ 0x3000
- 802618e:	f04f 6000 	mov.w	r0, #134217728	@ 0x8000000
- 8026192:	f7f2 fb6b 	bl	0x801886c
- 8026196:	f7e1 f8c5 	bl	0x8007324
- 802619a:	f7e7 fb5f 	bl	0x800d85c
- 802619e:	f7ee fd4d 	bl	0x8014c3c
- 80261a2:	b662      	cpsie	i
- 80261a4:	f7fb fad0 	bl	0x8021748
- 80261a8:	f7f0 fcdc 	bl	0x8016b64
- 80261ac:	2000      	movs	r0, #0
+;; ═══════════════════════════════════════════════════════════════════
+;; OEM_MAIN BOOT ENTRY - Firmware initialization sequence
+;; Called from math_float_entry after FPU + C++ init
+;; Boot order: VTOR → hw_init → encoder → display → IRQ on → UART → loop
+;; ═══════════════════════════════════════════════════════════════════
+ 8026188:	b510      	push	{r4, lr} ;; oem_main entry
+ 802618a:	f44f 5140 	mov.w	r1, #12288	@ 0x3000 ;; r1 = 0x3000 = vector table offset (12KB bootloader)
+ 802618e:	f04f 6000 	mov.w	r0, #134217728	@ 0x8000000 ;; r0 = 0x08000000 = flash base
+ 8026192:	f7f2 fb6b 	bl	0x801886c ;; [1] nvic_vtor_set(0x08000000, 0x3000) → VTOR=0x08003000
+ 8026196:	f7e1 f8c5 	bl	0x8007324 ;; [2] hw_init_main - 11-step peripheral init
+ 802619a:	f7e7 fb5f 	bl	0x800d85c ;; [3] subsystem_init_a - read encoder PB4/PB5 state
+ 802619e:	f7ee fd4d 	bl	0x8014c3c ;; [4] display_init_engine - LCD init + splash screen
+ 80261a2:	b662      	cpsie	i ;; [5] CPSIE I - enable all interrupts globally
+ 80261a4:	f7fb fad0 	bl	0x8021748 ;; [6] uart_comm_handler - UART protocol + BT init
+ 80261a8:	f7f0 fcdc 	bl	0x8016b64 ;; [7] main_task_dispatch - INFINITE polling loop (never returns)
+ 80261ac:	2000      	movs	r0, #0 ;; (unreachable) return 0
  80261ae:	bd10      	pop	{r4, pc}
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  crc_byte_process                                                        ║
@@ -54287,30 +57077,76 @@
  802621a:	2001      	movs	r0, #1
  802621c:	4770      	bx	lr
 
-; ─── DATA @ 0x0802621E ────────────────────────────────────────────
+; --- DATA @ 0x0802621E --------------------------------------------
   0x08026210: 00 20 70 47 40 68 00 B1 00 47 01 20 70 47 00 00  |. pG@h...G. pG..| [+8] 0x20014700=RAM+0x14700
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_route_config_apply                                                        ║
 ; ║  0x08026220  size=110                                           ║
 ; ║  Called by: audio_route_setup                                         ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * audio_route_config_apply  [AUDIO] - Audio route config apply - 110B, ←audio_route_setup
+; ┌---------------------------------------------------------------------┐
+; │ C PSEUDOCODE: audio_route_config_apply(uint8_t *dst, uint8_t *src,│
+; │                                        uint16_t len)               │
+; │                                                                     │
+; │ Applies bit-mask configuration from src to dst using an 8-bit     │
+; │ mask table {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80}.             │
+; │ Also stores len at dst[0x14C] (duration field).                    │
+; │                                                                     │
+; │   uint8_t masks[] = {1,2,4,8,16,32,64,128}; // @ 0x8026290       │
+; │   dst[0x14C] = len;  // store duration                            │
+; │   dst[0] = 1;        // mark as configured                        │
+; │   uint8_t carry = 0;                                               │
+; │   for (byte = 0; byte < len; byte++) {                             │
+; │       for (bit = 0; bit < 8; bit++) {                              │
+; │           if (src[byte] & masks[bit]) {                            │
+; │               if (carry) dst[byte] |= masks[bit];                 │
+; │               else       dst[byte] &= ~masks[bit];                │
+; │           } else {                                                  │
+; │               if (carry) dst[byte] &= ~masks[bit];                │
+; │               else       dst[byte] |= masks[bit];                 │
+; │           }                                                         │
+; │           carry = (dst[byte] & masks[bit]) ? 1 : 0;               │
+; │       }                                                             │
+; │       dst[byte] = ~dst[byte];  // invert result byte              │
+; │   }                                                                 │
+; │                                                                     │
+; │ EFFECT: XOR-like bit manipulation that scrambles tone config data  │
+; │ into the format needed by beep_tone_generate's phase accumulator.  │
+; └---------------------------------------------------------------------┘
+; * audio_route_config_apply  [AUDIO] - Bit-mask tone config apply with XOR scramble
+; -- audio_route_config_apply --------------------------------------------
+; Bit-mask tone config scrambler (110B). Applies XOR-like bit manipulation
+; to transform source tone data into the phase accumulator format needed
+; by beep_tone_generate during DMA buffer fills.
+;
+; r0 = destination (g_timer_state @ 0x2000DF34)
+; r1 = source tone descriptor
+; r2 = length (bytes to process)
+;
+; Algorithm: For each byte in source[0..len-1]:
+;   For each bit position [0..7] (mask table: 01,02,04,08,10,20,40,80):
+;     XOR-toggle: if source bit matches current carry → OR mask into dest
+;                 if source bit differs → BIC mask from dest
+;     Then invert result byte (MVN) and update carry flag
+;   dest[0x14C] = length (store as halfword)
+;   dest[0] = 1 (mark active)
+; ------------------------------------------------------------------------
  8026220:	b5fc      	push	{r2, r3, r4, r5, r6, r7, lr}
  8026222:	2600      	movs	r6, #0
  8026224:	a31a      	add	r3, pc, #104	@ (adr r3, 0x8026290)
  8026226:	cb18      	ldmia	r3, {r3, r4}
  8026228:	e9cd 3400 	strd	r3, r4, [sp]
- 802622c:	f8a0 214c 	strh.w	r2, [r0, #332]	@ 0x14c
+ 802622c:	f8a0 214c 	strh.w	r2, [r0, #332] ;; dest[0x14C] = length	@ 0x14c
  8026230:	2301      	movs	r3, #1
- 8026232:	7003      	strb	r3, [r0, #0]
+ 8026232:	7003      	strb	r3, [r0, #0] ;; dest[0] = 1 (mark active)
  8026234:	2300      	movs	r3, #0
  8026236:	466f      	mov	r7, sp
  8026238:	e026      	b.n	0x8026288
  802623a:	2500      	movs	r5, #0
  802623c:	f811 c003 	ldrb.w	ip, [r1, r3]
- 8026240:	5d7c      	ldrb	r4, [r7, r5]
+ 8026240:	5d7c      	ldrb	r4, [r7, r5] ;; bit mask (01,02,04..80)
  8026242:	ea1c 0f04 	tst.w	ip, r4
  8026246:	d008      	beq.n	0x802625a
  8026248:	b11e      	cbz	r6, 0x8026252
@@ -54338,10 +57174,10 @@
  8026274:	2600      	movs	r6, #0
  8026276:	1c6d      	adds	r5, r5, #1
  8026278:	b2ad      	uxth	r5, r5
- 802627a:	2d08      	cmp	r5, #8
+ 802627a:	2d08      	cmp	r5, #8 ;; 8 bits per byte
  802627c:	d3de      	bcc.n	0x802623c
  802627e:	5cc4      	ldrb	r4, [r0, r3]
- 8026280:	43e4      	mvns	r4, r4
+ 8026280:	43e4      	mvns	r4, r4 ;; invert result byte
  8026282:	54c4      	strb	r4, [r0, r3]
  8026284:	1c5b      	adds	r3, r3, #1
  8026286:	b29b      	uxth	r3, r3
@@ -54349,10 +57185,10 @@
  802628a:	d3d6      	bcc.n	0x802623a
  802628c:	bdfc      	pop	{r2, r3, r4, r5, r6, r7, pc}
 
-; ─── DATA @ 0x0802628E ────────────────────────────────────────────
+; --- DATA @ 0x0802628E --------------------------------------------
   0x08026280: E4 43 C4 54 5B 1C 9B B2 93 42 D6 D3 FC BD 00 00  |.C.T[....B......|
   0x08026290: 01 02 04 08 10 20 40 80 2D E9 FF 47 DD E9 0C 9A  |..... @.-..G....| [+0] 0x08040201=flash+0x40201
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  keypad_string_read                                                        ║
@@ -54389,11 +57225,11 @@
  80262da:	2001      	movs	r0, #1
  80262dc:	e7ec      	b.n	0x80262b8
 
-; ─── DATA @ 0x080262DE ────────────────────────────────────────────
+; --- DATA @ 0x080262DE --------------------------------------------
   0x080262D0: 51 FC 06 28 01 D0 00 20 EE E7 01 20 EC E7 00 00  |Q..(... ... ....| [+4] 0x2000D001=RAM+0xD001; [+8] 0x2001E7EE=RAM+0x1E7EE
   0x080262E0: 25 32 64 25 32 64 25 66 2C 25 32 64 2C 25 32 64  |%2d%2d%f,%2d,%2d|
   0x080262F0: 2C 25 34 64 00 00 00 00 10 B5 9F ED 08 1B 51 EC  |,%4d..........Q.|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_shift_entry                                                        ║
@@ -54413,10 +57249,10 @@
  8026316:	ec41 0b10 	vmov	d0, r0, r1
  802631a:	bd10      	pop	{r4, pc}
 
-; ─── DATA @ 0x0802631C ────────────────────────────────────────────
+; --- DATA @ 0x0802631C --------------------------------------------
   0x08026310: 11 2B 00 F0 75 FF 41 EC 10 0B 10 BD 00 00 00 60  |.+..u.A........`|
   0x08026320: FB 21 09 40 00 00 00 00 00 80 66 40 DF ED 02 0A  |.!.@......f@....|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lib_format_dispatch_tail                                                        ║
@@ -54428,9 +57264,9 @@
  8026330:	ee20 0a20 	vmul.f32	s0, s0, s1
  8026334:	4770      	bx	lr
 
-; ─── DATA @ 0x08026336 ────────────────────────────────────────────
+; --- DATA @ 0x08026336 --------------------------------------------
   0x08026330: 20 EE 20 0A 70 47 00 00 E1 2E 65 42 09 49 0A 4A  | . .pG....eB.I.J|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_field_render_rf                                                        ║
@@ -54454,7 +57290,7 @@
  802635a:	f882 1038 	strb.w	r1, [r2, #56]	@ 0x38
  802635e:	f7f1 bb53 	b.w	0x8017a08
 
-; ─── DATA @ 0x08026362 ────────────────────────────────────────────
+; --- DATA @ 0x08026362 --------------------------------------------
   0x08026360: 53 BB 00 00 30 E6 00 20 D0 AD 00 20 30 B5 00 22  |S...0.. ... 0.."| [+4] 0x2000E630=RAM+0xE630; [+8] 0x2000ADD0=g_config
   0x08026370: 1A 4C 0D 28 1B D0 0A 28 1B D0 09 28 1D D0 61 68  |.L.(...(...(..ah|
   0x08026380: 10 29 05 D3 A1 68 05 29 02 D2 49 1C A1 60 62 60  |.)...h.)..I..`b`|
@@ -54464,7 +57300,7 @@
   0x080263C0: E1 60 30 BD 01 21 FB E7 00 23 05 4D 55 35 05 EB  |.`0..!...#.MU5..|
   0x080263D0: 02 12 53 54 49 1C 61 60 30 BD 00 00 00 02 00 20  |..STI.a`0...... | [+12] 0x20000200=RAM+0x200
   0x080263E0: 49 AE 00 20 1C B5 00 F0 21 F9 19 48 01 24 04 70  |I.. ....!..H.$.p| [+0] 0x2000AE49=RAM+0xAE49
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_scroll_delay_fn                                                        ║
@@ -54511,10 +57347,10 @@
  8026446:	e8bd 401c 	ldmia.w	sp!, {r2, r3, r4, lr}
  802644a:	f7e8 bb31 	b.w	0x800eab0
 
-; ─── DATA @ 0x0802644E ────────────────────────────────────────────
+; --- DATA @ 0x0802644E --------------------------------------------
   0x08026440: E0 75 E8 F7 BD FB BD E8 1C 40 E8 F7 31 BB 00 00  |.u.......@..1...|
   0x08026450: 9E 01 00 20 40 A3 00 20 9A B8 02 08 F9 A8 00 20  |... @.. ....... | [+0] 0x2000019E=RAM+0x19E; [+4] 0x2000A340=RAM+0xA340; [+8] 0x0802B89A=flash+0x2B89A; [+12] 0x2000A8F9=RAM+0xA8F9
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_scroll_delay_fn                                                        ║
@@ -54571,9 +57407,9 @@
  80264dc:	f7e8 fb70 	bl	0x800ebc0
  80264e0:	e7d7      	b.n	0x8026492
 
-; ─── DATA @ 0x080264E2 ────────────────────────────────────────────
+; --- DATA @ 0x080264E2 --------------------------------------------
   0x080264E0: D7 E7 00 00 9E 01 00 20 F9 A8 00 20 40 A3 00 20  |....... ... @.. | [+4] 0x2000019E=RAM+0x19E; [+8] 0x2000A8F9=RAM+0xA8F9; [+12] 0x2000A340=RAM+0xA340
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  aprs_protocol_handler                                                        ║
@@ -54581,7 +57417,13 @@
 ; ║  Called by: display_scroll_delay_fn                                              ║
 ; ║  Calls: delay_short, gpio_bits_reset, gpio_bits_set, aprs_protocol_handler, aprs_protocol_handler (+1 more)  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * aprs_protocol_handler [APRS] - APRS protocol handler (2492B). Largest unnamed function. Refs g_rf. APRS encode/decode.
+; * si4732_i2c_read_response  [SI4732/I2C] - I2C read multi-byte response (2492B)
+;
+;   Sends I2C START + read address (0x23), reads N response bytes into RAM buffer.
+;   Largest I2C function - handles CTS polling, multi-byte reads, error recovery.
+;   Buffer: 0x2000019E (7-byte I2C response buffer in RAM)
+;
+;   RENAME: was aprs_protocol_handler - actually SI4732 I2C multi-byte read
  80264f0:	b570      	push	{r4, r5, r6, lr}
  80264f2:	4605      	mov	r5, r0
  80264f4:	460c      	mov	r4, r1
@@ -54662,7 +57504,12 @@
 ; ║  Called by: display_scroll_delay_fn, display_scroll_delay_fn, lib_udiv, display_scroll_delay_fn    ║
 ; ║  Calls: aprs_modulate_dispatch, aprs_modulate_dispatch                                   ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * aprs_modulate_dispatch  [APRS] - APRS modulation dispatch - calls aprs_ptt_modulate, aprs_gpio_modulate_b
+; * si4732_i2c_send_cmd  [SI4732/I2C] - I2C send command (38B)
+;
+;   Sends multi-byte command to SI4732: START + write addr (0x22) + N data bytes.
+;   Uses si4732_i2c_start_send_addr then loops calling si4732_i2c_write_byte.
+;
+;   RENAME: was aprs_modulate_dispatch - actually SI4732 I2C command sender
  8026584:	b570      	push	{r4, r5, r6, lr}
  8026586:	4604      	mov	r4, r0
  8026588:	460d      	mov	r5, r1
@@ -54719,9 +57566,9 @@
  80265ec:	d3f5      	bcc.n	0x80265da
  80265ee:	bd70      	pop	{r4, r5, r6, pc}
 
-; ─── DATA @ 0x080265F0 ────────────────────────────────────────────
+; --- DATA @ 0x080265F0 --------------------------------------------
   0x080265F0: A0 B8 02 08 08 B5 69 46 01 20 FF F7 79 FF 9D F8  |......iF. ..y...| [+0] 0x0802B8A0=flash+0x2B8A0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_scroll_delay_fn                                                        ║
@@ -54741,7 +57588,14 @@
 ; ║  0x08026604  size=34                                            ║
 ; ║  Called by: display_scroll_pos, display_scroll_udiv, display_scroll_delay_fn, display_scroll_delay_fn, display_scroll_udiv  ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * display_scroll_udiv  [DISPLAY] - Scroll unsigned div - ->lib_udiv
+; * si4732_set_property  [SI4732/I2C] - Set SI4732 property via I2C (34B)
+;
+;   Encodes property ID into 6-byte I2C frame:
+;     [0x12, 0x00, prop_hi, prop_lo, val_hi, val_lo]
+;   0x12 = SI4732 SET_PROPERTY command
+;   Properties control: volume, bandwidth, AGC, seek thresholds, etc.
+;
+;   RENAME: was display_scroll_udiv - actually SI4732 property setter
  8026604:	4a08      	ldr	r2, [pc, #32]	@ (0x8026628)                     ; = 0x2000019E (RAM+0x19E)
  8026606:	2312      	movs	r3, #18
  8026608:	7013      	strb	r3, [r2, #0]
@@ -54759,9 +57613,9 @@
  8026620:	2006      	movs	r0, #6
  8026622:	f7ff bfc2 	b.w	0x80265aa
 
-; ─── DATA @ 0x08026626 ────────────────────────────────────────────
+; --- DATA @ 0x08026626 --------------------------------------------
   0x08026620: 06 20 FF F7 C2 BF 00 00 9E 01 00 20 70 B5 64 24  |. ......... p.d$| [+8] 0x2000019E=RAM+0x19E
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  display_scroll_delay_fn                                                        ║
@@ -54769,7 +57623,13 @@
 ; ║  Called by: display_scroll_delay_fn, display_scroll_delay_fn, lib_udiv, display_scroll_delay_fn    ║
 ; ║  Calls: delay_short, display_scroll_delay_fn                                    ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
-; * display_scroll_delay_fn  [DISPLAY] - Scroll delay function - ->delay_short
+; * si4732_wait_cts  [SI4732/I2C] - Poll CTS (Clear-to-Send) status (42B)
+;
+;   Polls SDA line (PB7) for SI4732 CTS bit. 100 retries x 500us = 50ms timeout.
+;   CTS indicates SI4732 has finished processing previous command.
+;   Must be called between commands per SI4732 programming guide.
+;
+;   RENAME: was display_scroll_delay_fn - actually SI4732 CTS polling loop
  802662c:	b570      	push	{r4, r5, r6, lr}
  802662e:	2464      	movs	r4, #100	@ 0x64
  8026630:	f44f 75fa 	mov.w	r5, #500	@ 0x1f4
@@ -54905,10 +57765,10 @@
  802675e:	bf00      	nop
  8026760:	e8bd 81f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, pc}
 
-; ─── DATA @ 0x08026764 ────────────────────────────────────────────
+; --- DATA @ 0x08026764 --------------------------------------------
   0x08026760: BD E8 F0 81 00 14 01 40 02 46 4F F4 A0 71 00 20  |.......@.FO..q. | [+4] 0x40011400=GPIOD; [+12] 0x200071A0=RAM+0x71A0
   0x08026770: EE F7 E6 BA 2D E9 F0 41 04 46 DD F8 18 80 08 46  |....-..A.F.....F|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lib_div_mod_fast                                                        ║
@@ -54991,9 +57851,9 @@
  802680c:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  8026810:	f7eb becf 	b.w	0x80125b2                                       ; -> gpio_bits_set
 
-; ─── DATA @ 0x08026814 ────────────────────────────────────────────
+; --- DATA @ 0x08026814 --------------------------------------------
   0x08026810: EB F7 CF BE 00 14 01 40 70 B5 04 46 15 4D 02 21  |.......@p..F.M.!| [+4] 0x40011400=GPIOD
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  gpio_data_strobe                                                        ║
@@ -55047,9 +57907,9 @@
  802686c:	e8bd 4070 	ldmia.w	sp!, {r4, r5, r6, lr}
  8026870:	f7eb be9f 	b.w	0x80125b2                                       ; -> gpio_bits_set
 
-; ─── DATA @ 0x08026874 ────────────────────────────────────────────
+; --- DATA @ 0x08026874 --------------------------------------------
   0x08026870: EB F7 9F BE 00 14 01 40 2D E9 F0 5F 04 46 DD E9  |.......@-.._.F..| [+4] 0x40011400=GPIOD
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lib_strcmp                                                        ║
@@ -55161,7 +58021,32 @@
  802694c:	202c      	movs	r0, #44	@ 0x2c
  802694e:	f7ff bf33 	b.w	0x80267b8
 
-; ─── DATA @ 0x08026952 ────────────────────────────────────────────
+; --- DATA @ 0x08026952 --------------------------------------------
+; -- LCD_Init Implementation (ST7789V) ----------------------------------
+; This DATA block contains the actual display_init_engine implementation.
+; The disassembler could not decode it (likely alignment or Thumb mode issue).
+; See full C pseudocode at the LCD_Init documentation section (search
+; "LCD_Init - ST7789V initialization").
+;
+; Decoded sequence (from raw bytes):
+;   push {r4, lr}
+;   [1] GPIO PD2 RST → HIGH, delay 1ms → LOW, delay 1ms → HIGH, delay 120ms
+;   [2] LCD_cmd(0x11) Sleep Out + 120ms delay
+;   [3] LCD_cmd(0xB2) Porch: 05,05,00,33,33
+;   [4] LCD_cmd(0xB7) Gate: 35     [5] LCD_cmd(0xC0) Power1: 2C
+;   [6] LCD_cmd(0xC2) Power3: 01   [7] LCD_cmd(0xC3) VCOM1: 0F
+;   [8] LCD_cmd(0xC4) VCOM2: 20    [9] LCD_cmd(0xC6) FRC: 11
+;   [10] LCD_cmd(0xD0) Power: A4,A1
+;   [11] LCD_cmd(0xE8) EQ timing: 03  [12] LCD_cmd(0xE9): 09,09,08
+;   [13] LCD_cmd(0xBB) VCOM: 3F
+;   [14] LCD_cmd(0xE0) +Gamma: 14 values
+;   [15] LCD_cmd(0xE1) -Gamma: 14 values
+;   [16] LCD_cmd(0x36) MADCTL: C0 (180° rotation, RGB565)
+;   [17] LCD_cmd(0x3A) Pixel: 05 (16-bit RGB565)
+;   [18] LCD_cmd(0x21) Invert ON   [19] LCD_cmd(0x29) Display ON + 20ms
+;   [20] Backlight: GPIOC pin 6 + GPIOB pin 3 → HIGH
+;   pop {r4, lr}; return
+; ------------------------------------------------------------------------
   0x08026950: 33 BF 00 00 10 B5 72 4C 04 21 20 46 EB F7 29 FE  |3.....rL.! F..).|
   0x08026960: 01 20 E3 F7 F0 FF 04 21 20 46 EB F7 20 FE 01 20  |. .....! F.. .. | [+12] 0x2001FE20=RAM+0x1FE20
   0x08026970: E3 F7 E9 FF 04 21 20 46 EB F7 1B FE 78 20 E3 F7  |.....! F....x ..|
@@ -55192,7 +58077,7 @@
   0x08026B00: 5B FE 05 20 FF F7 88 FE 21 20 FF F7 55 FE 29 20  |[.. ....! ..U.) |
   0x08026B10: FF F7 52 FE BD E8 10 40 00 20 FF F7 25 BE 00 00  |..R....@. ..%...|
   0x08026B20: 00 14 01 40 0F B4 2D E9 F0 47 AD F6 68 2D DD F8  |...@..-..G..h-..| [+0] 0x40011400=GPIOD
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  audio_usart3_config                                                        ║
@@ -55286,9 +58171,9 @@
  8026bf2:	e8bd 07f0 	ldmia.w	sp!, {r4, r5, r6, r7, r8, r9, sl}
  8026bf6:	f85d fb14 	ldr.w	pc, [sp], #20
 
-; ─── DATA @ 0x08026BFA ────────────────────────────────────────────
+; --- DATA @ 0x08026BFA --------------------------------------------
   0x08026BF0: 68 2D BD E8 F0 07 5D F8 14 FB 00 00 03 49 08 80  |h-....]......I..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  usart3_data_write                                                        ║
@@ -55304,9 +58189,9 @@
  8026c06:	d5fc      	bpl.n	0x8026c02
  8026c08:	4770      	bx	lr
 
-; ─── DATA @ 0x08026C0A ────────────────────────────────────────────
+; --- DATA @ 0x08026C0A --------------------------------------------
   0x08026C00: 08 1F 01 88 49 06 FC D5 70 47 00 00 04 48 00 40  |....I...pG...H.@|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  usart1_irq_handler                                                        ║
@@ -55314,29 +58199,29 @@
 ; ║  Called by: usart1_irq_handler, nvic_irq_config                                ║
 ; ╚══════════════════════════════════════════════════════════════════════╝
 ; * usart1_irq_handler  [COMMS/USART] - USART1 IRQ handler - 44B, refs USART1
- 8026c10:	490a      	ldr	r1, [pc, #40]	@ (0x8026c3c)                     ; = 0x2000A8B0 (RAM+0xA8B0)
- 8026c12:	7f49      	ldrb	r1, [r1, #29]
- 8026c14:	2901      	cmp	r1, #1
- 8026c16:	d10a      	bne.n	0x8026c2e
- 8026c18:	4909      	ldr	r1, [pc, #36]	@ (0x8026c40)                     ; = 0x2000A3B4 (g_rf_state)
- 8026c1a:	f891 1047 	ldrb.w	r1, [r1, #71]	@ 0x47
- 8026c1e:	b131      	cbz	r1, 0x8026c2e
- 8026c20:	4908      	ldr	r1, [pc, #32]	@ (0x8026c44)                     ; = 0x40013804
- 8026c22:	8008      	strh	r0, [r1, #0]
- 8026c24:	1f08      	subs	r0, r1, #4
- 8026c26:	8801      	ldrh	r1, [r0, #0]
- 8026c28:	0649      	lsls	r1, r1, #25
- 8026c2a:	d5fc      	bpl.n	0x8026c26
+ 8026c10:	490a      	ldr	r1, [pc, #40]	@ (0x8026c3c)                     ; = 0x2000A8B0 (RAM+0xA8B0) ;; -- USART1_IRQ_HANDLER: route received byte --
+ 8026c12:	7f49      	ldrb	r1, [r1, #29] ;; r1 = RAM[0x2000A8B0+29] (BT mode flag)
+ 8026c14:	2901      	cmp	r1, #1 ;; BT mode == 1?
+ 8026c16:	d10a      	bne.n	0x8026c2e ;; if not BT mode → forward to UART4 (debug port)
+ 8026c18:	4909      	ldr	r1, [pc, #36]	@ (0x8026c40)                     ; = 0x2000A3B4 (g_rf_state) ;; g_rf_state @ 0x2000A3B4
+ 8026c1a:	f891 1047 	ldrb.w	r1, [r1, #71]	@ 0x47 ;; r1 = g_rf_state[0x47] (BT connection active?)
+ 8026c1e:	b131      	cbz	r1, 0x8026c2e ;; if BT not connected → UART4 path
+ 8026c20:	4908      	ldr	r1, [pc, #32]	@ (0x8026c44)                     ; = 0x40013804 ;; -- BT PATH: echo byte back to USART1 TX --
+ 8026c22:	8008      	strh	r0, [r1, #0] ;; USART1->DT = r0 (write byte to TX data register)
+ 8026c24:	1f08      	subs	r0, r1, #4 ;; r0 = USART1->STS (status register @ 0x40013800)
+ 8026c26:	8801      	ldrh	r1, [r0, #0] ;; poll USART1->STS
+ 8026c28:	0649      	lsls	r1, r1, #25 ;; test TXBE bit (TX buffer empty)
+ 8026c2a:	d5fc      	bpl.n	0x8026c26 ;; spin until TX complete
  8026c2c:	4770      	bx	lr
- 8026c2e:	4906      	ldr	r1, [pc, #24]	@ (0x8026c48)                     ; = 0x40004C04
- 8026c30:	8008      	strh	r0, [r1, #0]
- 8026c32:	1f08      	subs	r0, r1, #4
- 8026c34:	8801      	ldrh	r1, [r0, #0]
- 8026c36:	0649      	lsls	r1, r1, #25
- 8026c38:	d5fc      	bpl.n	0x8026c34
- 8026c3a:	4770      	bx	lr
+ 8026c2e:	4906      	ldr	r1, [pc, #24]	@ (0x8026c48)                     ; = 0x40004C04 ;; -- DEBUG PATH: forward byte to UART4 --
+ 8026c30:	8008      	strh	r0, [r1, #0] ;; UART4->DT = r0 (forward to debug port)
+ 8026c32:	1f08      	subs	r0, r1, #4 ;; r0 = UART4->STS @ 0x40004C00
+ 8026c34:	8801      	ldrh	r1, [r0, #0] ;; poll UART4->STS
+ 8026c36:	0649      	lsls	r1, r1, #25 ;; test TXBE bit
+ 8026c38:	d5fc      	bpl.n	0x8026c34 ;; spin until TX complete
+ 8026c3a:	4770      	bx	lr ;; return from ISR
 
-; ─── DATA @ 0x08026C3C ────────────────────────────────────────────
+; --- DATA @ 0x08026C3C --------------------------------------------
   0x08026C30: 08 80 08 1F 01 88 49 06 FC D5 70 47 B0 A8 00 20  |......I...pG... | [+12] 0x2000A8B0=RAM+0xA8B0
   0x08026C40: B4 A3 00 20 04 38 01 40 04 4C 00 40 10 B5 00 29  |... .8.@.L.@...)| [+0] 0x2000A3B4=g_rf_state
   0x08026C50: 0A D0 08 78 00 28 07 D0 05 48 78 44 DB F7 56 FB  |...x.(...HxD..V.|
@@ -55345,7 +58230,7 @@
   0x08026C80: 00 28 07 D0 05 48 78 44 DB F7 40 FB 00 28 01 D0  |.(...HxD..@..(..|
   0x08026C90: 00 20 10 BD 02 48 78 44 10 BD 00 00 B2 59 03 00  |. ...HxD.....Y..|
   0x08026CA0: AA 59 03 00 81 F0 00 41 70 47 80 F0 00 40 70 47  |.Y.....ApG...@pG|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_fixpoint_round                                                        ║
@@ -55356,10 +58241,10 @@
  8026ca4:	f081 4100 	eor.w	r1, r1, #2147483648	@ 0x80000000
  8026ca8:	4770      	bx	lr
 
-; ─── DATA @ 0x08026CAA ────────────────────────────────────────────
+; --- DATA @ 0x08026CAA --------------------------------------------
   0x08026CA0: AA 59 03 00 81 F0 00 41 70 47 80 F0 00 40 70 47  |.Y.....ApG...@pG|
   0x08026CB0: 21 F0 00 41 70 47 20 F0 00 40 70 47 21 F0 00 42  |!..ApG ..@pG!..B|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lib_long_div                                                        ║
@@ -55432,7 +58317,7 @@
  8026d7e:	4608      	moveq	r0, r1
  8026d80:	4770      	bxeq	lr
 
-; ─── DATA @ 0x08026D82 ────────────────────────────────────────────
+; --- DATA @ 0x08026D82 --------------------------------------------
   0x08026D80: 70 47 5F EA 12 5C BC F1 FE 0F 1E D1 F1 EE 10 CA  |pG_..\..........|
   0x08026D90: 1C F4 40 0F CD D1 5F EA C0 0C 9B D0 5F EA 00 1C  |..@..._....._...|
   0x08026DA0: 4F EA C2 0C 4C EB 50 7C 04 BF C2 00 2C EA D2 7C  |O...L.P|....,..||
@@ -55465,7 +58350,7 @@
   0x08026F50: 40 5C C3 00 4C F0 88 0C 92 D0 5C F0 40 4C 09 42  |@\..L.....\.@L.B|
   0x08026F60: 48 BF 52 00 12 F4 00 0F 8A D1 10 F1 00 50 41 F1  |H.R..........PA.|
   0x08026F70: 00 01 2C F0 00 4C 83 D1 88 00 00 40 88 00 00 10  |..,..L.....@....|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_div_mod                                                        ║
@@ -55902,7 +58787,7 @@
  80274e4:	f85f c028 	ldr.w	ip, [pc, #-40]	@ 0x80274c0
  80274e8:	f000 bed0 	b.w	0x802828c
 
-; ─── DATA @ 0x080274EC ────────────────────────────────────────────
+; --- DATA @ 0x080274EC --------------------------------------------
   0x080274E0: BD E8 00 41 5F F8 28 C0 00 F0 D0 BE FF FD FB F9  |...A_.(.........|
   0x080274F0: F7 F5 F4 F2 F0 EE ED EB E9 E8 E6 E4 E3 E1 E0 DE  |................|
   0x08027500: DD DB DA D8 D7 D5 D4 D3 D1 D0 CF CD CC CB CA C8  |................|
@@ -55913,7 +58798,7 @@
   0x08027550: 8F 8F 8E 8E 8D 8C 8C 8B 8B 8A 89 89 88 88 87 87  |................|
   0x08027560: 86 85 85 84 84 83 83 82 82 81 81 80 00 00 FF 07  |................|
   0x08027570: 14 00 00 40 14 00 00 10 14 00 00 08 51 EA 03 0C  |...@........Q...| [+8] 0x08000014=flash+0x14
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_multiply                                                        ║
@@ -56033,9 +58918,9 @@
  80276ac:	b580      	push	{r7, lr}
  80276ae:	e7df      	b.n	0x8027670
 
-; ─── DATA @ 0x080276B0 ────────────────────────────────────────────
+; --- DATA @ 0x080276B0 --------------------------------------------
   0x080276B0: C8 00 02 40 C8 00 02 04 4F EA 11 53 A3 F5 80 63  |...@....O..S...c|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_multiply                                                        ║
@@ -56111,10 +58996,10 @@
  8027788:	b580      	push	{r7, lr}
  802778a:	e7d1      	b.n	0x8027730
 
-; ─── DATA @ 0x0802778C ────────────────────────────────────────────
+; --- DATA @ 0x0802778C --------------------------------------------
   0x08027780: 00 00 00 BF E8 00 03 04 80 B5 D1 E7 E8 00 02 40  |...............@|
   0x08027790: E8 00 02 04 10 F0 00 42 48 BF 40 42 B0 FA 80 F3  |.......BH.@B....|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  string_parse_field                                                        ║
@@ -56137,10 +59022,10 @@
  80277bc:	f04f 0000 	mov.w	r0, #0
  80277c0:	4770      	bx	lr
 
-; ─── DATA @ 0x080277C2 ────────────────────────────────────────────
+; --- DATA @ 0x080277C2 --------------------------------------------
   0x080277C0: 70 47 B1 FA 81 F2 01 FA 02 F1 C2 F1 1D 02 4F EA  |pG............O.|
   0x080277D0: 41 50 03 EB 02 53 03 EB D1 21 70 47 B0 FA 80 F3  |AP...S...!pG....|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_round_adjust                                                        ║
@@ -56160,9 +59045,9 @@
  80277fc:	f04f 0000 	mov.w	r0, #0
  8027800:	4770      	bx	lr
 
-; ─── DATA @ 0x08027802 ────────────────────────────────────────────
+; --- DATA @ 0x08027802 --------------------------------------------
   0x08027800: 70 47 00 00 51 EA 03 0C 11 D4 1C F5 80 1F 00 F1  |pG..Q...........|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  aprs_math_interp                                                        ║
@@ -56218,9 +59103,9 @@
  802786a:	0416      	lsls	r6, r2, #16
  802786c:	f7ff bcbc 	b.w	0x80271e8
 
-; ─── DATA @ 0x08027870 ────────────────────────────────────────────
+; --- DATA @ 0x08027870 --------------------------------------------
   0x08027870: 4F F0 00 51 4F F0 80 53 FF F7 B6 BC DF F8 B4 C1  |O..QO..S........|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_shift_util                                                        ║
@@ -56512,10 +59397,10 @@
  8027baa:	2601      	movs	r6, #1
  8027bac:	e7f3      	b.n	0x8027b96
 
-; ─── DATA @ 0x08027BAE ────────────────────────────────────────────
+; --- DATA @ 0x08027BAE --------------------------------------------
   0x08027BA0: 18 BF 25 46 CE D1 80 BD 80 B5 01 26 F3 E7 08 08  |..%F.......&....|
   0x08027BB0: A0 F5 00 11 4F EA 31 01 70 47 53 EA 01 0C 11 D4  |....O.1.pGS.....|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_format_core                                                        ║
@@ -56786,7 +59671,7 @@
  8027e96:	f083 4300 	eormi.w	r3, r3, #2147483648	@ 0x80000000
  8027e9a:	f53f a886 	bmi.w	0x8026faa
 
-; ─── DATA @ 0x08027E9E ────────────────────────────────────────────
+; --- DATA @ 0x08027E9E --------------------------------------------
   0x08027E90: 91 EA 03 0F 48 BF 83 F0 00 43 3F F5 86 A8 84 1A  |....H....C?.....|
   0x08027EA0: 71 EB 03 0C 07 D2 12 19 8C F0 00 4C 43 EB 0C 03  |q..........LC...|
   0x08027EB0: 00 1B 61 EB 0C 01 52 42 4F EA 11 54 A4 EB 13 5C  |..a...RBO..T...\|
@@ -56845,7 +59730,7 @@
   0x08028200: 41 F1 00 01 F1 EE 10 3A 4C F0 80 4C 43 F0 08 03  |A......:L..LC...|
   0x08028210: E1 EE 10 3A 00 F0 3A B8 5F EA AC 72 EF D4 F1 D1  |...:..:._..r....|
   0x08028220: 40 1C 41 F1 00 01 20 F0 01 00 EB E7 1C F0 80 4F  |@.A... ........O|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_cmp_tail                                                        ║
@@ -56856,7 +59741,7 @@
  8028230:	bf08      	it	eq
  8028232:	4770      	bxeq	lr
 
-; ─── DATA @ 0x08028234 ────────────────────────────────────────────
+; --- DATA @ 0x08028234 --------------------------------------------
   0x08028230: 08 BF 70 47 2C F0 00 4C E4 E7 09 42 54 BF 13 F4  |..pG,..L...BT...|
   0x08028240: 00 0F 13 F4 80 0F DD D1 D9 E7 F1 EE 10 3A 13 F0  |.............:..|
   0x08028250: 80 7F 1E BF 01 F0 00 41 00 20 70 47 13 F4 00 6F  |.......A. pG...o|
@@ -56894,7 +59779,7 @@
   0x08028450: 33 BA 00 BF 00 00 00 00 00 00 F0 7F 00 00 80 7F  |3...............|
   0x08028460: FF FF FF FF FF FF EF 7F FF FF 7F 7F 00 00 00 00  |................|
   0x08028470: 00 00 F8 7F 00 00 C0 7F 43 00 4F EA D3 0C 4F EA  |........C.O...O.|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_dispatch                                                        ║
@@ -56912,7 +59797,7 @@
  802848c:	f013 4ffe 	tstne.w	r3, #2130706432	@ 0x7f000000
  8028490:	4770      	bxne	lr
 
-; ─── DATA @ 0x08028492 ────────────────────────────────────────────
+; --- DATA @ 0x08028492 --------------------------------------------
   0x08028490: 70 47 1C F0 00 6F 14 D1 33 F0 00 40 04 BF 19 46  |pG...o..3..@...F|
   0x080284A0: 70 47 83 EA 83 03 83 EA 43 03 03 F0 07 03 43 EA  |pG......C.....C.|
   0x080284B0: CC 01 0C F0 00 43 03 F1 5A 53 03 F5 40 13 FF F7  |.....C..ZS..@...|
@@ -56920,7 +59805,7 @@
   0x080284D0: 00 F0 0F F8 00 00 00 BA 18 00 00 04 4F EA 00 01  |............O...|
   0x080284E0: FF F7 65 BB 4F EA E0 02 4F EA 40 70 42 F0 E0 41  |..e.O...O.@pB..A|
   0x080284F0: 70 47 0E F1 02 0E 2E F0 03 0E 4F EA 40 02 5E F8  |pG........O.@.^.|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_lib                                                        ║
@@ -57136,7 +60021,7 @@
  8028762:	f000 4000 	andne.w	r0, r0, #2147483648	@ 0x80000000
  8028766:	4770      	bxne	lr
 
-; ─── DATA @ 0x08028768 ────────────────────────────────────────────
+; --- DATA @ 0x08028768 --------------------------------------------
   0x08028760: 1C BF 00 F0 00 40 70 47 11 F4 00 6F 40 F0 8E 80  |.....@pG...o@...|
   0x08028770: 00 F0 00 43 43 EA D0 53 23 F4 80 73 C3 F1 C1 03  |...CC..S#..s....|
   0x08028780: 23 F0 00 41 17 29 41 D8 C3 F1 20 03 10 FA 03 F1  |#..A.)A... .....|
@@ -57157,7 +60042,7 @@
   0x08028870: 00 41 20 F0 00 40 B0 FA 80 F3 A3 F1 08 03 41 F0  |.A ..@........A.|
   0x08028880: C0 41 00 FA 03 F0 A1 EB C3 51 08 44 42 F0 00 5C  |.A.......Q.DB..\|
   0x08028890: 00 F0 FC B8 06 4A 21 EA 02 01 20 EA 02 02 F1 EE  |.....J!... .....|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_round                                                        ║
@@ -57174,7 +60059,7 @@
  80288aa:	eee1 2a10 	vmsr	fpscr, r2
  80288ae:	4770      	bx	lr
 
-; ─── DATA @ 0x080288B0 ────────────────────────────────────────────
+; --- DATA @ 0x080288B0 --------------------------------------------
   0x080288B0: 60 60 3F F6 D8 F7 BC BD 0C F0 0F 03 09 2B 08 BF  |``?..........+..|
   0x080288C0: 08 20 00 F0 F5 80 0A 2B 32 D0 08 2B 18 BF 70 47  |. .....+2..+..pG|
   0x080288D0: 08 BF 1C F0 40 0F 31 D0 1C F4 80 3F 23 D1 1C F0  |....@.1....?#...|
@@ -57185,7 +60070,7 @@
   0x08028920: C0 43 C9 43 70 47 4F F0 00 00 4F F0 00 01 70 47  |.C.CpGO...O...pG|
   0x08028930: 1C F0 40 0F 18 BF 4F F0 00 40 70 47 1C F0 10 0F  |..@...O..@pG....|
   0x08028940: 08 D0 20 F0 70 43 00 F0 7F 42 42 EA D3 01 4F EA  |.. .pC...BB...O.|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_const_block                                                        ║
@@ -57195,10 +60080,10 @@
  802894e:	ea4f 7043 	mov.w	r0, r3, lsl #29
  8028952:	4770      	bx	lr
 
-; ─── DATA @ 0x08028954 ────────────────────────────────────────────
+; --- DATA @ 0x08028954 --------------------------------------------
   0x08028950: 43 70 70 47 00 F0 60 40 21 F0 7F 42 42 EA 00 02  |CppG..`@!..BB...|
   0x08028960: 01 F0 7F 40 40 EA 72 70 70 47 00 00 4F F0 FF 0C  |...@@.rppG..O...|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_shift_tail                                                        ║
@@ -57217,7 +60102,7 @@
  8028984:	eb01 5102 	addgt.w	r1, r1, r2, lsl #20
  8028988:	4770      	bxgt	lr
 
-; ─── DATA @ 0x0802898A ────────────────────────────────────────────
+; --- DATA @ 0x0802898A --------------------------------------------
   0x08028980: C2 BF DA 42 01 EB 02 51 70 47 00 2B 39 D0 BC F1  |...B...QpG.+9...|
   0x08028990: 00 0F 68 D0 A1 EB 03 51 12 F5 64 6F 0E DD B2 F5  |..h....Q..do....|
   0x080289A0: 64 6F B8 BF D2 18 A2 F5 00 63 5B 1C 15 DA 00 2A  |do.......c[....*|
@@ -57234,7 +60119,7 @@
   0x08028A50: 00 FA 0C F0 41 EA D0 21 C3 F1 00 03 4F EA 40 50  |....A..!....O.@P|
   0x08028A60: 21 F4 80 11 98 E7 50 EA 01 33 4F F0 9B 0C 18 BF  |!.....P..3O.....|
   0x08028A70: 4C F0 80 6C 7E F4 AA AB 70 47 00 BF 9B 00 00 10  |L..l~...pG......|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  math_float_convert_tail                                                        ║
@@ -61023,7 +63908,7 @@
  802aa84:	78b1      	ldrb	r1, [r6, #2]
  802aa86:	ef8f cc16 			@ <UNDEFINED> instruction: 0xef8fcc16
 
-; ─── DATA @ 0x0802AA88 ────────────────────────────────────────────
+; --- DATA @ 0x0802AA88 --------------------------------------------
   0x0802AA80: 16 FC 09 A1 B1 78 8F EF 16 CC 9E 51 DD 8F B6 BF  |.....x.....Q....|
   0x0802AA90: 16 38 F1 C7 F7 A0 97 6B 16 6D 6F 5F 71 73 AF 4D  |.8.....k.mo_qs.M|
   0x0802AAA0: 16 02 C5 66 51 5C 76 33 16 EF A0 07 79 E7 31 63  |...fQ\v3....y.1c|
@@ -64559,7 +67444,7 @@
   0x08038740: AE 73 AE 73 0C 63 65 29 65 29 65 29 24 41 82 B0  |.s.s.ce)e)e)$A..|
   0x08038750: 20 E0 00 F8 20 E0 82 B0 24 41 65 29 65 29 65 29  | ... ...$Ae)e)e)|
   0x08038760: 65 29 65 29 24 51 00 F0 00 F8 00 F8 41 C8 00 F8  |e)e)$Q......A...|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  DATA_float_constant_table                                                        ║
@@ -64568,7 +67453,7 @@
 ; * DATA_float_constant_table  [DATA] - Format float stub - 4B, ←lib_format_float_entry
  803876a:	f800 c841 	strb.w	ip, [r0, <undefined>]
 
-; ─── DATA @ 0x0803876E ────────────────────────────────────────────
+; --- DATA @ 0x0803876E --------------------------------------------
   0x08038760: 65 29 65 29 24 51 00 F0 00 F8 00 F8 41 C8 00 F8  |e)e)$Q......A...|
   0x08038770: 00 F8 00 F0 24 51 65 29 65 29 65 29 65 29 20 E0  |....$Qe)e)e)e) .|
   0x08038780: 00 F8 A2 90 65 29 65 29 65 29 A2 90 00 F8 20 E0  |....e)e)e).... .|
@@ -65388,7 +68273,7 @@
   0x0803BA60: 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F 1F  |................|
   0x0803BA70: 1F 1F FF FF FF FF 1F 3F 7E FC F8 F0 E0 C0 80 00  |.......?~.......|
   0x0803BA80: 00 00 00 00 00 00 00 00 00 FF FF FF FF FF 00 00  |................|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  data_table_padding                                                        ║
@@ -65397,7 +68282,7 @@
 ; * data_table_padding  [SYSTEM] - Data table padding - 4B
  803ba8c:	ffff 0000 	vaddl.u<illegal width 64>	q8, d15, d0
 
-; ─── DATA @ 0x0803BA90 ────────────────────────────────────────────
+; --- DATA @ 0x0803BA90 --------------------------------------------
   0x0803BA90: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
   0x0803BAA0: 00 00 FF FF FF FF F0 F0 F0 F0 F1 F3 F7 FF FF FF  |................|
   0x0803BAB0: FE FC F8 00 00 00 00 00 00 FF FF FF FF FF 00 00  |................|
@@ -67136,7 +70021,7 @@
   0x08042700: FF FF 92 94 04 21 9E F7 FF FF FF FF FF FF FF FF  |.....!..........|
   0x08042710: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF  |................|
   0x08042720: FF FF FF FF FF FF 9A D6 82 10 00 00 86 31 96 B5  |.............1..|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  lib_format_rf_jump                                                        ║
@@ -67150,7 +70035,7 @@
  804272e:	b596      	push	{r1, r2, r4, r7, lr}
  8042730:	f79e ffff 	bl	0x7fe1732
 
-; ─── DATA @ 0x08042734 ────────────────────────────────────────────
+; --- DATA @ 0x08042734 --------------------------------------------
   0x08042730: 9E F7 FF FF FF FF FF FF FF FF FF FF FF FF FF FF  |................|
   0x08042740: FF FF FF FF FF FF FF FF 1C E7 10 84 82 10 00 00  |................|
   0x08042750: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
@@ -67711,7 +70596,7 @@
   0x08044A00: 00 78 00 78 00 78 00 C8 00 F8 00 F0 00 10 00 00  |.x.x.x..........|
   0x08044A10: 00 00 00 F8 00 C0 00 00 00 00 00 00 00 00 00 00  |................|
   0x08044A20: 00 00 00 00 00 00 00 20 00 F0 00 F8 00 B8 00 B8  |....... ........| [+4] 0x20000000=RAM+0x0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_settings_aprs_init                                                        ║
@@ -67721,12 +70606,12 @@
  8044a2c:	b800      			@ <UNDEFINED> instruction: 0xb800
  8044a2e:	b800      			@ <UNDEFINED> instruction: 0xb800
 
-; ─── DATA @ 0x08044A30 ────────────────────────────────────────────
+; --- DATA @ 0x08044A30 --------------------------------------------
   0x08044A30: 00 E8 00 F8 00 90 00 00 00 F8 00 F8 00 F8 00 F8  |................|
   0x08044A40: 00 F8 00 F8 00 B0 00 20 00 00 00 00 00 00 00 F8  |....... ........| [+4] 0x2000B000=RAM+0xB000
   0x08044A50: 00 C0 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
   0x08044A60: 00 00 00 00 00 20 00 A0 00 F0 00 F8 00 D0 00 60  |..... .........`|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_aprs_gpio_dispatch                                                        ║
@@ -67738,7 +70623,7 @@
  8044a70:	0000      	movs	r0, r0
  8044a72:	0000      	movs	r0, r0
 
-; ─── DATA @ 0x08044A74 ────────────────────────────────────────────
+; --- DATA @ 0x08044A74 --------------------------------------------
   0x08044A70: 00 00 00 00 FF FF FF FF FF FF FF FF FF FF FF FF  |................|
   0x08044A80: 75 AD 04 21 00 00 00 00 00 00 FF FF FF FF FF FF  |u..!............|
   0x08044A90: FF FF FF FF FF FF FF FF FF FF 00 00 00 00 00 00  |................|
@@ -69407,7 +72292,7 @@
   0x0804B280: 00 00 00 00 18 C6 FF FF FF FF 04 21 00 00 00 00  |...........!....|
   0x0804B290: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
   0x0804B2A0: 00 00 61 20 00 F0 00 F8 00 F8 00 F8 00 F0 00 D0  |..a ............|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  rf_menu_jump                                                        ║
@@ -69416,7 +72301,7 @@
 ; * rf_menu_jump  [RF] - RF menu jump - ->menu_subsystem_entry
  804b2a8:	f800 f800 	strb.w	pc, [r0, <undefined>]
 
-; ─── DATA @ 0x0804B2AC ────────────────────────────────────────────
+; --- DATA @ 0x0804B2AC --------------------------------------------
   0x0804B2A0: 00 00 61 20 00 F0 00 F8 00 F8 00 F8 00 F0 00 D0  |..a ............|
   0x0804B2B0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
   0x0804B2C0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
@@ -69443,7 +72328,7 @@
   0x0804B410: 00 00 00 00 4D 6B FF FF FF FF CF 7B 00 00 00 00  |....Mk.....{....|
   0x0804B420: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
   0x0804B430: 00 00 00 08 00 F0 00 F8 00 F8 00 F8 00 F0 41 E8  |..............A.| [+0] 0x08000000=flash+0x0
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------
 
 ; ╔══════════════════════════════════════════════════════════════════════╗
 ; ║  menu_subsystem_entry                                                        ║
@@ -69452,7 +72337,7 @@
 ; * menu_subsystem_entry  [MENU] - Menu subsystem entry - ->menu_display_tick, subsystem_poll
  804b438:	f800 f800 	strb.w	pc, [r0, <undefined>]
 
-; ─── DATA @ 0x0804B43C ────────────────────────────────────────────
+; --- DATA @ 0x0804B43C --------------------------------------------
   0x0804B430: 00 00 00 08 00 F0 00 F8 00 F8 00 F8 00 F0 41 E8  |..............A.| [+0] 0x08000000=flash+0x0
   0x0804B440: 20 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00  | ...............|
   0x0804B450: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
@@ -73955,4 +76840,4 @@
   0x0805CD60: 03 46 DA D8 E0 2C F2 03 F7 F2 FE 4B C6 97 CB 0E  |.F...,.....K....|
   0x0805CD70: CB 44 A3 81 09 57 FD 43 FD 6E 2D A3 2F BE 47 76  |.D...W.C.n-./.Gv|
   0x0805CD80: 64 10 7F 0D 8D A0 F1 72 F8 20 6D D7 2D FE F7 1F  |d......r. m.-...|
-; ─── end data ────────────────────────────────────────────────────────
+; --- end data --------------------------------------------------------

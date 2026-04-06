@@ -37,12 +37,14 @@ void adc_init(void)
      * OEM: CRM_CFGR &= 0xEFFF3FFF; CRM_CFGR |= 0x8000 @ fw 0x080227B4 */
     CRM->CFGR = (CRM->CFGR & ~CRM_CFGR_ADCPRE_MASK) | CRM_CFGR_ADCPRE_DIV6;
 
-    /* Enable ADC2 peripheral clock (OEM also enables ADC1 @ fw 0x080227BC) */
-    CRM->APB2EN |= CRM_APB2EN_ADC2EN;
+    /* Enable ADC1 + ADC2 peripheral clocks (OEM enables both @ fw 0x080227BC) */
+    CRM->APB2EN |= CRM_APB2EN_ADC1EN | CRM_APB2EN_ADC2EN;
 
-    /* Configure PA0 and PA1 as analog input (GPIOA clock already enabled) */
+    /* Configure PA0, PA1, PA2 as analog input (GPIOA clock already enabled).
+     * PA2 = ADC12_CH2 (RSSI) - OEM adc2_convert_read reads PA2 first. */
     gpio_config_pin(GPIOA, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
     gpio_config_pin(GPIOA, GPIO_PIN_1, GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
+    gpio_config_pin(GPIOA, GPIO_PIN_2, GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
 
     /* Configure ADC2: single conversion, right-aligned, SW trigger */
     ADC2->CR1 = 0;
@@ -135,4 +137,17 @@ uint8_t adc_read_battery(void)
 uint8_t adc_read_audio_level(void)
 {
     return (uint8_t)(adc_read_channel(1) >> 4);
+}
+
+/* ========================================================================
+ *  adc_read_rssi - Read RSSI on PA2 (channel 2).
+ *
+ *  OEM adc2_convert_read @ fw 0x080227AC reads PA2 as first ADC sample
+ *  after init. Used for signal strength indication.
+ *  Returns 8-bit value (12-bit >> 4), same scaling as other OEM ADC reads.
+ * ======================================================================== */
+
+uint8_t adc_read_rssi(void)
+{
+    return (uint8_t)(adc_read_channel(2) >> 4);
 }

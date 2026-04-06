@@ -208,7 +208,13 @@ void SystemInit(void)
      * table from the start. */
     SCB->VTOR = 0x08003000UL;
 
-    /* ---- 10. Enable GPIO port clocks (our addition) ---- */
+    /* ---- 10. NVIC Priority Group 4 (OEM rcc_periph_enable @ 0x08018750) ----
+     * OEM sets PRIGROUP=3 → 4 preemption bits, 0 sub-priority bits.
+     * Must be configured before any NVIC_SetPriority calls.
+     * AIRCR requires VECTKEY (0x05FA) in upper 16 bits for write access. */
+    SCB->AIRCR = SCB_AIRCR_VECTKEY | (3UL << 8);
+
+    /* ---- 11. Enable GPIO port clocks (our addition) ---- */
     CRM->APB2EN |= CRM_APB2EN_AFIOEN
                   | CRM_APB2EN_IOPAEN
                   | CRM_APB2EN_IOPBEN
@@ -216,10 +222,25 @@ void SystemInit(void)
                   | CRM_APB2EN_IOPDEN
                   | CRM_APB2EN_IOPEEN;
 
-    /* ---- 11. Start SysTick (1 ms tick, our addition) ---- */
+    /* ---- 11b. Disable JTAG, keep SWD (OEM @ 0x80123D6) ----
+     * OEM gpio_modes_init calls AFIO remap with 0x02000000 → SWJ_CFG=010.
+     * This frees PA15, PB3, PB4 from JTAG function.
+     * IOMUX_REMAP register (0x40010004) bits[26:24] = SWJ_CFG:
+     *   000 = Full SWJ (JTAG+SWD)  - PA15,PB3,PB4 locked to JTAG
+     *   010 = JTAG disabled, SWD only - PA15,PB3,PB4 freed as GPIO
+     * Write is special: SWJ_CFG is write-only, must clear then set. */
+    {
+        volatile uint32_t *iomux_remap = (volatile uint32_t *)0x40010004UL;
+        uint32_t val = *iomux_remap;
+        val &= ~(7UL << 24);    /* clear SWJ_CFG[26:24] */
+        val |=  (2UL << 24);    /* SWJ_CFG = 010: JTAG off, SWD on */
+        *iomux_remap = val;
+    }
+
+    /* ---- 12. Start SysTick (1 ms tick, our addition) ---- */
     SysTick_Init();
 
-    /* ---- 12. Debug UART (compile-time optional) ---- */
+    /* ---- 13. Debug UART (compile-time optional) ---- */
     dbg_init();
     dbg_puts("\n[DBG] SystemInit OK: HCLK=120MHz VTOR=0x08003000\n");
     dbg_reg("[DBG]   CRM->CR=0x", CRM->CR);

@@ -17,10 +17,7 @@
  * Pin assignments:
  *   PA0 / ADC12_IN0 - Battery voltage sense
  *   PA1 / ADC12_IN1 - Audio input level
- *
- * OEM timer ISR note: all TIMx vectors use default handler (branch-to-self
- * at fw 0x080032BB). Our TIM2/TIM3 interrupts are custom design; OEM uses
- * BK4829 hardware for CTCSS and SysTick for periodic timing.
+ *   PA2 / ADC12_IN2 - RSSI (signal strength)
  */
 
 #ifndef DRIVERS_ADC_H
@@ -105,5 +102,11 @@ uint8_t adc_read_battery(void);
  * Returns 8-bit value (12-bit >> 4), matching stock firmware scaling.
  */
 uint8_t adc_read_audio_level(void);
+
+/*
+ * adc_read_rssi - Read PA2 (ADC12_IN2) signal strength.
+ * Returns 8-bit value (12-bit >> 4), matching OEM scaling.
+ */
+uint8_t adc_read_rssi(void);
 
 #endif /* DRIVERS_ADC_H */

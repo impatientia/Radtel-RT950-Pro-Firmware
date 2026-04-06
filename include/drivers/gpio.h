@@ -2,8 +2,8 @@
  * gpio.h - GPIO driver for AT32F403A on the RT-950 Pro
  *
  * Pin set/clear verified from V0.27 binary:
- *   GPIO_SetPin   @ fw 0x080125AE: str r1,[r0,#0x10]  (SCR register)
- *   GPIO_ClearPin @ fw 0x080125B2: str r1,[r0,#0x14]  (CLR register)
+ *   GPIO_SetPin   @ fw 0x080125B2: str r1,[r0,#0x10]  (SCR +0x10, sets HIGH)
+ *   GPIO_ClearPin @ fw 0x080125AE: str r1,[r0,#0x14]  (CLR +0x14, sets LOW)
  */
 
 #ifndef DRIVERS_GPIO_H
@@ -13,13 +13,13 @@
 
 /*
  * gpio_set_pin - Set one or more GPIO pins HIGH.
- * Writes pin mask to GPIO SCR (+0x14), matching firmware behavior.
+ * Writes pin mask to GPIO SCR (+0x10), matching OEM 0x080125B2.
  */
 void gpio_set_pin(GPIO_TypeDef *port, uint16_t pin);
 
 /*
  * gpio_clear_pin - Set one or more GPIO pins LOW.
- * Writes pin mask to GPIO CLR (+0x10), matching firmware behavior.
+ * Writes pin mask to GPIO CLR (+0x14), matching OEM 0x080125AE.
  */
 void gpio_clear_pin(GPIO_TypeDef *port, uint16_t pin);
 

@@ -44,7 +44,16 @@
 
 /* CTCSS constants ---------------------------------------------------- */
 #define CTCSS_TONE_COUNT    50      /* Standard CTCSS tone table size */
-#define SINE_TABLE_SAMPLES  32      /* Samples per sine wave cycle */
+
+/* DMA buffer sizing - OEM uses 2×2048 halfword double-buffers.
+ * We use a single 2048-sample buffer (circular DMA, no TCIE needed).
+ * At 7936 Hz sample rate, 2048 samples = 258ms of audio - long enough
+ * for the DMA to loop cleanly without audible glitches. */
+#define DAC_BUFFER_SAMPLES  2048    /* Samples per DMA buffer */
+
+/* OEM sine LUT is 256 entries (12-bit unsigned, centered at 0x0800).
+ * DDS phase accumulator indexes into this table via top 8 bits. */
+#define SINE_LUT_SIZE       256     /* Entries in sine lookup table */
 
 /* Functions ---------------------------------------------------------- */
 

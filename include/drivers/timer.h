@@ -1,23 +1,20 @@
 /*
  * timer.h - Timer driver for AT32F403A on the RT-950 Pro
  *
- * Timer allocation (custom design - OEM uses NO timer interrupts):
+ * Timer allocation:
  *
- *   TIM2 - CTCSS tone generation/detection tick (1200 Hz)
- *           OEM handles CTCSS through BK4829 hardware registers instead.
+ *   TIM2 - RESERVED for OEM ADC1 triggering at 4.8 kHz (PSC=0, ARR=12500).
+ *           OEM peripheral_init @ 0x080033D8 configures TIM2→ADC1 trigger.
+ *           NOT used for CTCSS (moved to TIM4 to match OEM TIM2 role).
  *
  *   TIM3 - System fast tick (1000 Hz / 1 ms)
- *           OEM uses SysTick (fw 0x080241E1) for periodic timing.
- *           Note: TIM3 base (0x40000400) hits in binary are false positives
- *           within VFP instruction encodings in a math library area.
+ *           OEM uses SysTick for periodic timing; our TIM3 is custom.
+ *
+ *   TIM4 - CTCSS tone generation/detection tick (1200 Hz)
+ *           Moved from TIM2 to avoid conflict with OEM ADC trigger role.
  *
  *   TIM6 - DAC audio sample clock (owned by dac_audio.c, not managed here)
  *           OEM uses TIM6 as TRGO trigger for DAC (no ISR needed).
- *           V0.27 configs: PSC=3/ARR=781 (~1200Hz), PSC=119/ARR=125 (~248Hz)
- *           TIM6 refs @ fw 0x0800697C (clock enable), fw 0x0801BF70 (audio)
- *
- * V0.27 vector table: ALL timer IRQs (TIM1-TIM7) point to default handler
- * at fw 0x080032BB (branch-to-self). Our TIM2/TIM3 ISRs are custom.
  *
  * Timer clock: APB1 timers run at 120 MHz
  *   (APB1 bus = 60 MHz, prescaler > 1 -> timer clock is doubled)
@@ -32,10 +29,10 @@
 /* Timer clock ------------------------------------------------------- */
 #define TIM_APB1_CLOCK_HZ   120000000UL
 
-/* TIM2: CTCSS tick @ 1200 Hz --------------------------------------- */
-#define TIM2_FREQ_HZ        1200U
-#define TIM2_PSC             (120U - 1U)        /* 120 MHz / 120 = 1 MHz tick */
-#define TIM2_ARR             (1000000U / TIM2_FREQ_HZ - 1U)  /* 833 counts */
+/* TIM4: CTCSS tick @ 1200 Hz (moved from TIM2 to avoid OEM ADC conflict) */
+#define TIM4_FREQ_HZ        1200U
+#define TIM4_PSC             (120U - 1U)        /* 120 MHz / 120 = 1 MHz tick */
+#define TIM4_ARR             (1000000U / TIM4_FREQ_HZ - 1U)  /* 833 counts */
 
 /* TIM3: fast tick @ 1000 Hz ----------------------------------------- */
 #define TIM3_FREQ_HZ        1000U

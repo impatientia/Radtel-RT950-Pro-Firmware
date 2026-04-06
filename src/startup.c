@@ -305,11 +305,25 @@ void Reset_Handler(void)
     /* Enable FPU (CP10 + CP11 full access) before any float operations */
     *(volatile uint32_t *)0xE000ED88UL |= (0xFUL << 20);
 
-    /* Re-enable interrupts - the bootloader does cpsid i before jumping */
-    __asm volatile ("cpsie i");
+    /*
+     * Clean up residual state from bootloader before enabling interrupts.
+     * The bootloader may leave NVIC interrupts enabled, DMA channels
+     * running, or timers active.  Disable everything first.
+     */
+    /* Disable ALL NVIC interrupts (ICER0..ICER2 cover IRQ 0-95) */
+    *(volatile uint32_t *)0xE000E180UL = 0xFFFFFFFFUL;
+    *(volatile uint32_t *)0xE000E184UL = 0xFFFFFFFFUL;
+    *(volatile uint32_t *)0xE000E188UL = 0xFFFFFFFFUL;
+    /* Clear ALL pending NVIC interrupts */
+    *(volatile uint32_t *)0xE000E280UL = 0xFFFFFFFFUL;
+    *(volatile uint32_t *)0xE000E284UL = 0xFFFFFFFFUL;
+    *(volatile uint32_t *)0xE000E288UL = 0xFFFFFFFFUL;
 
-    /* System clock configuration */
+    /* System clock configuration - sets VTOR = 0x08003000 */
     SystemInit();
+
+    /* VTOR is now set to our vector table - safe to enable interrupts */
+    __asm volatile ("cpsie i");
 
     /* Enter application */
     main();
@@ -366,19 +380,16 @@ void HardFault_Handler_C(const uint32_t *frame)
     dbg_reg("[FAULT] CFSR=0x", cfsr);
 
     /* SCB->HFSR (Hard Fault Status Register) */
-    volatile uint32_t hfsr = *(volatile uint32_t *)0xE000ED2CUL;
-    dbg_reg("[FAULT] HFSR=0x", hfsr);
+    dbg_reg("[FAULT] HFSR=0x", *(volatile uint32_t *)0xE000ED2CUL);
 
     /* SCB->BFAR (Bus Fault Address) - valid if CFSR bit 15 set */
     if (cfsr & (1UL << 15)) {
-        volatile uint32_t bfar = *(volatile uint32_t *)0xE000ED38UL;
-        dbg_reg("[FAULT] BFAR=0x", bfar);
+        dbg_reg("[FAULT] BFAR=0x", *(volatile uint32_t *)0xE000ED38UL);
     }
 
     /* SCB->MMFAR (MemManage Fault Address) - valid if CFSR bit 7 set */
     if (cfsr & (1UL << 7)) {
-        volatile uint32_t mmfar = *(volatile uint32_t *)0xE000ED34UL;
-        dbg_reg("[FAULT] MMFAR=0x", mmfar);
+        dbg_reg("[FAULT] MMFAR=0x", *(volatile uint32_t *)0xE000ED34UL);
     }
 
     /* Exception stack frame: [R0, R1, R2, R3, R12, LR, PC, xPSR] */

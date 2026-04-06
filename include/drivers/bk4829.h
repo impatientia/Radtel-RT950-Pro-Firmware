@@ -117,6 +117,9 @@ uint16_t bk4829_read_rssi(uint8_t chip);
 void bk4829_enable_rx(uint8_t chip);
 void bk4829_enable_tx(uint8_t chip);
 void bk4829_standby(uint8_t chip);
+void bk4829_audio_filter_config(uint8_t chip);
+void bk4829_set_af_beep(uint8_t chip);
+void bk4829_set_af_rx(uint8_t chip);
 
 /*
  * Set RF operating mode - configures REG_30 + REG_47 + REG_48.

@@ -63,8 +63,8 @@
  *  GPIO - register layout verified from V0.27 binary
  *
  *  IMPORTANT: Firmware disassembly shows:
- *    GPIO_SetPin   (fw 0x080125AE): str r1,[r0,#0x10]  -> offset +0x10 (SCR)
- *    GPIO_ClearPin (fw 0x080125B2): str r1,[r0,#0x14]  -> offset +0x14 (CLR)
+ *    GPIO_SetPin   (fw 0x080125B2): str r1,[r0,#0x10]  -> offset +0x10 (SCR)
+ *    GPIO_ClearPin (fw 0x080125AE): str r1,[r0,#0x14]  -> offset +0x14 (CLR)
  *
  *  This matches STM32F1/AT32F403A reference manual:
  *    +0x10 = BSRR  (bit-set/reset register: low 16 bits SET, high 16 RESET)
@@ -230,6 +230,7 @@ typedef struct {
 #define CRM_APB1EN_UART5EN (1UL << 20)
 #define CRM_APB1EN_I2C1EN  (1UL << 21)
 #define CRM_APB1EN_I2C2EN  (1UL << 22)
+#define CRM_APB1EN_BKPEN   (1UL << 27)
 #define CRM_APB1EN_DACEN   (1UL << 29)
 
 /* AHBEN bits */
@@ -393,6 +394,7 @@ typedef struct {
     volatile uint32_t DHR8RD;   /* +0x28  Dual, 8-bit right-aligned */
     volatile uint32_t DOR1;     /* +0x2C  Channel 1 data output */
     volatile uint32_t DOR2;     /* +0x30  Channel 2 data output */
+    volatile uint32_t SR;       /* +0x34  Status (DMAUDR1 bit13, DMAUDR2 bit29) */
 } DAC_TypeDef;
 
 #define DAC         ((DAC_TypeDef *)DAC_BASE)

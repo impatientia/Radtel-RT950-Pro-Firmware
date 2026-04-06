@@ -95,7 +95,7 @@ void uart_gps_init(void)
     USART3->BRR = 6250;
     USART3->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
 
-    NVIC_SetPriority(USART3_IRQn, 5);
+    NVIC_SetPriority(USART3_IRQn, 1);
     NVIC_EnableIRQ(USART3_IRQn);
 }
 
@@ -115,7 +115,7 @@ void uart_bt_init(void)
     USART1->BRR = 521;
     USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
 
-    NVIC_SetPriority(USART1_IRQn, 5);
+    NVIC_SetPriority(USART1_IRQn, 1);  /* OEM: preempt=1 */
     NVIC_EnableIRQ(USART1_IRQn);
 }
 
@@ -136,7 +136,7 @@ void uart_acc_init(void)
     UART4->BRR = 521;
     UART4->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
 
-    NVIC_SetPriority(UART4_IRQn, 6);
+    NVIC_SetPriority(UART4_IRQn, 1);   /* OEM: preempt=1 */
     NVIC_EnableIRQ(UART4_IRQn);
 }
 

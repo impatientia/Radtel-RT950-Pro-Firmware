@@ -167,20 +167,18 @@ void power_poll(void)
         uint8_t raw = power_read_battery_raw();
         uint16_t mv = power_get_battery_mv();
         battery_level_t level = power_get_battery_level();
-        dbg_puts("[BAT] raw=");
-        dbg_reg("", raw);
-        dbg_puts("  mv=");
-        dbg_reg("", mv);
-        dbg_puts("  level=");
-        dbg_reg("", (uint32_t)level);
+        dbg_reg("[BAT] raw=", raw);
+        dbg_reg("  mv=", mv);
+        dbg_reg("  level=", (uint32_t)level);
+        (void)raw; (void)mv; (void)level;
     }
 
     /* Log audio ADC level (PA1 channel 1) for VOX calibration.
      * OEM ADC_Read_PA1 @ 0x08013820, UBFX(DR,4,8) → 8-bit. */
     {
         uint8_t audio = adc_read_audio_level();
-        dbg_puts("[AUD] raw=");
-        dbg_reg("", audio);
+        dbg_reg("[AUD] raw=", audio);
+        (void)audio;
     }
 
     /* Auto power-off countdown */

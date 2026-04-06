@@ -344,8 +344,8 @@
 #define PTT_PORT                GPIOE       /* HW_CONFIRMED - GPIO scan: PE3 toggle on PTT1 press */
 #define PTT_PIN                 GPIO_PIN_3  /* mask 0x0008 - primary PTT input, active LOW */
 
-#define PA_ENABLE_PORT          GPIOE       /* BINARY_VERIFIED + HW_PROBED "POWER AMP ENABLE" */
-#define PA_ENABLE_PIN           GPIO_PIN_4  /* mask 0x0010 - RF power amplifier enable */
+#define PA_ENABLE_PORT          GPIOE       /* BINARY_VERIFIED + HW_PROBED */
+#define PA_ENABLE_PIN           GPIO_PIN_4  /* mask 0x0010 - audio amplifier power rail (V12 verified) */
 
 #define TOP_PROG_PORT           GPIOE       /* BINARY_VERIFIED: OEM keypad scan @ 0x08012FF8 reads PE5 */
 #define TOP_PROG_PIN            GPIO_PIN_5  /* mask 0x0020 - top programmable side button, active LOW */
@@ -461,14 +461,13 @@
 #define PTT_ACC1_PORT           RF_V3T_EN_PORT
 #define PTT_ACC1_PIN            RF_V3T_EN_PIN
 /*
- * RF frontend enable pair (PB8 + PE4).
+ * RF frontend / audio amplifier enable pair (PB8 + PE4).
  * OEM V0.27 @ 0x08022E3C: Always SET/CLR together as a ref-counted
- * RF frontend enable/disable.  NOT band selectors - per-band filter
- * selection is done via BK4829 registers (REG_30/47/48).
+ * RF frontend enable/disable.
  *
- * NOTE: PB8 is dual-purpose - also used as AMP_EN for audio path
- * (see audio.c).  A proper ref-count mechanism will be needed when
- * both audio and RF paths are active simultaneously.
+ * V12 hardware verification: PE4 = audio amplifier power rail.
+ * Must be HIGH for any speaker output. PB8 = amplifier enable.
+ * Both are used for RF TX path AND audio playback path.
  */
 #define RF_FRONTEND_EN0_PORT    MIC_ENABLE_PORT   /* PB8 */
 #define RF_FRONTEND_EN0_PIN     MIC_ENABLE_PIN

@@ -1,17 +1,12 @@
 /*
  * timer.c - Timer ISR architecture for the RT-950 Pro
  *
- * TIM2 @ 1200 Hz - CTCSS tone detection/generation timing
+ * TIM4 @ 1200 Hz - CTCSS tone detection/generation timing
  * TIM3 @ 1000 Hz - Fast system tick (VOX sampling, scanner dwell, etc.)
  *
- * NOTE: The OEM V0.27 firmware does NOT use any timer interrupts.  All
- * timer vector entries (TIM1-TIM7) point to the default handler at fw
- * 0x080032BB (b . - infinite loop).  The OEM likely handles CTCSS via
- * BK4829 hardware registers and uses SysTick for all periodic timing.
- *
- * Our ISR-based timer architecture is a custom design choice providing
- * cleaner callback separation.  It is functionally correct but does not
- * match OEM structure.
+ * TIM2 is RESERVED for OEM-style ADC1 triggering (PSC=0, ARR=12500,
+ * 4.8 kHz). OEM peripheral_init @ 0x080033D8 configures TIM2 for this
+ * purpose. CTCSS was moved from TIM2 to TIM4 to avoid this conflict.
  *
  * Both timers use APB1 timer clock at 120 MHz (APB1 bus = 60 MHz, doubled
  * when prescaler > 1) with PSC=119 -> 1 MHz counter tick.
@@ -37,12 +32,12 @@ static uint8_t          fast_cb_count;
 
 static volatile uint32_t fast_tick_counter;
 
-/* ISR: TIM2 - CTCSS tick @ 1200 Hz --------------------------------- */
+/* ISR: TIM4 - CTCSS tick @ 1200 Hz --------------------------------- */
 
-void TIM2_IRQHandler(void)
+void TIM4_IRQHandler(void)
 {
-    if (TIM2->SR & TIM_SR_UIF) {
-        TIM2->SR = ~TIM_SR_UIF;        /* Clear flag (rc_w0) */
+    if (TIM4->SR & TIM_SR_UIF) {
+        TIM4->SR = ~TIM_SR_UIF;        /* Clear flag (rc_w0) */
 
         for (uint8_t i = 0; i < ctcss_cb_count; i++)
             ctcss_cbs[i]();
@@ -67,22 +62,22 @@ void TIM3_IRQHandler(void)
 
 void timer_init(void)
 {
-    /* Enable APB1 clocks for TIM2 and TIM3 */
-    CRM->APB1EN |= CRM_APB1EN_TIM2EN | CRM_APB1EN_TIM3EN;
+    /* Enable APB1 clocks for TIM4 and TIM3 (TIM2 reserved for ADC trigger) */
+    CRM->APB1EN |= CRM_APB1EN_TIM4EN | CRM_APB1EN_TIM3EN;
 
-    /* TIM2: CTCSS @ 1200 Hz --------------------------------------- */
-    TIM2->CR1 = 0;                      /* Stop */
-    TIM2->PSC = TIM2_PSC;
-    TIM2->ARR = TIM2_ARR;
-    TIM2->CNT = 0;
-    TIM2->EGR = TIM_EGR_UG;            /* Load shadow registers */
-    TIM2->SR  = 0;                      /* Clear all flags */
-    TIM2->DIER = TIM_DIER_UIE;         /* Enable update IRQ */
+    /* TIM4: CTCSS @ 1200 Hz (moved from TIM2) ----------------------- */
+    TIM4->CR1 = 0;                      /* Stop */
+    TIM4->PSC = TIM4_PSC;
+    TIM4->ARR = TIM4_ARR;
+    TIM4->CNT = 0;
+    TIM4->EGR = TIM_EGR_UG;            /* Load shadow registers */
+    TIM4->SR  = 0;                      /* Clear all flags */
+    TIM4->DIER = TIM_DIER_UIE;         /* Enable update IRQ */
 
-    NVIC_SetPriority(TIM2_IRQn, 3);    /* Medium-low priority */
-    NVIC_EnableIRQ(TIM2_IRQn);
+    NVIC_SetPriority(TIM4_IRQn, 2);    /* OEM-aligned priority */
+    NVIC_EnableIRQ(TIM4_IRQn);
 
-    TIM2->CR1 = TIM_CR1_CEN;           /* Start */
+    TIM4->CR1 = TIM_CR1_CEN;           /* Start */
 
     /* TIM3: Fast tick @ 1000 Hz ----------------------------------- */
     TIM3->CR1 = 0;
@@ -93,7 +88,7 @@ void timer_init(void)
     TIM3->SR  = 0;
     TIM3->DIER = TIM_DIER_UIE;
 
-    NVIC_SetPriority(TIM3_IRQn, 4);    /* Lower priority than CTCSS */
+    NVIC_SetPriority(TIM3_IRQn, 3);    /* Below CTCSS and UARTs */
     NVIC_EnableIRQ(TIM3_IRQn);
 
     TIM3->CR1 = TIM_CR1_CEN;

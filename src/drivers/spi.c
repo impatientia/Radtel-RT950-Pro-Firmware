@@ -9,8 +9,7 @@
  *   Base: 0x40003800, CS: PB12 (GPIOB 0x40010C00, mask 0x1000)
  *   PB13 = SCK, PB14 = MISO, PB15 = MOSI
  *
- *   V0.27 SPI2 config (CR1 = 0x030F):
- *     CPOL=1 (idle HIGH), CPHA=1 (capture 2nd edge) -> SPI Mode 3
+ *   OEM SPI2 config: Mode 0 (CPOL=0, CPHA=0)
  *     Master mode, APB1/4 prescaler (MDIV=001)
  *     MSB-first, 8-bit frame, Software NSS (SWCSEN+SWCSIL)
  *
@@ -150,19 +149,15 @@ void spi2_init(void)
     flash_cs_high();
 
     /* Configure SPI2:
-     *   Master mode, 8-bit, Mode 3 (CPOL=1, CPHA=1)
+     *   Master mode, 8-bit, Mode 0 (CPOL=0, CPHA=0) - matches OEM
      *   Software slave management (SSM + SSI)
      *   Baud rate = APB1 / 4
      *
-     *   V0.27 OEM CR1 = 0x030F (before SPE):
-     *     CPHA=1, CPOL=1, MSTEN=1, MDIV[2:0]=001 (/4),
-     *     SWCSEN=1, SWCSIL=1
+     *   OEM SPI2_Init @ 0x08014000: Mode 0 via HAL config struct.
      */
     SPI2->CR1 = SPI_CR1_MSTR
               | SPI_CR1_SSM
               | SPI_CR1_SSI
-              | SPI_CR1_CPOL
-              | SPI_CR1_CPHA
               | (0x1UL << 3);      /* BR[2:0] = 001 -> /4 */
 
     SPI2->CR1 |= SPI_CR1_SPE;

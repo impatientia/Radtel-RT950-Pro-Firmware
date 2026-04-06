@@ -53,6 +53,7 @@
 #include "drivers/calibration.h"
 #include "app/settings.h"
 #include "rt950_pinmap.h"
+#include "debug_uart.h"
 
 extern void delay_ms(uint32_t ms);
 
@@ -268,6 +269,15 @@ static void ptt_deassert(void)
 
 void radio_init(void)
 {
+    /*
+     * Save the return address from LR register into a GLOBAL variable.
+     * LR still holds the caller's return address after PUSH {LR} on
+     * Cortex-M (PUSH stores but doesn't clear LR).  We save to a global
+     * so it survives even if our stack frame is corrupted.
+     */
+    static volatile uint32_t saved_lr;
+    __asm volatile ("mov %0, lr" : "=r"(saved_lr));
+
     /* Configure BK4829 SPI pins on GPIOE */
     gpio_config_pin(BK4829_SEN1_PORT, BK4829_SEN1_PIN,
                     GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);
@@ -316,6 +326,32 @@ void radio_init(void)
 
     /* Initialize dual VFO system (inits both BK4829 chips and applies settings) */
     vfo_init();
+
+    /*
+     * Stack corruption detection: compare the return address currently
+     * on the stack with what we captured at entry.  If they differ,
+     * something inside vfo_init (or an ISR) corrupted our stack frame.
+     */
+    {
+        uint32_t ra_now = (uint32_t)__builtin_return_address(0);
+        if (ra_now != saved_lr) {
+            dbg_puts("[RI] *** STACK CORRUPTED ***\n");
+            dbg_reg("[RI]   expected=0x", saved_lr);
+            dbg_reg("[RI]   got=0x", ra_now);
+            /* Dump 8 words from current SP to see damage pattern */
+            uint32_t sp;
+            __asm volatile ("mov %0, sp" : "=r"(sp));
+            dbg_reg("[RI]   SP=0x", sp);
+            for (int i = 0; i < 8; i++)
+                dbg_reg("[RI]   stk=0x", ((volatile uint32_t *)sp)[i]);
+            /* Attempt to fix the return address so we don't crash */
+            /* (can't easily - just report and hope tail call saves us) */
+        } else {
+            dbg_puts("[RI] LR OK\n");
+        }
+    }
+
+    dbg_puts("[DBG] radio_init done\n");
 }
 
 int radio_is_transmitting(void)

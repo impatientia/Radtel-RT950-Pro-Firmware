@@ -20,18 +20,109 @@
 ;   - Application validation (SP check at 0x08003000)
 ;   - Model string verification ("RT-950      ")
 ;
+; ==========================================================================
+; UART Update Protocol
+; ==========================================================================
+;
 ; Bootloader commands (UART):
-;   0x0A - Version handshake ("BOOTLOADER_V3")
-;   0x02 - Model verification
-;   0x04 - Package count
-;   0x03 - Data write (1024-byte blocks)
-;   0x45 - End update
+;   0x0A - Version handshake → responds "BOOTLOADER_V3"
+;   0x02 - Model verification → compares to "RT-950      " (12 bytes)
+;          On match: sets state[1]=1 (model verified), ACK (0x06)
+;          On mismatch: error 0xE6
+;   0x04 - Package count setup → requires state[1]==1
+;          Extracts block count from bytes [r5+6..7] (big-endian u16)
+;          Stores at state[0xC], resets write offset (state[8]=0)
+;          Sets state[1]=2 (ready for data), ACK
+;   0x03 - Data write → requires state[1]==2
+;          Validates data length == 0x400 (1024 bytes)
+;          Block number from bytes [r5+2..3] (big-endian u16)
+;          Block 1: calls set_decryption_key (key = data[6..21])
+;          Block 0: writes directly to flash (plaintext vectors+metadata)
+;          Block ≥2: calls flash_from_spi (decrypt + write at (block-1)*0x400)
+;          Updates write offset: state[8] += 0x400
+;   0x45 - End update → sets countdown timer, triggers reboot
 ;   (NO read/download commands - write-only protocol)
+;
+; State machine at [0x2000000C]:
+;   state[0x00] = unused
+;   state[0x01] = phase: 0=idle, 1=model verified, 2=ready for data
+;   state[0x04] = write offset (bytes written so far)
+;   state[0x08] = next expected write address
+;   state[0x0C] = total block count
+;   state[0x10] = reboot countdown
 ;
 ; Packet format: [0xAA, cmd, args_hi, args_lo, len_hi, len_lo, data..., crc_hi, crc_lo, 0x55]
 ; Response:      [0xAA, cmd, 0x00, result, 0x00, 0x00, crc_hi, crc_lo, 0x55]
 ; Result codes: 0x06=ACK, 0xE1=length error, 0xE2=verify error,
 ;               0xE3=flash error, 0xE5=unknown cmd, 0xE6=model mismatch
+;
+; ==========================================================================
+; Firmware Decryption Algorithm (flash_from_spi @ 0x080013A8)
+; ==========================================================================
+;
+; C pseudocode:
+;
+;   int flash_from_spi(uint32_t offset, uint8_t *data) {
+;       if (offset >= 0xFD000) return 0;       // bounds check
+;       uint32_t flash_addr = offset + 0x08003000;  // app base
+;       CPSID_I();                              // disable interrupts
+;
+;       // If 2KB page-aligned, erase flash page first
+;       if ((offset % 2048) == 0) {
+;           if (flash_page_erase(flash_addr) != 4) return 2;
+;       }
+;
+;       // Retry counter at 0x20000018; if < 2, set to 5
+;       uint32_t *retry = (uint32_t *)0x20000018;
+;       if (*retry < 2) *retry = 5;
+;       uint32_t max_offset = (*retry - 1) * 0x400;
+;
+;       // Decrypt blocks from 0x400..max_offset (skip block 0 = plaintext)
+;       if (offset >= 0x400 && offset < max_offset) {
+;           uint8_t *key = (uint8_t *)0x20000034;   // 16-byte key
+;           uint32_t key_idx = 0;
+;           for (uint32_t i = 0; i < 1024; i++) {
+;               uint8_t d = data[i];
+;               // FOUR skip conditions (preserve 0x00/0xFF in output):
+;               if (d == 0x00) goto skip;            // plaintext 0x00
+;               if (d == 0xFF) goto skip;            // plaintext 0xFF
+;               if (d == key[key_idx]) goto skip;    // XOR → 0x00
+;               if (d == (key[key_idx] ^ 0xFF)) goto skip; // XOR → 0xFF
+;               data[i] = d ^ key[key_idx];          // DECRYPT
+;           skip:
+;               key_idx = (key_idx + 1) & 0x0F;      // wrap at 16
+;               if (key_idx == 0) {                   // rotate key every 16 bytes
+;                   for (int j = 0; j < 8; j++) {
+;                       key[j]   = ROL8(key[j], 1);   // bytes 0-7: rotate left
+;                       key[j+8] = ROR8(key[j+8], 1); // bytes 8-15: rotate right
+;                   }
+;               }
+;           }
+;       }
+;
+;       // Write 256 words (1024 bytes) to flash, verify each
+;       int ok = 1;
+;       for (int i = 0; i < 256; i++) {
+;           flash_program_word(flash_addr, *(uint32_t*)data);
+;           if (*(uint32_t*)flash_addr != *(uint32_t*)data) ok = 0;
+;           flash_addr += 4; data += 4;
+;       }
+;       flash_wait_busy();
+;       CPSIE_I();
+;       return ok;
+;   }
+;
+; Key management:
+;   set_decryption_key (0x080011C0): copies 16 bytes from packet to 0x20000034
+;   Key schedule: in-place rotation every 16 bytes. After 128 bytes
+;   (8 rotations), ROL8×8 = identity → key returns to original.
+;   Equivalent to 128-byte expanded key with modulo-128 wrap.
+;
+; rotate_byte (0x080007BE):
+;   uint8_t rotate_byte(uint8_t val, int direction) {
+;       if (direction != 0) return ROL8(val, 1);  // (val<<1)|(val>>7)
+;       else                return ROR8(val, 1);  // (val>>1)|(val<<7)
+;   }
 ;
 ; 95 functions identified, 65+ named via reverse engineering.
 ; ==========================================================================
@@ -154,6 +245,10 @@
 |           0x08000184      0048           ldr r0, [0x08000188]        ; [0x8000188:4]=0x80022a1
 \           0x08000186      0047           bx r0
 
+; --------------------------------------------------------------------------
+; memset: Fill memory region with a byte value.
+; C pseudocode: memset(r0, r2, r1)  - fills r1 bytes at r0 with value r2
+; --------------------------------------------------------------------------
 ; CODE XREF from fcn.080001c2 @ 0x80001c4(x)
             ; CALL XREF from fcn.080001c6 @ 0x80001d0(x)
 / 14: fcn.080001b4 (int16_t arg1, int16_t arg2, int16_t arg3);
@@ -168,10 +263,18 @@
 \           0x080001c0      7047           bx lr
 
 :   ; CALL XREF from flash_program @ 0x8001502(x)
+; --------------------------------------------------------------------------
+; bzero: Zero-fill memory. Calls memset with r2=0.
+; C pseudocode: memset(r0, 0, r1)
+; --------------------------------------------------------------------------
 / 4: fcn.080001c2 ();
 |       :   0x080001c2      0022           movs r2, 0
 \       `=< 0x080001c4      f6e7           b fcn.080001b4
 
+; --------------------------------------------------------------------------
+; memcpy: Copy memory. Wraps memset as memmove(r0, r2, r1).
+; C pseudocode: memcpy(dst=r0, src=r1, len=r2)  - returns dst
+; --------------------------------------------------------------------------
 / 18: fcn.080001c6 (int16_t arg1, int16_t arg2, int16_t arg3);
 | `- args(r0, r1, r2)
 |           0x080001c6      10b5           push {r4, lr}
@@ -183,6 +286,11 @@
 |           0x080001d4      2046           mov r0, r4
 \           0x080001d6      10bd           pop {r4, pc}
 
+; --------------------------------------------------------------------------
+; memcmp_model: Compute string length (strlen equivalent).
+; C pseudocode: int memcmp_model(char *s) { return strlen(s); }
+; Scans for null terminator and returns count.
+; --------------------------------------------------------------------------
 ; CALL XREF from uart_update_mode @ 0x80002b2(x)
             ; CALL XREF from check_spi_model @ 0x8000674(x)
 / 14: memcmp_model (int16_t arg1);
@@ -195,6 +303,15 @@
 |           0x080001e2      801a           subs r0, r0, r2             ; arg1
 \           0x080001e4      7047           bx lr
 
+; --------------------------------------------------------------------------
+; memcmp_buf: Compare two byte buffers.
+; C pseudocode:
+;   int memcmp_buf(uint8_t *a, uint8_t *b, uint32_t len) {
+;       for (int i = 0; i < len; i++)
+;           if (a[i] != b[i]) return a[i] - b[i];
+;       return 0;  // buffers match
+;   }
+; --------------------------------------------------------------------------
 ; CALL XREF from uart_update_mode @ 0x80002bc(x)
             ; CALL XREF from check_spi_model @ 0x800067e(x)
 / 26: memcmp_buf (int16_t arg1, int16_t arg2, uint32_t arg3);
@@ -240,189 +357,251 @@
 \           0x08000222      0008           lsrs r0, r0, 0x20
 
 ; CALL XREF from main @ 0x80022be(x)
+; --------------------------------------------------------------------------
+; uart_update_mode: Main UART firmware update command dispatcher.
+;
+; State machine (r6 → 0x2000000C):
+;   state[1] = phase: 0=idle → 1=model verified → 2=ready for data
+;   state[4] = write offset counter
+;   state[8] = next expected flash write address
+;   state[C] = total block count
+;   state[10] = reboot countdown timer
+;
+; r5 = 0x20000044 (UART receive buffer base)
+; r6 = 0x2000000C (state structure)
+; r7 = 0 (constant)
+; r8 = 0xFFFF (mask for big-endian 16-bit extraction)
+; sb = 0x400 (expected data block size: 1024 bytes)
+; --------------------------------------------------------------------------
 / 410: uart_update_mode ();
 | afv: vars(1:sp[0xc..0xc])
 |           0x08000224      1fb5           push {r0, r1, r2, r3, r4, lr}
+|           ; Load model string "RT-950      " (12 bytes + null) onto stack
 |           0x08000226      5fa0           adr r0, 0x17c               ; "RT-950      "
 |                                                                      ; 0x80003a4
 |           0x08000228      90e80e00       ldm.w r0, {r1, r2, r3}
 |           0x0800022c      c068           ldr r0, [r0, 0xc]
 |           0x0800022e      8de80e00       stm.w sp, {r1, r2, r3}
 |           0x08000232      0390           str r0, [var_ch]
+|           ; sb = 0x400 = expected data payload size (1024 bytes)
 |           0x08000234      4ff48069       mov.w sb, 0x400
 |           0x08000238      4946           mov r1, sb
+|           ; Configure UART4 (0x40011800) with baud divisor 0x400
 |           0x0800023a      5e48           ldr r0, [0x080003b4]        ; [0x80003b4:4]=0x40011800
 |           0x0800023c      00f0b3ff       bl fcn.080011a6
 |           0x08000240      01f062fe       bl timer_reset
+|           ; r6 = state structure base at 0x2000000C
 |           0x08000244      5c4e           ldr r6, [0x080003b8]        ; [0x80003b8:4]=0x2000000c
 |           0x08000246      0027           movs r7, 0
+|           ; Initialize state: phase=0 (idle), countdown=0, offset=0
 |           0x08000248      7770           strb r7, [r6, 1]
 |           0x0800024a      3761           str r7, [r6, 0x10]
 |           0x0800024c      7760           str r7, [r6, 4]
 |           0x0800024e      4ff6ff78       movw r8, 0xffff
+|           ; r5 = UART receive buffer at 0x20000044
 |           0x08000252      5a4d           ldr r5, [0x080003bc]        ; [0x80003bc:4]=0x20000044
+|           ; === MAIN LOOP: wait for complete UART packet ===
 |           ; CODE XREFS from uart_update_mode @ 0x800025e(x), 0x8000280(x)
 |      ..-> 0x08000254      00f02afa       bl uart_rx_handler
+|      ::   ; Check if a complete packet has been received (flag at rx_buf+0x412)
 |      ::   0x08000258      95f81204       ldrb.w r0, [r5, 0x412]
 |      ::   0x0800025c      0128           cmp r0, 1                   ; 1
 |      `==< 0x0800025e      f9d1           bne 0x8000254
+|       :   ; Packet received - toggle UART RX enable bit (bit 10 of CR1)
 |       :   0x08000260      5448           ldr r0, [0x080003b4]        ; [0x80003b4:4]=0x40011800
 |       :   0x08000262      0c30           adds r0, 0xc
 |       :   0x08000264      0168           ldr r1, [r0]
 |       :   0x08000266      81f48061       eor r1, r1, 0x400
 |       :   0x0800026a      0160           str r1, [r0]
+|       :   ; Validate packet framing (0xAA header, 0x55 trailer) and CRC
 |       :   0x0800026c      00f0bef9       bl packet_validate
 |       :   0x08000270      0128           cmp r0, 1                   ; 1
 |      ,==< 0x08000272      06d0           beq 0x8000282
+|      |:   ; Packet validation failed → send error 0xE1 (length/CRC error)
 |      |:   0x08000274      6878           ldrb r0, [r5, 1]
 |      |:   0x08000276      e121           movs r1, 0xe1
 |      |:   0x08000278      00f0a2f8       bl send_response
 |      |:   ; XREFS: CODE 0x080002a4  CODE 0x080002ae  CODE 0x080002ca  CODE 0x080002d8  CODE 0x080002e8  
 |      |:   ; XREFS: CODE 0x08000302  CODE 0x08000312  CODE 0x0800032c  CODE 0x08000356  CODE 0x08000366  
 |      |:   ; XREFS: CODE 0x08000380  CODE 0x0800038c  
+|      |:   ; --- Loop back: reset timer and wait for next packet ---
 | .....---> 0x0800027c      01f044fe       bl timer_reset
 | :::::|`=< 0x08000280      e8e7           b 0x8000254
 | :::::|    ; CODE XREF from uart_update_mode @ 0x8000272(x)
+| :::::|    ; === COMMAND DISPATCH on cmd byte at rx_buf[1] ===
 | :::::`--> 0x08000282      6c78           ldrb r4, [r5, 1]
+| :::::     ; r4 = command byte
 | :::::     0x08000284      042c           cmp r4, 4                   ; 4
-| ::::: ,=< 0x08000286      28d0           beq 0x80002da
+| ::::: ,=< 0x08000286      28d0           beq 0x80002da               ; → cmd 0x04: package count
 | :::::,==< 0x08000288      04dc           bgt 0x8000294
 | :::::||   0x0800028a      022c           cmp r4, 2                   ; 2
-| ========< 0x0800028c      10d0           beq 0x80002b0
+| ========< 0x0800028c      10d0           beq 0x80002b0               ; → cmd 0x02: model verify
 | :::::||   0x0800028e      032c           cmp r4, 3                   ; 3
 | ========< 0x08000290      04d1           bne 0x800029c
-| ========< 0x08000292      37e0           b 0x8000304
+| ========< 0x08000292      37e0           b 0x8000304                  ; → cmd 0x03: data write
 | :::::||   ; CODE XREF from uart_update_mode @ 0x8000288(x)
 | :::::`--> 0x08000294      0a2c           cmp r4, 0xa                 ; 10
-| :::::,==< 0x08000296      06d0           beq 0x80002a6
+| :::::,==< 0x08000296      06d0           beq 0x80002a6               ; → cmd 0x0A: version query
 | :::::||   0x08000298      452c           cmp r4, 0x45                ; 69
-| ========< 0x0800029a      78d0           beq 0x800038e
+| ========< 0x0800029a      78d0           beq 0x800038e               ; → cmd 0x45: end update
 | :::::||   ; CODE XREF from uart_update_mode @ 0x8000290(x)
+|           ; --- Unknown command: respond with error 0xE5 ---
 | --------> 0x0800029c      e521           movs r1, 0xe5
 | :::::||   0x0800029e      2046           mov r0, r4
 | :::::||   0x080002a0      00f08ef8       bl send_response
 | ========< 0x080002a4      eae7           b 0x800027c
 | :::::||   ; CODE XREF from uart_update_mode @ 0x8000296(x)
-| :::::`--> 0x080002a6      0621           movs r1, 6
+|           ; --- CMD 0x0A: Version query → ACK with "BOOTLOADER_V3" ---
+| :::::`--> 0x080002a6      0621           movs r1, 6                  ; ACK
 | ::::: |   0x080002a8      2046           mov r0, r4
 | ::::: |   0x080002aa      00f089f8       bl send_response
 | ::::: |   ; CODE XREF from uart_update_mode @ 0x800039e(x)
 | =====.--> 0x080002ae      e5e7           b 0x800027c
 | ::::::|   ; CODE XREF from uart_update_mode @ 0x800028c(x)
-| --------> 0x080002b0      6846           mov r0, sp
-| ::::::|   0x080002b2      fff791ff       bl memcmp_model
-| ::::::|   0x080002b6      0246           mov r2, r0
-| ::::::|   0x080002b8      6946           mov r1, sp
-| ::::::|   0x080002ba      a81d           adds r0, r5, 6
-| ::::::|   0x080002bc      fff793ff       bl memcmp_buf
-| ========< 0x080002c0      20b1           cbz r0, 0x80002cc
+|           ; --- CMD 0x02: Model verification ---
+|           ; Compare received string (rx_buf+6) against "RT-950      " on stack
+| --------> 0x080002b0      6846           mov r0, sp                  ; model string on stack
+| ::::::|   0x080002b2      fff791ff       bl memcmp_model             ; r0 = strlen(model)
+| ::::::|   0x080002b6      0246           mov r2, r0                  ; r2 = length to compare
+| ::::::|   0x080002b8      6946           mov r1, sp                  ; r1 = expected model
+| ::::::|   0x080002ba      a81d           adds r0, r5, 6              ; r0 = received model (rx_buf+6)
+| ::::::|   0x080002bc      fff793ff       bl memcmp_buf               ; returns 0 if match
+| ========< 0x080002c0      20b1           cbz r0, 0x80002cc           ; match → set state=1
+| ::::::|   ; Model mismatch → error 0xE6
 | ::::::|   0x080002c2      e621           movs r1, 0xe6
 | ::::::|   0x080002c4      2046           mov r0, r4
 | ::::::|   0x080002c6      00f07bf8       bl send_response
 | ========< 0x080002ca      d7e7           b 0x800027c
 | ::::::|   ; CODE XREF from uart_update_mode @ 0x80002c0(x)
+|           ; Model match → state[1] = 1 (model verified), ACK
 | --------> 0x080002cc      0120           movs r0, 1
-| ::::::|   0x080002ce      7070           strb r0, [r6, 1]
-| ::::::|   0x080002d0      0621           movs r1, 6
+| ::::::|   0x080002ce      7070           strb r0, [r6, 1]            ; state[1] = 1 (verified)
+| ::::::|   0x080002d0      0621           movs r1, 6                  ; ACK
 | ::::::|   0x080002d2      2046           mov r0, r4
 | ::::::|   0x080002d4      00f074f8       bl send_response
 | ========< 0x080002d8      d0e7           b 0x800027c
 | ::::::|   ; CODE XREF from uart_update_mode @ 0x8000286(x)
-| ::::::`-> 0x080002da      7078           ldrb r0, [r6, 1]
-| ::::::    0x080002dc      0128           cmp r0, 1                   ; 1
-| ::::::,=< 0x080002de      04d0           beq 0x80002ea
+|           ; --- CMD 0x04: Package count setup (requires state[1]==1) ---
+| ::::::`-> 0x080002da      7078           ldrb r0, [r6, 1]            ; check current phase
+| ::::::    0x080002dc      0128           cmp r0, 1                   ; must be 1 (model verified)
+| ::::::,=< 0x080002de      04d0           beq 0x80002ea               ; proceed if verified
+| ::::::|   ; State not ready → error 0xE5
 | ::::::|   0x080002e0      e521           movs r1, 0xe5
 | ::::::|   0x080002e2      2046           mov r0, r4
 | ::::::|   0x080002e4      00f06cf8       bl send_response
 | ========< 0x080002e8      c8e7           b 0x800027c
 | ::::::|   ; CODE XREF from uart_update_mode @ 0x80002de(x)
-| ::::::`-> 0x080002ea      a879           ldrb r0, [r5, 6]
+|           ; Extract block count from rx_buf[6..7] (big-endian u16)
+| ::::::`-> 0x080002ea      a879           ldrb r0, [r5, 6]            ; high byte
 | ::::::    0x080002ec      0002           lsls r0, r0, 8
-| ::::::    0x080002ee      e979           ldrb r1, [r5, 7]
-| ::::::    0x080002f0      0143           orrs r1, r0
-| ::::::    0x080002f2      f160           str r1, [r6, 0xc]
-| ::::::    0x080002f4      b760           str r7, [r6, 8]
+| ::::::    0x080002ee      e979           ldrb r1, [r5, 7]            ; low byte
+| ::::::    0x080002f0      0143           orrs r1, r0                 ; r1 = block count
+| ::::::    0x080002f2      f160           str r1, [r6, 0xc]           ; state[0xC] = total blocks
+| ::::::    0x080002f4      b760           str r7, [r6, 8]             ; state[8] = 0 (reset write offset)
+| ::::::    ; Advance to phase 2 (ready for data)
 | ::::::    0x080002f6      0220           movs r0, 2
-| ::::::    0x080002f8      7070           strb r0, [r6, 1]
-| ::::::    0x080002fa      0621           movs r1, 6
+| ::::::    0x080002f8      7070           strb r0, [r6, 1]            ; state[1] = 2
+| ::::::    0x080002fa      0621           movs r1, 6                  ; ACK
 | ::::::    0x080002fc      2046           mov r0, r4
 | ::::::    0x080002fe      00f05ff8       bl send_response
 | ========< 0x08000302      bbe7           b 0x800027c
 | ::::::    ; CODE XREF from uart_update_mode @ 0x8000292(x)
-| --------> 0x08000304      7078           ldrb r0, [r6, 1]
-| ::::::    0x08000306      0228           cmp r0, 2                   ; 2
-| ::::::,=< 0x08000308      04d0           beq 0x8000314
+|           ; --- CMD 0x03: Data write (requires state[1]==2) ---
+| --------> 0x08000304      7078           ldrb r0, [r6, 1]            ; check current phase
+| ::::::    0x08000306      0228           cmp r0, 2                   ; must be 2 (ready for data)
+| ::::::,=< 0x08000308      04d0           beq 0x8000314               ; proceed if ready
+| ::::::|   ; State not ready → error 0xE5
 | ::::::|   0x0800030a      e521           movs r1, 0xe5
 | ::::::|   0x0800030c      2046           mov r0, r4
 | ::::::|   0x0800030e      00f057f8       bl send_response
 | ========< 0x08000312      b3e7           b 0x800027c
 | ::::::|   ; CODE XREF from uart_update_mode @ 0x8000308(x)
-| ::::::`-> 0x08000314      2879           ldrb r0, [r5, 4]
+|           ; Validate data length == 0x400 (1024 bytes)
+| ::::::`-> 0x08000314      2879           ldrb r0, [r5, 4]            ; len_hi from rx_buf[4]
 | ::::::    0x08000316      2946           mov r1, r5
-| ::::::    0x08000318      08ea0020       and.w r0, r8, r0, lsl 8
-| ::::::    0x0800031c      4a79           ldrb r2, [r1, 5]
-| ::::::    0x0800031e      1044           add r0, r2
-| ::::::    0x08000320      4845           cmp r0, sb
-| ::::::,=< 0x08000322      04d0           beq 0x800032e
+| ::::::    0x08000318      08ea0020       and.w r0, r8, r0, lsl 8     ; (len_hi << 8) & 0xFFFF
+| ::::::    0x0800031c      4a79           ldrb r2, [r1, 5]            ; len_lo from rx_buf[5]
+| ::::::    0x0800031e      1044           add r0, r2                  ; r0 = data length
+| ::::::    0x08000320      4845           cmp r0, sb                  ; must equal 0x400
+| ::::::,=< 0x08000322      04d0           beq 0x800032e               ; length OK
+| ::::::|   ; Length mismatch → error 0xE1
 | ::::::|   0x08000324      e121           movs r1, 0xe1
 | ::::::|   0x08000326      0320           movs r0, 3
 | ::::::|   0x08000328      00f04af8       bl send_response
 | `=======< 0x0800032c      a6e7           b 0x800027c
 |  :::::|   ; CODE XREF from uart_update_mode @ 0x8000322(x)
-|  :::::`-> 0x0800032e      8878           ldrb r0, [r1, 2]
-|  :::::    0x08000330      ca78           ldrb r2, [r1, 3]
+|           ; Extract block number from rx_buf[2..3] (big-endian u16)
+|  :::::`-> 0x0800032e      8878           ldrb r0, [r1, 2]            ; block_hi
+|  :::::    0x08000330      ca78           ldrb r2, [r1, 3]            ; block_lo
 |  :::::    0x08000332      08ea0020       and.w r0, r8, r0, lsl 8
-|  :::::    0x08000336      1044           add r0, r2
+|  :::::    0x08000336      1044           add r0, r2                  ; r0 = block number
+|  :::::    ; Block 1 → extract decryption key (special case)
 |  :::::    0x08000338      0128           cmp r0, 1                   ; 1
-|  :::::,=< 0x0800033a      0dd0           beq 0x8000358
-| ,=======< 0x0800033c      00b1           cbz r0, 0x8000340
+|  :::::,=< 0x0800033a      0dd0           beq 0x8000358               ; → set_decryption_key
+|           ; Block 0 → write directly (no decryption, contains vectors)
+| ,=======< 0x0800033c      00b1           cbz r0, 0x8000340           ; block 0: skip subtract
+| |:::::|   ; Block ≥ 2 → r0 = block_num - 1 (flash offset = (block-1)*0x400)
 | |:::::|   0x0800033e      401e           subs r0, r0, 1
 | |:::::|   ; CODE XREF from uart_update_mode @ 0x800033c(x)
-| `-------> 0x08000340      8202           lsls r2, r0, 0xa
-|  :::::|   0x08000342      b068           ldr r0, [r6, 8]
+| `-------> 0x08000340      8202           lsls r2, r0, 0xa            ; r2 = offset = r0 * 0x400
+|  :::::|   ; Verify sequential ordering: state[8] must match expected offset
+|  :::::|   0x08000342      b068           ldr r0, [r6, 8]             ; r0 = state[8] (next expected)
 |  :::::|   0x08000344      9042           cmp r0, r2
-| ,=======< 0x08000346      02d1           bne 0x800034e
+| ,=======< 0x08000346      02d1           bne 0x800034e               ; mismatch → error 0xE2
+| |:::::|   ; Bounds check: offset must be < 0xFD000 (firmware region)
 | |:::::|   0x08000348      b0f57d2f       cmp.w r0, 0xfd000
-| ========< 0x0800034c      0cd3           blo 0x8000368
+| ========< 0x0800034c      0cd3           blo 0x8000368               ; in bounds → flash write
 | |:::::|   ; CODE XREF from uart_update_mode @ 0x8000346(x)
+|           ; Sequence or bounds error → error 0xE2 (verify error)
 | `-------> 0x0800034e      e221           movs r1, 0xe2
 |  :::::|   0x08000350      2046           mov r0, r4
 |  :::::|   0x08000352      00f035f8       bl send_response
 |  `======< 0x08000356      91e7           b 0x800027c
 |   ::::|   ; CODE XREF from uart_update_mode @ 0x800033a(x)
-|   ::::`-> 0x08000358      881d           adds r0, r1, 6
-|   ::::    0x0800035a      00f031ff       bl set_decryption_key
-|   ::::    0x0800035e      0621           movs r1, 6
+|           ; --- Block 1: Extract 16-byte decryption key from data[6..21] ---
+|   ::::`-> 0x08000358      881d           adds r0, r1, 6              ; r0 = &rx_buf[6] (key data)
+|   ::::    0x0800035a      00f031ff       bl set_decryption_key       ; copy 16 bytes → 0x20000034
+|   ::::    0x0800035e      0621           movs r1, 6                  ; ACK
 |   ::::    0x08000360      2046           mov r0, r4
 |   ::::    0x08000362      00f02df8       bl send_response
 |   `=====< 0x08000366      89e7           b 0x800027c
 |    :::    ; CODE XREF from uart_update_mode @ 0x800034c(x)
-| --------> 0x08000368      891d           adds r1, r1, 6
+|           ; --- Block 0 or ≥2: Decrypt (if needed) and write to flash ---
+|           ; r0 = state[8] (write offset), r1 = &rx_buf[6] (data payload)
+| --------> 0x08000368      891d           adds r1, r1, 6              ; r1 = data pointer
+|    :::    ; flash_from_spi(offset=state[8], data=rx_buf+6)
+|    :::    ; Block 0 skips decryption; block ≥2 decrypts then writes
 |    :::    0x0800036a      01f01df8       bl flash_from_spi
-|    :::,=< 0x0800036e      48b1           cbz r0, 0x8000384
+|    :::,=< 0x0800036e      48b1           cbz r0, 0x8000384           ; 0 = flash error
+|    :::|   ; Flash write succeeded → advance write offset by 0x400
 |    :::|   0x08000370      b068           ldr r0, [r6, 8]
-|    :::|   0x08000372      00f58060       add.w r0, r0, 0x400
+|    :::|   0x08000372      00f58060       add.w r0, r0, 0x400         ; state[8] += 1024
 |    :::|   0x08000376      b060           str r0, [r6, 8]
-|    :::|   0x08000378      0621           movs r1, 6
+|    :::|   0x08000378      0621           movs r1, 6                  ; ACK
 |    :::|   0x0800037a      2046           mov r0, r4
 |    :::|   0x0800037c      00f020f8       bl send_response
 |    `====< 0x08000380      7ce7           b 0x800027c
 ..
 |    |::|   ; CODE XREF from uart_update_mode @ 0x800036e(x)
+|           ; Flash write failed → error 0xE3
 |    |::`-> 0x08000384      e321           movs r1, 0xe3
 |    |::    0x08000386      2046           mov r0, r4
 |    |::    0x08000388      00f01af8       bl send_response
 |    |`===< 0x0800038c      76e7           b 0x800027c
 |    | :    ; CODE XREF from uart_update_mode @ 0x800029a(x)
 |    | :    ; CODE XREF from uart_update_mode @ +0x15e(x)
-| ---`----> 0x0800038e      0621           movs r1, 6
+|           ; --- CMD 0x45: End update → ACK, set countdown, reboot ---
+| ---`----> 0x0800038e      0621           movs r1, 6                  ; ACK
 |      :    0x08000390      2046           mov r0, r4
 |      :    0x08000392      00f015f8       bl send_response
+|      :    ; Set reboot countdown timer = 0x14 (20 ticks)
 |      :    0x08000396      1420           movs r0, 0x14
-|      :    0x08000398      3061           str r0, [r6, 0x10]
+|      :    0x08000398      3061           str r0, [r6, 0x10]          ; state[0x10] = countdown
+|      :    ; Wait for countdown to reach 0 (decremented by SysTick ISR)
 |      :    0x0800039a      3069           ldr r0, [r6, 0x10]
 |      :    0x0800039c      0028           cmp r0, 0
-|      `==< 0x0800039e      86d0           beq 0x80002ae
+|      `==< 0x0800039e      86d0           beq 0x80002ae               ; done → return to main loop
+|           ; System reset via AIRCR register (SCB→AIRCR = 0x05FA0004)
 |           0x080003a0      01f078fa       bl systick_delay
 |           ; DATA XREFS from uart_update_mode @ 0x8000226(r), 0x8000228(r)
 |           0x080003a4      5254           strb r2, [r2, r1]
@@ -1096,26 +1275,45 @@
 \  `======< 0x080005d2      cae7           b 0x800056a
 
 ; CALL XREF from uart_update_mode @ 0x800026c(x)
+; --------------------------------------------------------------------------
+; packet_validate: Validate received UART packet framing and CRC.
+;
+; C pseudocode:
+;   int packet_validate(void) {
+;       uint8_t *buf = rx_buf;             // 0x20000044
+;       uint16_t len = *(uint16_t*)(buf + 0x410);  // packet length
+;       if (buf[0] != 0xAA) return 0;      // header check
+;       if (buf[len - 1] != 0x55) return 0;// trailer check
+;       uint16_t crc = crc_ccitt_calc(&buf[1], len - 4);
+;       uint16_t pkt_crc = (buf[len-3] << 8) | buf[len-2];
+;       return (crc == pkt_crc) ? 1 : 0;
+;   }
+; --------------------------------------------------------------------------
 / 78: packet_validate ();
 |           0x080005ec      10b5           push {r4, lr}
 |           0x080005ee      134c           ldr r4, [0x0800063c]        ; [0x800063c:4]=0x20000044
+|           ; Check header byte == 0xAA
 |           0x080005f0      2078           ldrb r0, [r4]
 |           0x080005f2      aa28           cmp r0, 0xaa                ; 170
-|       ,=< 0x080005f4      05d1           bne 0x8000602
+|       ,=< 0x080005f4      05d1           bne 0x8000602               ; not 0xAA → fail
+|       |   ; Check trailer byte == 0x55 at buf[len-1]
 |       |   0x080005f6      b4f81014       ldrh.w r1, [r4, 0x410]
 |       |   0x080005fa      601e           subs r0, r4, 1
 |       |   0x080005fc      085c           ldrb r0, [r1, r0]
 |       |   0x080005fe      5528           cmp r0, 0x55                ; 85
-|      ,==< 0x08000600      01d0           beq 0x8000606
+|      ,==< 0x08000600      01d0           beq 0x8000606               ; trailer OK → check CRC
 |      ||   ; CODE XREF from packet_validate @ 0x80005f4(x)
+|           ; Framing failed → return 0
 |      |`-> 0x08000602      0020           movs r0, 0
 |      |    0x08000604      10bd           pop {r4, pc}
 |      |    ; CODE XREF from packet_validate @ 0x8000600(x)
+|           ; Compute CRC-CCITT over buf[1..len-4], compare to packet CRC
 |      `--> 0x08000606      b4f81004       ldrh.w r0, [r4, 0x410]
-|           0x0800060a      001f           subs r0, r0, 4
+|           0x0800060a      001f           subs r0, r0, 4              ; CRC covers len-4 bytes
 |           0x0800060c      81b2           uxth r1, r0
-|           0x0800060e      601c           adds r0, r4, 1              ; int16_t arg1
-|           0x08000610      00f0b6f8       bl crc_ccitt_calc
+|           0x0800060e      601c           adds r0, r4, 1              ; skip header byte (0xAA)
+|           0x08000610      00f0b6f8       bl crc_ccitt_calc           ; r0 = computed CRC
+|           ; Extract packet CRC from buf[len-3] (hi) and buf[len-2] (lo)
 |           0x08000614      b4f81024       ldrh.w r2, [r4, 0x410]
 |           0x08000618      0849           ldr r1, [0x0800063c]        ; [0x800063c:4]=0x20000044
 |           0x0800061a      c91e           subs r1, r1, 3
@@ -1124,11 +1322,12 @@
 |           0x08000622      064a           ldr r2, [0x0800063c]        ; [0x800063c:4]=0x20000044
 |           0x08000624      921e           subs r2, r2, 2
 |           0x08000626      9a5c           ldrb r2, [r3, r2]
-|           0x08000628      02eb0121       add.w r1, r2, r1, lsl 8
+|           0x08000628      02eb0121       add.w r1, r2, r1, lsl 8     ; r1 = (crc_hi << 8) | crc_lo
 |           0x0800062c      89b2           uxth r1, r1
+|           ; Compare computed CRC vs packet CRC
 |           0x0800062e      8842           cmp r0, r1
-|       ,=< 0x08000630      01d0           beq 0x8000636
-|       |   0x08000632      0020           movs r0, 0
+|       ,=< 0x08000630      01d0           beq 0x8000636               ; match → return 1
+|       |   0x08000632      0020           movs r0, 0                  ; CRC mismatch → return 0
 |       |   0x08000634      10bd           pop {r4, pc}
 |       |   ; CODE XREF from packet_validate @ 0x8000630(x)
 |       `-> 0x08000636      0120           movs r0, 1
@@ -1181,13 +1380,31 @@
 |      :`-> 0x08000694      0120           movs r0, 1
 \      `==< 0x08000696      fbe7           b 0x8000690
 
-; CALL XREF from uart_update_mode @ 0x8000254(x)
+; --------------------------------------------------------------------------
+; uart_rx_handler: UART receive state machine / watchdog handler.
+;
+; C pseudocode:
+;   void uart_rx_handler(void) {
+;       uint32_t *state = (uint32_t *)0x2000000C;
+;       if (state[1] < 100) return;         // not enough ticks yet
+;       state[1] = 0;                       // reset tick counter
+;       if (uart_check_data(UART4, 1) != 1) { state[0] = 0; return; }
+;       if (state[0] != 0) {                // already initialized
+;           gpio_set(GPIOA, 0x800);         // toggle LED
+;           gpio_read_pin(100);             // debounce
+;           systick_delay();
+;       }
+;       state[0] = 1;                       // mark UART active
+;   }
+; --------------------------------------------------------------------------
 / 60: uart_rx_handler ();
 |           0x080006ac      70b5           push {r4, r5, r6, lr}
+|           ; r4 = state structure at 0x2000000C
 |           0x080006ae      0e4c           ldr r4, [0x080006e8]        ; [0x80006e8:4]=0x2000000c
+|           ; Check timeout counter at state[4]
 |           0x080006b0      6068           ldr r0, [r4, 4]
 |           0x080006b2      6428           cmp r0, 0x64                ; 100
-|       ,=< 0x080006b4      08d3           blo 0x80006c8
+|       ,=< 0x080006b4      08d3           blo 0x80006c8               ; < 100 ticks → return
 |       |   0x080006b6      0025           movs r5, 0
 |       |   0x080006b8      6560           str r5, [r4, 4]
 |       |   0x080006ba      0121           movs r1, 1                  ; uint32_t arg2
@@ -1271,27 +1488,50 @@
 
 ; CALL XREF from send_response @ 0x80003d8(x)
             ; CALL XREF from packet_validate @ 0x8000610(x)
+; --------------------------------------------------------------------------
+; crc_ccitt_calc: CRC-CCITT (0xFFFF initial, polynomial 0x1021) calculator.
+;
+; C pseudocode:
+;   uint16_t crc_ccitt_calc(uint8_t *data, uint16_t len) {
+;       uint16_t crc = 0;
+;       for (uint16_t i = 0; i < len; i++) {
+;           crc ^= (uint16_t)data[i] << 8;
+;           for (int bit = 0; bit < 8; bit++) {
+;               if (crc & 0x8000)
+;                   crc = (crc << 1) ^ 0x1021;
+;               else
+;                   crc = (crc << 1) & 0xFFFF;
+;           }
+;       }
+;       return crc;
+;   }
+; --------------------------------------------------------------------------
 / 62: crc_ccitt_calc (int16_t arg1, uint32_t arg2);
 | `- args(r0, r1)
 |           0x08000780      f0b5           push {r4, r5, r6, r7, lr}
-|           0x08000782      0646           mov r6, r0                  ; arg1
-|           0x08000784      0020           movs r0, 0
-|           0x08000786      0023           movs r3, 0
+|           0x08000782      0646           mov r6, r0                  ; r6 = data pointer
+|           0x08000784      0020           movs r0, 0                  ; crc = 0
+|           0x08000786      0023           movs r3, 0                  ; byte index = 0
+|           ; r4 = polynomial 0x1021, r5 = mask 0xFFFF
 |           0x08000788      41f22104       movw r4, 0x1021             ; '!\x10'
 |           0x0800078c      4ff6ff75       movw r5, 0xffff
 |       ,=< 0x08000790      12e0           b 0x80007b8
 |       |   ; CODE XREF from crc_ccitt_calc @ 0x80007ba(x)
-|      .--> 0x08000792      f25c           ldrb r2, [r6, r3]
-|      :|   0x08000794      80ea0220       eor.w r0, r0, r2, lsl 8
+|           ; Outer loop: for each byte
+|      .--> 0x08000792      f25c           ldrb r2, [r6, r3]           ; data[i]
+|      :|   0x08000794      80ea0220       eor.w r0, r0, r2, lsl 8    ; crc ^= data[i] << 8
 |      :|   0x08000798      80b2           uxth r0, r0
-|      :|   0x0800079a      0022           movs r2, 0
+|      :|   0x0800079a      0022           movs r2, 0                  ; bit counter
 |      :|   ; CODE XREF from crc_ccitt_calc @ 0x80007b2(x)
-|     .---> 0x0800079c      0704           lsls r7, r0, 0x10
-|    ,====< 0x0800079e      03d5           bpl 0x80007a8
+|           ; Inner loop: 8 bits per byte
+|     .---> 0x0800079c      0704           lsls r7, r0, 0x10          ; test bit 15
+|    ,====< 0x0800079e      03d5           bpl 0x80007a8               ; bit 15 clear → shift only
+|    |::|   ; bit 15 set → crc = (crc << 1) ^ 0x1021
 |    |::|   0x080007a0      84ea4000       eor.w r0, r4, r0, lsl 1
 |    |::|   0x080007a4      80b2           uxth r0, r0
 |   ,=====< 0x080007a6      01e0           b 0x80007ac
 |   ||::|   ; CODE XREF from crc_ccitt_calc @ 0x800079e(x)
+|           ; bit 15 clear → crc = (crc << 1) & 0xFFFF
 |   |`----> 0x080007a8      05ea4000       and.w r0, r5, r0, lsl 1
 |   | ::|   ; CODE XREF from crc_ccitt_calc @ 0x80007a6(x)
 |   `-----> 0x080007ac      521c           adds r2, r2, 1
@@ -1306,21 +1546,38 @@
 \           0x080007bc      f0bd           pop {r4, r5, r6, r7, pc}
 
 ; CALL XREFS from flash_from_spi @ 0x800142e(x), 0x8001440(x)
+; --------------------------------------------------------------------------
+; rotate_byte (fcn.080007be): Single-bit byte rotation for key schedule.
+;
+; C pseudocode:
+;   uint8_t rotate_byte(uint8_t val, int direction) {
+;       if (direction != 0)
+;           return (val << 1) | (val >> 7);   // ROL8 by 1
+;       else
+;           return (val >> 1) | (val << 7);   // ROR8 by 1
+;   }
+;
+; Called from flash_from_spi key rotation loop:
+;   - direction=1 for key bytes 0-7  (ROL8)
+;   - direction=0 for key bytes 8-15 (ROR8)
+; --------------------------------------------------------------------------
 / 26: fcn.080007be (int16_t arg1, uint32_t arg2);
 | `- args(r0, r1)
-|           0x080007be      0246           mov r2, r0                  ; arg1
-|           0x080007c0      0029           cmp r1, 0                   ; arg2
-|       ,=< 0x080007c2      04d0           beq 0x80007ce
-|       |   0x080007c4      5006           lsls r0, r2, 0x19
-|       |   0x080007c6      000e           lsrs r0, r0, 0x18
-|       |   0x080007c8      d109           lsrs r1, r2, 7
-|       |   0x080007ca      0843           orrs r0, r1
+|           0x080007be      0246           mov r2, r0                  ; r2 = val
+|           0x080007c0      0029           cmp r1, 0                   ; direction: 0=ROR, nonzero=ROL
+|       ,=< 0x080007c2      04d0           beq 0x80007ce               ; → ROR path
+|       |   ; ROL8: (val << 1) | (val >> 7) - bits 0-6 shift up, bit 7 wraps to bit 0
+|       |   0x080007c4      5006           lsls r0, r2, 0x19           ; val << 25 (isolate top bits)
+|       |   0x080007c6      000e           lsrs r0, r0, 0x18           ; >> 24 = effectively (val << 1) & 0xFE
+|       |   0x080007c8      d109           lsrs r1, r2, 7              ; val >> 7 (carry bit)
+|       |   0x080007ca      0843           orrs r0, r1                 ; combine
 |       |   0x080007cc      7047           bx lr
 |       |   ; CODE XREF from fcn.080007be @ 0x80007c2(x)
-|       `-> 0x080007ce      5008           lsrs r0, r2, 1
-|           0x080007d0      d107           lsls r1, r2, 0x1f
-|           0x080007d2      090e           lsrs r1, r1, 0x18
-|           0x080007d4      0843           orrs r0, r1
+|       |   ; ROR8: (val >> 1) | (val << 7) - bits 1-7 shift down, bit 0 wraps to bit 7
+|       `-> 0x080007ce      5008           lsrs r0, r2, 1              ; val >> 1
+|           0x080007d0      d107           lsls r1, r2, 0x1f           ; val << 31 (isolate bit 0)
+|           0x080007d2      090e           lsrs r1, r1, 0x18           ; >> 24 = bit 0 moved to bit 7
+|           0x080007d4      0843           orrs r0, r1                 ; combine
 \           0x080007d6      7047           bx lr
 
 ; CALL XREF from model_xor_decode @ 0x8002388(x)
@@ -2527,6 +2784,13 @@
 \           0x080011a4      7047           bx lr
 
 ; XREFS: CALL 0x0800023c  CALL 0x08000482  CODE 0x08000880  CALL 0x080008ac  CALL 0x080008de  
+; --------------------------------------------------------------------------
+; uart_set_baud (fcn.080011a6): Set UART baud rate divisor.
+; C pseudocode: void uart_set_baud(UART_TypeDef *uart, uint16_t divisor) {
+;                   uart->BRR = divisor;  // offset 0x10 in UART registers
+;               }
+; Called with 0x40011800 (UART4) and divisor 0x400.
+; --------------------------------------------------------------------------
             ; XREFS: CODE 0x08000906  CODE 0x08000924  CALL 0x0800121c  CALL 0x08001590  CALL 0x080015ac  
             ; XREFS: CALL 0x08001c70  CALL 0x08001cb4  CALL 0x08001d88  CALL 0x08001e38  CALL 0x080023b4  
             ; XREFS: CODE 0x080023c0  CALL 0x080023da  CALL 0x08002414  CODE 0x08002420  
@@ -2556,19 +2820,44 @@
 \           0x080011bc      7047           bx lr
 
 ; CALL XREF from uart_update_mode @ 0x800035a(x)
+; --------------------------------------------------------------------------
+; set_decryption_key: Copy 16-byte XOR key from packet to RAM.
+;
+; C pseudocode:
+;   void set_decryption_key(uint8_t *src) {
+;       uint8_t *dst = (uint8_t *)0x20000034;  // key storage in RAM
+;       for (int i = 0; i < 16; i++)
+;           dst[i] = src[i];
+;   }
+;
+; Called with block 1 data: key = packet_data[6..21] (16 bytes).
+; No key expansion - the in-place ROL/ROR rotation during decryption
+; IS the key schedule. After 128 bytes (8 rotations), key resets.
+; --------------------------------------------------------------------------
 / 18: set_decryption_key (int16_t arg1);
 | `- args(r0)
-|           0x080011c0      0021           movs r1, 0
+|           0x080011c0      0021           movs r1, 0                  ; i = 0
 |           0x080011c2      044a           ldr r2, [0x080011d4]        ; [0x80011d4:4]=0x20000034
 |           ; CODE XREF from set_decryption_key @ 0x80011ce(x)
-|       .-> 0x080011c4      435c           ldrb r3, [r0, r1]           ; arg1
-|       :   0x080011c6      5354           strb r3, [r2, r1]
-|       :   0x080011c8      491c           adds r1, r1, 1
+|       .-> 0x080011c4      435c           ldrb r3, [r0, r1]           ; src[i]
+|       :   0x080011c6      5354           strb r3, [r2, r1]           ; dst[i] = src[i]
+|       :   0x080011c8      491c           adds r1, r1, 1              ; i++
 |       :   0x080011ca      c9b2           uxtb r1, r1
 |       :   0x080011cc      1029           cmp r1, 0x10                ; 16
-|       `=< 0x080011ce      f9d3           blo 0x80011c4
+|       `=< 0x080011ce      f9d3           blo 0x80011c4               ; loop while i < 16
 \           0x080011d0      7047           bx lr
 
+; --------------------------------------------------------------------------
+; copy_bytes (hardfault_handler): Byte-by-byte memory copy.
+; Despite the misleading radare2 name, this is a simple memcpy.
+;
+; C pseudocode:
+;   int copy_bytes(uint8_t *src, uint8_t *dst, uint32_t len) {
+;       for (int i = 0; i < len; i++)
+;           dst[i] = *src++;
+;       return 1;
+;   }
+; --------------------------------------------------------------------------
 ; CALL XREF from check_spi_model @ 0x800066e(x)
 / 22: hardfault_handler (int16_t arg1, int16_t arg2, uint32_t arg3);
 | `- args(r0, r1, r2)
@@ -2586,110 +2875,155 @@
 \           0x080013a6      10bd           pop {r4, pc}
 
 ; CALL XREF from uart_update_mode @ 0x800036a(x)
+; --------------------------------------------------------------------------
+; flash_from_spi: Decrypt firmware block and write to internal flash.
+;
+; This is the CRITICAL decryption function. See file header for full
+; C pseudocode and algorithm details.
+;
+; Args: r0 = flash offset from app base, r1 = pointer to 1024-byte data
+; Returns: 1 = success, 0 = out of bounds, 2 = erase error
+;
+; Register allocation:
+;   r4 = offset, r5 = data pointer, r6 = key_idx (0-15)
+;   r7 = flash_addr (0x08003000 + offset), r8 = success flag
+;   sb = 0x20000034 (16-byte key in RAM), sl = 0x400 (1024)
+;   fp = &key[8] (used for ROR half during rotation)
+; --------------------------------------------------------------------------
 / 222: flash_from_spi (int16_t arg1, int16_t arg2, int16_t arg_8h);
 | `- args(r0, r1, sp[0x8..0x8])
 |           0x080013a8      2de9f05f       push.w {r4, r5, r6, r7, r8, sb, sl, fp, ip, lr}
-|           0x080013ac      0446           mov r4, r0                  ; arg1
-|           0x080013ae      0d46           mov r5, r1                  ; arg2
-|           0x080013b0      4ff00108       mov.w r8, 1
+|           0x080013ac      0446           mov r4, r0                  ; r4 = offset
+|           0x080013ae      0d46           mov r5, r1                  ; r5 = data pointer
+|           0x080013b0      4ff00108       mov.w r8, 1                 ; r8 = success (assume ok)
+|           ; === BOUNDS CHECK: offset must be < 0xFD000 ===
 |           0x080013b4      b4f57d2f       cmp.w r4, 0xfd000
-|       ,=< 0x080013b8      02d3           blo 0x80013c0
-|       |   0x080013ba      0020           movs r0, 0
+|       ,=< 0x080013b8      02d3           blo 0x80013c0               ; in bounds
+|       |   0x080013ba      0020           movs r0, 0                  ; return 0 (out of bounds)
 |       |   ; CODE XREFS from flash_from_spi @ 0x80013da(x), 0x8001484(x)
 |     ..--> 0x080013bc      bde8f09f       pop.w {r4, r5, r6, r7, r8, sb, sl, fp, ip, pc}
 |     ::|   ; CODE XREF from flash_from_spi @ 0x80013b8(x)
 |     ::`-> 0x080013c0      3148           ldr r0, aav.0x08003000      ; [0x8001488:4]=0x8003000 aav.0x08003000
+|     ::    ; r7 = flash_addr = 0x08003000 + offset
 |     ::    0x080013c2      2718           adds r7, r4, r0
+|     ::    ; === DISABLE INTERRUPTS for flash operations ===
 |     ::    0x080013c4      72b6           cpsid i
 |     ::    0x080013c6      fff71dfc       bl spi_cs_low
+|     ::    ; === PAGE ERASE: if offset is 2KB-aligned (bit test via lsl 0x15) ===
+|     ::    ; (offset << 0x15) == 0 iff offset is a multiple of 2048
 |     ::    0x080013ca      6005           lsls r0, r4, 0x15
-|     ::,=< 0x080013cc      06d1           bne 0x80013dc
+|     ::,=< 0x080013cc      06d1           bne 0x80013dc               ; not aligned → skip erase
 |     ::|   0x080013ce      3846           mov r0, r7                  ; int16_t arg1
-|     ::|   0x080013d0      fff724fb       bl spi_flash_read
-|     ::|   0x080013d4      0428           cmp r0, 4                   ; 4
-|    ,====< 0x080013d6      01d0           beq 0x80013dc
-|    |::|   0x080013d8      0220           movs r0, 2
+|     ::|   0x080013d0      fff724fb       bl spi_flash_read           ; erase flash page
+|     ::|   0x080013d4      0428           cmp r0, 4                   ; 4 = erase success
+|    ,====< 0x080013d6      01d0           beq 0x80013dc               ; success → continue
+|    |::|   0x080013d8      0220           movs r0, 2                  ; return 2 (erase error)
 |    |`===< 0x080013da      efe7           b 0x80013bc
 |    | :|   ; CODE XREFS from flash_from_spi @ 0x80013cc(x), 0x80013d6(x)
+|          ; === RETRY COUNTER: if *0x20000018 < 2, set to 5 ===
 |    `--`-> 0x080013dc      2b48           ldr r0, [0x0800148c]        ; [0x800148c:4]=0x20000018
-|      :    0x080013de      0168           ldr r1, [r0]
+|      :    0x080013de      0168           ldr r1, [r0]                ; retry counter
 |      :    0x080013e0      0229           cmp r1, 2                   ; 2
-|      :,=< 0x080013e2      01d2           bhs 0x80013e8
-|      :|   0x080013e4      0521           movs r1, 5
+|      :,=< 0x080013e2      01d2           bhs 0x80013e8               ; >= 2 → keep
+|      :|   0x080013e4      0521           movs r1, 5                  ; default to 5
 |      :|   0x080013e6      0160           str r1, [r0]
 |      :|   ; CODE XREF from flash_from_spi @ 0x80013e2(x)
 |      :`-> 0x080013e8      0068           ldr r0, [r0]
+|      :    ; max_offset = (retry - 1) * 0x400
 |      :    0x080013ea      401e           subs r0, r0, 1
-|      :    0x080013ec      8002           lsls r0, r0, 0xa
-|      :    0x080013ee      4ff4806a       mov.w sl, 0x400
+|      :    0x080013ec      8002           lsls r0, r0, 0xa            ; r0 = max decryptable offset
+|      :    0x080013ee      4ff4806a       mov.w sl, 0x400             ; sl = 1024 (block size)
+|      :    ; === DECRYPTION RANGE CHECK ===
+|      :    ; Only decrypt if offset >= 0x400 (skip block 0 = plaintext vectors)
+|      :    ; and offset < max_offset
 |      :    0x080013f2      5445           cmp r4, sl
-|      :,=< 0x080013f4      30d3           blo 0x8001458
+|      :,=< 0x080013f4      30d3           blo 0x8001458               ; offset < 0x400 → skip decrypt
 |      :|   0x080013f6      8442           cmp r4, r0
-|     ,===< 0x080013f8      2ed2           bhs 0x8001458
-|     |:|   0x080013fa      0026           movs r6, 0
-|     |:|   0x080013fc      0024           movs r4, 0
+|     ,===< 0x080013f8      2ed2           bhs 0x8001458               ; offset >= max → skip decrypt
+|     |:|   ; === DECRYPTION LOOP: 1024 bytes with XOR + skip rules ===
+|     |:|   0x080013fa      0026           movs r6, 0                  ; r6 = key_idx (0-15)
+|     |:|   0x080013fc      0024           movs r4, 0                  ; r4 = byte index i (0-1023)
+|     |:|   ; sb = key pointer at 0x20000034
 |     |:|   0x080013fe      dff89090       ldr.w sb, [0x08001490]      ; [0x8001490:4]=0x20000034
 |     |:|   ; CODE XREF from flash_from_spi @ 0x8001456(x)
-|    .----> 0x08001402      2a5d           ldrb r2, [r5, r4]
-|   ,=====< 0x08001404      5ab1           cbz r2, 0x800141e
+|           ; --- Per-byte decryption: for (i = 0; i < 1024; i++) ---
+|    .----> 0x08001402      2a5d           ldrb r2, [r5, r4]           ; r2 = data[i]
+|           ; Skip condition 1: data[i] == 0x00 (plaintext zero)
+|   ,=====< 0x08001404      5ab1           cbz r2, 0x800141e           ; → skip (no decrypt)
+|   |:|:|   ; Skip condition 2: data[i] == 0xFF (plaintext erased byte)
 |   |:|:|   0x08001406      ff2a           cmp r2, 0xff                ; 255
-|  ,======< 0x08001408      09d0           beq 0x800141e
-|  ||:|:|   0x0800140a      19f80600       ldrb.w r0, [sb, r6]
+|  ,======< 0x08001408      09d0           beq 0x800141e               ; → skip
+|  ||:|:|   ; Load key[key_idx]
+|  ||:|:|   0x0800140a      19f80600       ldrb.w r0, [sb, r6]         ; r0 = key[key_idx]
+|  ||:|:|   ; Skip condition 3: data[i] == key[key_idx] (XOR would produce 0x00)
 |  ||:|:|   0x0800140e      8242           cmp r2, r0
-| ,=======< 0x08001410      05d0           beq 0x800141e
+| ,=======< 0x08001410      05d0           beq 0x800141e               ; → skip
+| |||:|:|   ; Skip condition 4: data[i] == key[key_idx] ^ 0xFF (XOR would produce 0xFF)
 | |||:|:|   0x08001412      80f0ff01       eor r1, r0, 0xff
 | |||:|:|   0x08001416      8a42           cmp r2, r1
-| ========< 0x08001418      01d0           beq 0x800141e
+| ========< 0x08001418      01d0           beq 0x800141e               ; → skip
+| |||:|:|   ; All skip conditions failed → DECRYPT: data[i] ^= key[key_idx]
 | |||:|:|   0x0800141a      4240           eors r2, r0
-| |||:|:|   0x0800141c      2a55           strb r2, [r5, r4]
+| |||:|:|   0x0800141c      2a55           strb r2, [r5, r4]           ; data[i] = decrypted byte
 | |||:|:|   ; CODE XREFS from flash_from_spi @ 0x8001404(x), 0x8001408(x), 0x8001410(x), 0x8001418(x)
-| ```-----> 0x0800141e      761c           adds r6, r6, 1
-|    :|:|   0x08001420      06f00f06       and r6, r6, 0xf
-|   ,=====< 0x08001424      a6b9           cbnz r6, 0x8001450
-|   |:|:|   0x08001426      0023           movs r3, 0
+|           ; --- Advance key index (regardless of skip/decrypt) ---
+| ```-----> 0x0800141e      761c           adds r6, r6, 1              ; key_idx++
+|    :|:|   0x08001420      06f00f06       and r6, r6, 0xf             ; key_idx &= 0x0F (wrap at 16)
+|           ; If key_idx wrapped to 0 → rotate the 16-byte key
+|   ,=====< 0x08001424      a6b9           cbnz r6, 0x8001450          ; not zero → skip rotation
+|   |:|:|   ; === KEY ROTATION: every 16 bytes, rotate key in-place ===
+|   |:|:|   ; Bytes 0-7: ROL8 by 1 (direction=1)
+|   |:|:|   ; Bytes 8-15: ROR8 by 1 (direction=0)
+|   |:|:|   0x08001426      0023           movs r3, 0                  ; j = 0
 |   |:|:|   ; CODE XREF from flash_from_spi @ 0x800144e(x)
-|  .------> 0x08001428      0121           movs r1, 1                  ; uint32_t arg2
-|  :|:|:|   0x0800142a      19f80300       ldrb.w r0, [sb, r3]         ; int16_t arg1
-|  :|:|:|   0x0800142e      fff7c6f9       bl fcn.080007be
-|  :|:|:|   0x08001432      09f80300       strb.w r0, [sb, r3]
-|  :|:|:|   0x08001436      09eb030b       add.w fp, sb, r3
-|  :|:|:|   0x0800143a      0021           movs r1, 0                  ; uint32_t arg2
-|  :|:|:|   0x0800143c      9bf80800       ldrb.w r0, [arg_8h]         ; int16_t arg1
-|  :|:|:|   0x08001440      fff7bdf9       bl fcn.080007be
-|  :|:|:|   0x08001444      8bf80800       strb.w r0, [arg_8h]
-|  :|:|:|   0x08001448      5b1c           adds r3, r3, 1
+|  .------> 0x08001428      0121           movs r1, 1                  ; direction=1 (ROL)
+|  :|:|:|   0x0800142a      19f80300       ldrb.w r0, [sb, r3]         ; key[j] (bytes 0-7)
+|  :|:|:|   0x0800142e      fff7c6f9       bl fcn.080007be             ; rotate_byte(key[j], 1) → ROL8
+|  :|:|:|   0x08001432      09f80300       strb.w r0, [sb, r3]         ; key[j] = ROL8(key[j])
+|  :|:|:|   ; Now rotate key[j+8] with ROR (direction=0)
+|  :|:|:|   0x08001436      09eb030b       add.w fp, sb, r3            ; fp = &key[j]
+|  :|:|:|   0x0800143a      0021           movs r1, 0                  ; direction=0 (ROR)
+|  :|:|:|   0x0800143c      9bf80800       ldrb.w r0, [arg_8h]         ; key[j+8] (bytes 8-15)
+|  :|:|:|   0x08001440      fff7bdf9       bl fcn.080007be             ; rotate_byte(key[j+8], 0) → ROR8
+|  :|:|:|   0x08001444      8bf80800       strb.w r0, [arg_8h]         ; key[j+8] = ROR8(key[j+8])
+|  :|:|:|   0x08001448      5b1c           adds r3, r3, 1              ; j++
 |  :|:|:|   0x0800144a      dbb2           uxtb r3, r3
 |  :|:|:|   0x0800144c      082b           cmp r3, 8                   ; 8
-|  `======< 0x0800144e      ebd3           blo 0x8001428
+|  `======< 0x0800144e      ebd3           blo 0x8001428               ; loop j = 0..7
 |   |:|:|   ; CODE XREF from flash_from_spi @ 0x8001424(x)
-|   `-----> 0x08001450      641c           adds r4, r4, 1
+|           ; --- Continue byte loop ---
+|   `-----> 0x08001450      641c           adds r4, r4, 1              ; i++
 |    :|:|   0x08001452      a4b2           uxth r4, r4
-|    :|:|   0x08001454      5445           cmp r4, sl
-|    `====< 0x08001456      d4d3           blo 0x8001402
+|    :|:|   0x08001454      5445           cmp r4, sl                  ; i < 1024?
+|    `====< 0x08001456      d4d3           blo 0x8001402               ; next byte
 |     |:|   ; CODE XREFS from flash_from_spi @ 0x80013f4(x), 0x80013f8(x)
-|     `-`-> 0x08001458      0024           movs r4, 0
+|           ; === FLASH WRITE LOOP: write 256 words (1024 bytes) and verify ===
+|     `-`-> 0x08001458      0024           movs r4, 0                  ; word index = 0
 |      :    ; CODE XREF from flash_from_spi @ 0x800147a(x)
-|      :.-> 0x0800145a      3846           mov r0, r7                  ; int16_t arg1
-|      ::   0x0800145c      2968           ldr r1, [r5]                ; int16_t arg2
-|      ::   0x0800145e      fff781fb       bl spi_transaction
-|      ::   0x08001462      2868           ldr r0, [r5]
-|      ::   0x08001464      3968           ldr r1, [r7]
+|      :.-> 0x0800145a      3846           mov r0, r7                  ; flash_addr
+|      ::   0x0800145c      2968           ldr r1, [r5]                ; *(uint32_t*)data
+|      ::   0x0800145e      fff781fb       bl spi_transaction          ; flash_program_word(addr, word)
+|      ::   ; Verify: compare written word with source
+|      ::   0x08001462      2868           ldr r0, [r5]                ; source word
+|      ::   0x08001464      3968           ldr r1, [r7]                ; flash word (read back)
 |      ::   0x08001466      8842           cmp r0, r1
-|     ,===< 0x08001468      02d0           beq 0x8001470
+|     ,===< 0x08001468      02d0           beq 0x8001470               ; match → next word
+|     |::   ; Verify failed → mark r8 = 0 (will return failure)
 |     |::   0x0800146a      4ff00008       mov.w r8, 0
-|    ,====< 0x0800146e      05e0           b 0x800147c
+|    ,====< 0x0800146e      05e0           b 0x800147c                 ; bail out of write loop
 |    ||::   ; CODE XREF from flash_from_spi @ 0x8001468(x)
-|    |`---> 0x08001470      3f1d           adds r7, r7, 4
-|    | ::   0x08001472      2d1d           adds r5, r5, 4
-|    | ::   0x08001474      641c           adds r4, r4, 1
+|    |`---> 0x08001470      3f1d           adds r7, r7, 4              ; flash_addr += 4
+|    | ::   0x08001472      2d1d           adds r5, r5, 4              ; data += 4
+|    | ::   0x08001474      641c           adds r4, r4, 1              ; word_idx++
 |    | ::   0x08001476      a4b2           uxth r4, r4
-|    | ::   0x08001478      ff2c           cmp r4, 0xff                ; 255
-|    | :`=< 0x0800147a      eed9           bls 0x800145a
+|    | ::   0x08001478      ff2c           cmp r4, 0xff                ; 255 (256 words = 1024 bytes)
+|    | :`=< 0x0800147a      eed9           bls 0x800145a               ; next word
 |    | :    ; CODE XREF from flash_from_spi @ 0x800146e(x)
-|    `----> 0x0800147c      fff766fb       bl spi_wait_busy
-|      :    0x08001480      62b6           cpsie i
-|      :    0x08001482      4046           mov r0, r8
-\      `==< 0x08001484      9ae7           b 0x80013bc
+|           ; === CLEANUP: wait for flash, re-enable interrupts ===
+|    `----> 0x0800147c      fff766fb       bl spi_wait_busy            ; wait for flash controller
+|      :    0x08001480      62b6           cpsie i                     ; re-enable interrupts
+|      :    0x08001482      4046           mov r0, r8                  ; return success flag
+\      `==< 0x08001484      9ae7           b 0x80013bc                 ; → pop and return
 
 ; CALL XREF from lcd_gpio_init @ 0x8001370(x)
 / 82: fcn.08001494 ();
@@ -3327,6 +3661,21 @@
 ; CALL XREF from uart_update_mode @ 0x80003a0(x)
             ; CALL XREF from check_update_button @ 0x800055e(x)
             ; CALL XREF from uart_rx_handler @ 0x80006de(x)
+; --------------------------------------------------------------------------
+; systick_delay: Trigger system reset via AIRCR register.
+; Despite the name, this is actually a SYSTEM RESET function.
+;
+; C pseudocode:
+;   void systick_delay(void) {
+;       __DSB();
+;       SCB->AIRCR = (SCB->AIRCR & 0x700) | 0x05FA0004;  // SYSRESETREQ
+;       __DSB();
+;       while (1) __NOP();  // wait for reset
+;   }
+;
+; 0xE000ED0C = SCB->AIRCR (Application Interrupt and Reset Control)
+; 0x05FA0004 = VECTKEY (0x05FA) + SYSRESETREQ bit (bit 2)
+; --------------------------------------------------------------------------
 / 26: systick_delay ();
 |           0x08001894      bff34f8f       dsb sy
 |           0x08001898      0548           ldr r0, [0x080018b0]        ; [0x80018b0:4]=0xe000ed0c
@@ -4061,6 +4410,11 @@
 
 ; CALL XREFS from uart_update_mode @ 0x8000240(x), 0x800027c(x)
             ; CALL XREFS from check_update_button @ 0x8000574(x), 0x80005b2(x)
+; --------------------------------------------------------------------------
+; timer_reset: Reset the UART protocol watchdog timer.
+; Clears the timer state structure at 0x20000454:
+;   [0] = counter (u16), [2] = flags (u8), [3] = flags (u8)
+; --------------------------------------------------------------------------
 / 12: timer_reset ();
 |           0x08001f08      0248           ldr r0, [0x08001f14]        ; [0x8001f14:4]=0x20000454
 |           0x08001f0a      0021           movs r1, 0

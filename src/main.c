@@ -167,7 +167,9 @@ static void task_keypad(void)
             volatile uint32_t *gpioe_idr = (volatile uint32_t *)0x40011808UL;
             volatile uint32_t *gpioa_idr = (volatile uint32_t *)0x40010808UL;
             uint32_t pc = *gpioc_idr;
+            (void)pc;
             uint32_t pd = *gpiod_idr;
+            (void)pd;
             uint32_t pe = *gpioe_idr;
             uint32_t pa = *gpioa_idr;
             dbg_puts("[KBD_DIAG] PC=");
@@ -175,7 +177,9 @@ static void task_keypad(void)
             dbg_puts(" PD=");
             dbg_reg("", pd);
             uint8_t side1 = (pe >> 5) & 1;  /* PE5 TOP_PROG */
+            (void)side1;
             uint8_t side4 = (pa >> 12) & 1; /* PA12 BOT_PROG */
+            (void)side4;
             dbg_puts(" SIDE1=");
             dbg_reg("", side1);
             dbg_puts(" SIDE4=");
@@ -186,6 +190,7 @@ static void task_keypad(void)
     key_event_t evt;
     if (keypad_get_event(&evt)) {
         const char *kn = (evt.key < KEY_COUNT) ? key_names[evt.key] : "??";
+        (void)kn;
         switch (evt.type) {
         case KEY_EVT_PRESS:
             dbg_puts("[KEY] press: ");
@@ -226,7 +231,9 @@ static void task_encoder(void)
             volatile uint32_t *gpiob_idr = (volatile uint32_t *)0x40010C08UL;
             uint32_t pb = *gpiob_idr;
             uint8_t enc_a = (pb >> 4) & 1;
+            (void)enc_a;
             uint8_t enc_b = (pb >> 5) & 1;
+            (void)enc_b;
             dbg_puts("[ENC_DIAG] PB=");
             dbg_reg("", pb);
             dbg_puts(" A=");
@@ -293,6 +300,166 @@ static void task_cps(void)
     cps_poll();
 }
 
+/* ========================================================================
+ *  audio_diagnostic_v12 - Isolated in own stack frame to prevent
+ *  main() stack bloat that causes HardFault during bk4829_init.
+ * ======================================================================== */
+__attribute__((noinline)) static void audio_diagnostic_v12(void)
+{
+    dbg_puts("[AUD] === AUDIO DIAGNOSTIC V12 ===\n");
+    dbg_puts("[AUD] Aggressive reset + PC12=LOW confirmed path\n");
+
+    /* ================================================================
+     * PHASE 1: AGGRESSIVE HARDWARE RESET
+     * BK4829 AF output loads the bus even in "standby" if the chip's
+     * internal LDO still has charge.  We must fully isolate it.
+     * ================================================================ */
+
+    /* 1a: BK4829 deep shutdown - both chips */
+    bk4829_standby(BK4829_CHIP0);
+    bk4829_standby(BK4829_CHIP1);
+    /* Mute AF output explicitly: R47[15:14]=0 disables AF DAC */
+    bk4829_write_reg(BK4829_CHIP0, 0x47, 0x0000);
+    bk4829_write_reg(BK4829_CHIP1, 0x47, 0x0000);
+    /* R48=0 disables IF path */
+    bk4829_write_reg(BK4829_CHIP0, 0x48, 0x0000);
+    bk4829_write_reg(BK4829_CHIP1, 0x48, 0x0000);
+
+    /* 1b: Full DAC reset */
+    DAC->CR = 0;
+    DMA2_CH(3)->CCR = 0;
+    ((TIM_TypeDef*)0x40001000)->CR1 = 0;  /* TIM6 stop */
+
+    /* 1c: Amp power cycle - force PE4 LOW for 100ms to discharge */
+    gpio_config_pin(GPIOE, GPIO_PIN_4, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOE, GPIO_PIN_4);   /* PE4 LOW - amp power OFF */
+    gpio_config_pin(GPIOB, GPIO_PIN_8, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOB, GPIO_PIN_8);   /* PB8 LOW - amp disable */
+    gpio_config_pin(GPIOE, GPIO_PIN_1, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOE, GPIO_PIN_1);     /* PE1 HIGH - mute */
+    gpio_config_pin(GPIOC, GPIO_PIN_12, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOC, GPIO_PIN_12);  /* PC12 LOW */
+
+    /* PA3 OD LOW - match OEM */
+    gpio_config_pin(GPIOA, GPIO_PIN_3, GPIO_MODE_OUT_10MHZ, GPIO_CNF_OD);
+    gpio_clear_pin(GPIOA, GPIO_PIN_3);
+
+    dbg_puts("[AUD] Amp power-cycled OFF, waiting 500ms...\n");
+    delay_ms(500); IWDG_FEED();
+
+    /* 1d: Bring amp back up with settling time */
+    gpio_set_pin(GPIOE, GPIO_PIN_4);     /* PE4 HIGH - amp power ON */
+    gpio_set_pin(GPIOB, GPIO_PIN_8);     /* PB8 HIGH - amp enable */
+    gpio_clear_pin(GPIOE, GPIO_PIN_1);   /* PE1 LOW - unmute */
+    dbg_puts("[AUD] Amp powered ON, settling 200ms...\n");
+    delay_ms(200); IWDG_FEED();
+
+    /* ================================================================
+     * PHASE 2: FOCUSED AUDIO TESTS
+     * All tests use PC12=LOW (confirmed working).
+     * ================================================================ */
+
+    /* ---- T1: BF square wave 500Hz, PC12=LOW, BOFF1=1, 5s ---- */
+    dbg_puts("[AUD] T1: BF 500Hz PC12=LOW BOFF1=1 5s\n");
+    {
+        gpio_clear_pin(GPIOC, GPIO_PIN_12);
+        /* EN2 + BOFF1 + EN1 */
+        DAC->CR = (1UL << 16) | (1UL << 1) | (1UL << 0);
+        delay_ms(1);
+        uint32_t t0 = get_tick();
+        while (get_tick() - t0 < 5000) {
+            DAC->DHR12R1 = 0xFFF; delay_ms(1);
+            DAC->DHR12R1 = 0x000; delay_ms(1);
+            IWDG_FEED();
+        }
+        DAC->CR = 0;
+        dbg_puts("[AUD] T1 done\n");
+    }
+    delay_ms(500); IWDG_FEED();
+
+    /* ---- T2: BF 500Hz, PC12=LOW, buffer ON (BOFF1=0), 5s ---- */
+    dbg_puts("[AUD] T2: BF 500Hz PC12=LOW bufON 5s\n");
+    {
+        gpio_clear_pin(GPIOC, GPIO_PIN_12);
+        /* EN2 + EN1, NO BOFF1 = buffer enabled (lower impedance) */
+        DAC->CR = (1UL << 16) | (1UL << 0);
+        delay_ms(1);
+        uint32_t t0 = get_tick();
+        while (get_tick() - t0 < 5000) {
+            DAC->DHR12R1 = 0xFFF; delay_ms(1);
+            DAC->DHR12R1 = 0x000; delay_ms(1);
+            IWDG_FEED();
+        }
+        DAC->CR = 0;
+        dbg_puts("[AUD] T2 done\n");
+    }
+    delay_ms(500); IWDG_FEED();
+
+    /* ---- T3: DMA 1kHz tone, PC12=LOW, 5s ---- */
+    dbg_puts("[AUD] T3: DMA 1kHz PC12=LOW 5s\n");
+    {
+        gpio_clear_pin(GPIOC, GPIO_PIN_12);
+        dac_audio_play_tone(10000);
+        dbg_reg("[AUD] T3 DAC_CR=0x", DAC->CR);
+        delay_ms(5000); IWDG_FEED();
+        dac_audio_stop();
+        dbg_puts("[AUD] T3 done\n");
+    }
+    delay_ms(500); IWDG_FEED();
+
+    /* ---- T4: DMA frequency sweep PC12=LOW ---- */
+    dbg_puts("[AUD] T4: Sweep 500/1000/2000Hz PC12=LOW 3s each\n");
+    {
+        gpio_clear_pin(GPIOC, GPIO_PIN_12);
+        dac_audio_play_tone(5000);  /* 500 Hz */
+        dbg_puts("[AUD] 500Hz\n");
+        delay_ms(3000); IWDG_FEED();
+        dac_audio_stop(); delay_ms(100);
+        dac_audio_play_tone(10000); /* 1000 Hz */
+        dbg_puts("[AUD] 1000Hz\n");
+        delay_ms(3000); IWDG_FEED();
+        dac_audio_stop(); delay_ms(100);
+        dac_audio_play_tone(20000); /* 2000 Hz */
+        dbg_puts("[AUD] 2000Hz\n");
+        delay_ms(3000); IWDG_FEED();
+        dac_audio_stop();
+        dbg_puts("[AUD] T4 done\n");
+    }
+    delay_ms(500); IWDG_FEED();
+
+    /* ---- T5: PC12=HIGH comparison (should be silent) 3s ---- */
+    dbg_puts("[AUD] T5: DMA 1kHz PC12=HIGH 3s (expect silent)\n");
+    {
+        gpio_set_pin(GPIOC, GPIO_PIN_12);
+        dac_audio_play_tone(10000);
+        delay_ms(3000); IWDG_FEED();
+        dac_audio_stop();
+        dbg_puts("[AUD] T5 done\n");
+    }
+    delay_ms(500); IWDG_FEED();
+
+    /* ---- T6: Continuous 1kHz tone for enjoyment ---- */
+    dbg_puts("[AUD] T6: Continuous 1kHz PC12=LOW (10s)\n");
+    {
+        gpio_clear_pin(GPIOC, GPIO_PIN_12);
+        dac_audio_play_tone(10000);
+        delay_ms(10000); IWDG_FEED();
+        dac_audio_stop();
+        dbg_puts("[AUD] T6 done\n");
+    }
+
+    /* Cleanup: stop audio, mute amp */
+    dac_audio_stop();
+    DAC->CR = 0;
+    gpio_clear_pin(GPIOB, GPIO_PIN_8);   /* amp disable */
+    gpio_set_pin(GPIOE, GPIO_PIN_1);     /* mute */
+    gpio_clear_pin(GPIOC, GPIO_PIN_12);
+    bk4829_standby(BK4829_CHIP0);
+    bk4829_standby(BK4829_CHIP1);
+
+    dbg_puts("[AUD] === TESTS COMPLETE ===\n");
+}
+
 /* ======================================================================== */
 
 int main(void)
@@ -308,11 +475,32 @@ int main(void)
     {
         volatile uint32_t *ctrlsts = (volatile uint32_t *)0x40021024UL;
         uint32_t rst = *ctrlsts;
+        (void)rst;
         dbg_reg("[DBG] RST_FLAGS=0x", rst);
         *ctrlsts |= (1UL << 24);  /* RSTFC: clear reset flags */
     }
 
     dbg_puts("[DBG] main() entered\n");
+
+    /*
+     * Disable all DMA channels - bootloader may have left transfers active.
+     * Must be done after DMA clocks are implicitly enabled (AHB peripheral
+     * clocks survive software resets on AT32F403A).
+     * DMA1 channels at base 0x40020000, DMA2 at 0x40020400.
+     * Each channel: CCR at offset +0x08 + (ch-1)*0x14.
+     */
+    {
+        /* Enable DMA clocks first (may already be on from bootloader) */
+        volatile uint32_t *ahben = (volatile uint32_t *)0x40021014UL;
+        *ahben |= (1UL << 0) | (1UL << 1);  /* DMA1EN + DMA2EN */
+
+        /* DMA1 channels 1-7: write 0 to CCR to disable */
+        for (int ch = 0; ch < 7; ch++)
+            *(volatile uint32_t *)(0x40020008UL + ch * 0x14UL) = 0;
+        /* DMA2 channels 1-5: write 0 to CCR to disable */
+        for (int ch = 0; ch < 5; ch++)
+            *(volatile uint32_t *)(0x40020408UL + ch * 0x14UL) = 0;
+    }
 
     /* Hex table self-test: verify .rodata integrity after BTF upload.
      * If corrupted, you'll see garbled chars instead of 0123456789ABCDEF. */
@@ -336,6 +524,134 @@ int main(void)
 
     /* Initialize application-layer modules and register scheduler tasks */
     app_init();
+
+    /* ================================================================
+     * POST-INIT AUDIO TESTS
+     * ================================================================ */
+    dbg_puts("[AUD] === AUDIO TESTS ===\n");
+    {
+        /* Configure BK4829 audio filter/AF path (OEM audio_route_setup) */
+        bk4829_audio_filter_config(BK4829_CHIP0);
+        bk4829_audio_filter_config(BK4829_CHIP1);
+        dbg_puts("[AUD] BK4829 audio filters configured\n");
+
+        /* Set BK4829 AF path to BEEP mode (OEM @ 0x0801BC2C mode=3)
+         * REG_47=0xEB4F routes MCU DAC analog input to speaker driver
+         * REG_48=0xB0A3 sets fixed gain for beep output
+         * Without this, the BK4829 speaker path ignores the DAC signal! */
+        bk4829_set_af_beep(BK4829_CHIP0);
+        bk4829_set_af_beep(BK4829_CHIP1);
+        dbg_puts("[AUD] BK4829 AF path set to BEEP mode\n");
+
+        /* Verify REG 0x47 readback */
+        dbg_reg("[AUD]   C0 REG47=0x", bk4829_read_reg(BK4829_CHIP0, 0x47));
+        dbg_reg("[AUD]   C0 REG48=0x", bk4829_read_reg(BK4829_CHIP0, 0x48));
+
+        /* Audio path GPIOs: PE1 LOW=unmute, PB8 HIGH=amp,
+         * PC12 HIGH=radio/BK4829 path (LOW=DAC beep path, V12 verified),
+         * PE7 HIGH=RX/speaker mode (ACTIVE LOW relay), PE9 LOW=speaker (not BT).
+         * CRITICAL: PB8 must be configured as push-pull output BEFORE
+         * setting it HIGH.  Without this, PB8 stays in floating-input
+         * mode after reset and gpio_set_pin only enables a weak ~40kΩ
+         * internal pull-up - not enough to drive the amplifier. */
+        gpio_set_pin(GPIOE, GPIO_PIN_7);             /* U3T_EN HIGH = RX/spk */
+        gpio_clear_pin(GPIOE, GPIO_PIN_9);           /* SW_TO_BT LOW */
+        gpio_clear_pin(GPIOE, GPIO_PIN_1);
+        gpio_config_pin(GPIOB, GPIO_PIN_8,           /* AMP_EN */
+                        GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+        gpio_set_pin(GPIOB, GPIO_PIN_8);             /* enable amplifier */
+        gpio_set_pin(GPIOC, GPIO_PIN_12);            /* PC12 HIGH = radio path */
+
+        /* Verify audio routing GPIO state */
+        dbg_reg("[AUD] PE7=0x", (GPIOE->IDR >> 7) & 1);
+        dbg_reg("[AUD] PE9=0x", (GPIOE->IDR >> 9) & 1);
+        dbg_reg("[AUD] PE1=0x", (GPIOE->IDR >> 1) & 1);
+        dbg_reg("[AUD] PB8=0x", (GPIOB->IDR >> 8) & 1);
+        dbg_reg("[AUD] PC12=0x", (GPIOC->IDR >> 12) & 1);
+
+        /* Dump ALL GPIO port registers to find any missing config.
+         * Compare CRL/CRH/ODR with OEM to find hidden control signals. */
+        dbg_puts("[GPIO] === PORT REGISTER DUMP ===\n");
+        {
+            typedef struct { volatile uint32_t CRL, CRH, IDR, ODR, BSR, BRR, LOCK; } GP;
+            static const struct { const char *name; uint32_t base; } ports[] = {
+                {"A", 0x40010800}, {"B", 0x40010C00}, {"C", 0x40011000},
+                {"D", 0x40011400}, {"E", 0x40011800}
+            };
+            int p;
+            for (p = 0; p < 5; p++) {
+                volatile GP *g = (volatile GP *)ports[p].base;
+                (void)g;
+                dbg_puts("[GPIO] PORT");
+                dbg_puts(ports[p].name);
+                dbg_puts(": ");
+                dbg_reg("CRL=", g->CRL);
+                dbg_reg(" CRH=", g->CRH);
+                dbg_reg(" ODR=", g->ODR);
+                dbg_puts("\n");
+            }
+        }
+        dbg_puts("[GPIO] === END DUMP ===\n");
+
+        /* Verify PA4/PA5 analog mode + DAC state before test */
+        dbg_reg("[AUD] GPIOA_CRL=0x", ((GPIO_TypeDef *)GPIOA_BASE)->CRL);
+        dbg_reg("[AUD] DAC_CR=0x", DAC->CR);
+
+        /* Dump clock enable registers to verify all peripherals enabled */
+        dbg_reg("[CLK] APB1EN=0x", CRM->APB1EN);
+        dbg_reg("[CLK] APB2EN=0x", CRM->APB2EN);
+        dbg_reg("[CLK] AHBEN=0x",  CRM->AHBEN);
+
+        /* Verify AFIO IOMUX_REMAP - SWJ_CFG should be 010 (bits 26:24) */
+        dbg_reg("[AFIO] REMAP=0x", *(volatile uint32_t *)0x40010004UL);
+
+        /* Dump BK4829 GPIO-related registers - BK4829 GPIO outputs may
+         * physically control audio mux/switch components on the PCB */
+        dbg_reg("[BK] C0 R30=0x", bk4829_read_reg(BK4829_CHIP0, 0x30));
+        dbg_reg("[BK] C0 R31=0x", bk4829_read_reg(BK4829_CHIP0, 0x31));
+        dbg_reg("[BK] C0 R33=0x", bk4829_read_reg(BK4829_CHIP0, 0x33));
+        dbg_reg("[BK] C0 R3F=0x", bk4829_read_reg(BK4829_CHIP0, 0x3F));
+
+        /* Dump DAC peripheral registers in detail */
+        dbg_reg("[DAC] CR=0x",    DAC->CR);
+        dbg_reg("[DAC] SR=0x",    DAC->SR);
+        dbg_reg("[DAC] DOR1=0x",  DAC->DOR1);
+        dbg_reg("[DAC] DOR2=0x",  DAC->DOR2);
+
+        /* Full BK4829 CHIP0 register dump (0x00-0x3F) for OEM comparison */
+        dbg_puts("[BKDUMP] C0 regs 0x00-0x3F:\n");
+        {
+            int r;
+            for (r = 0; r <= 0x3F; r++) {
+                uint16_t v = bk4829_read_reg(BK4829_CHIP0, (uint8_t)r);
+                (void)v;
+                if (r % 8 == 0) {
+                    dbg_reg("[BKDUMP] ", r);
+                    dbg_puts(":");
+                }
+                dbg_reg(" ", v);
+                if (r % 8 == 7) dbg_puts("\n");
+            }
+        }
+        dbg_puts("[BKDUMP] C1 regs 0x00-0x3F:\n");
+        {
+            int r;
+            for (r = 0; r <= 0x3F; r++) {
+                uint16_t v = bk4829_read_reg(BK4829_CHIP1, (uint8_t)r);
+                (void)v;
+                if (r % 8 == 0) {
+                    dbg_reg("[BKDUMP] ", r);
+                    dbg_puts(":");
+                }
+                dbg_reg(" ", v);
+                if (r % 8 == 7) dbg_puts("\n");
+            }
+        }
+        IWDG_FEED();
+
+        /* === AUDIO PATH TESTS (V11) === */
+        audio_diagnostic_v12();
+    }
 
     /* Main loop - never returns */
     dbg_puts("[DBG] entering scheduler\n");
@@ -427,9 +743,11 @@ static void hw_init(void)
     {
         uint8_t probe[160];
         const char *names[] = {"SYSCFG","VFOCFG","EXTCFG","VFOSEL","CHCFG "};
+        (void)names;
         const wl_sector_t *secs[] = {&WL_SYSCFG,&WL_VFOCFG,&WL_EXTCFG,&WL_VFOSEL,&WL_CHCFG};
         for (int i = 0; i < 5; i++) {
             int rc = wl_read(secs[i], probe);
+            (void)rc;
             dbg_puts("[DBG] WL ");
             dbg_puts(names[i]);
             dbg_puts(rc == 0 ? ": valid\n" : ": empty/uninitialized\n");
@@ -438,8 +756,26 @@ static void hw_init(void)
     IWDG_FEED();
 
     /* BK4829 dual RF transceivers (GPIOE bit-bang) ------------------- */
-    /* RADIO DISABLED - skip RF transceiver init for peripheral testing */
-    dbg_puts("[DBG] bk4829_init SKIPPED (radio disabled)\n");
+    /* Configure BK4829 SPI GPIO pins as outputs before init.
+     * OEM gpio_modes_init @ 0x0801391C: configures PE8/10/11/15 as
+     * push-pull outputs and resets them LOW (CS idle = HIGH after init). */
+    dbg_puts("[DBG] bk4829_gpio_init...\n");
+    gpio_config_pin(BK4829_SEN1_PORT, BK4829_SEN1_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE8 = SEN1 */
+    gpio_set_pin(BK4829_SEN1_PORT, BK4829_SEN1_PIN);       /* CS idle HIGH */
+    gpio_config_pin(BK4829_SEN2_PORT, BK4829_SEN2_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE15 = SEN2 */
+    gpio_set_pin(BK4829_SEN2_PORT, BK4829_SEN2_PIN);       /* CS idle HIGH */
+    gpio_config_pin(BK4829_SCK_PORT, BK4829_SCK_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE10 = SCK */
+    gpio_clear_pin(BK4829_SCK_PORT, BK4829_SCK_PIN);       /* SCK idle LOW */
+    gpio_config_pin(BK4829_SDA_PORT, BK4829_SDA_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE11 = SDA */
+
+    /* BK4829 full init + frequency programming happens in
+     * radio_init() → vfo_init() during app_init phase.
+     * Removed from here to avoid double-init HardFault. */
+    dbg_puts("[DBG] bk4829 GPIO ready (init deferred to vfo_init)\n");
     IWDG_FEED();
 
     /* SI4732 broadcast receiver (GPIOB bit-bang I2C) ----------------- */
@@ -464,17 +800,45 @@ static void hw_init(void)
     dac_audio_init();
     IWDG_FEED();
 
-    /* Speaker audio path enable (must be before any tone playback) ---
-     * PE1 = SPK_MUTE: LOW = unmuted. OEM asserts HIGH at power-off.
-     * PC12 = BEEP_SW: HIGH = beep-to-speaker path enabled.
-     *   OEM evidence: gpio_bits_set(GPIOC, 0x1000) @ fw 0x080038EA */
+    /* Audio routing GPIO init (OEM gpio_modes_init @ 0x0801391C).
+     * OEM configures ALL audio path pins in gpio_modes_init:
+     *   PE7  (U3T_EN)  = GP push-pull output - ACTIVE LOW relay
+     *                     HIGH = RX/speaker (deasserted), LOW = TX/mic
+     *   PE9  (SW_TO_BT) = GP push-pull output, LOW → speaker (not BT)
+     *   PE1  (SPK_MUTE) = GP push-pull output, LOW → unmuted
+     *   PC12 (BEEP_SW)  = GP push-pull output, LOW at boot (enabled per-beep)
+     *   PB8  (AMP_EN)   = GP push-pull output, LOW at boot (enabled per-beep)
+     *
+     * OEM boot state: PB8=LOW, PC12=LOW - both enabled only during beep_play.
+     * PE7=HIGH (RX mode), PE9=LOW (speaker not BT), PE1=LOW (unmuted). */
     dbg_puts("[DBG] spk_unmute+beep_sw...\n");
+    /* PE7 = U3T_EN: HIGH = RX/speaker mode (relay deasserted, ACTIVE LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_7,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOE, GPIO_PIN_7);                /* RX audio mode */
+    /* PE9 = SW_TO_BT: LOW = speaker path (not Bluetooth) */
+    gpio_config_pin(GPIOE, GPIO_PIN_9,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOE, GPIO_PIN_9);              /* speaker mode */
+    /* PE1 = SPK_MUTE: LOW = unmuted */
     gpio_config_pin(SPK_MUTE_PORT, SPK_MUTE_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
     gpio_clear_pin(SPK_MUTE_PORT, SPK_MUTE_PIN);   /* unmute speaker */
-    gpio_config_pin(BEEP_SW_PORT, BEEP_SW_PIN,
+    /* PE4 = AMP_PWR: powers the audio amplifier rail (V12 discovery).
+     * Must be HIGH for any audio output. */
+    gpio_config_pin(GPIOE, GPIO_PIN_4,
                     GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(BEEP_SW_PORT, BEEP_SW_PIN);        /* enable beep path */
+    gpio_set_pin(GPIOE, GPIO_PIN_4);               /* amp power ON */
+    /* PB8 = AMP_EN: configured as PP output, LOW at boot (OEM default).
+     * audio_path_enable() sets HIGH before beep. */
+    gpio_config_pin(AMP_EN_PORT, AMP_EN_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(AMP_EN_PORT, AMP_EN_PIN);        /* amp OFF at boot */
+    /* PC12 = BEEP_SW: configured as PP output, HIGH at boot (radio path).
+     * audio_path_enable() sets LOW to route DAC to speaker. */
+    gpio_config_pin(BEEP_SW_PORT, BEEP_SW_PIN,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_set_pin(BEEP_SW_PORT, BEEP_SW_PIN);        /* radio path at boot */
     IWDG_FEED();
 
     /* LCD ------------------------------------------------------------ */
@@ -492,94 +856,7 @@ static void hw_init(void)
     lcd_fill_rect(0, 0, 240, 320, 0x001F);  /* RGB565 blue */
     IWDG_FEED();
 
-    /* -- Audio Amplifier Test -----------------------------------------
-     * OEM firmware analysis reveals PB8 is the audio amplifier enable:
-     *   - OEM function at 0x08006574 sets PB8 HIGH before beep
-     *   - Clears PB8 LOW after beep completes
-     *   - Full audio path: DAC -> PE1(unmute) -> PC12(beep_sw) -> PB8(amp)
-     * ------------------------------------------------------------------- */
-    dbg_puts("[AMP] === AUDIO AMP TEST ===\n");
-    {
-        /* Confirm audio path state */
-        dbg_puts("[AMP] PE1(SPK_MUTE)=");
-        dbg_puts((GPIOE->ODR & 0x0002) ? "MUTED!" : "unmuted");
-        dbg_puts(" PC12(BEEP_SW)=");
-        dbg_puts((GPIOC->ODR & 0x1000) ? "on" : "OFF!");
-        dbg_puts(" PB8=");
-        dbg_puts((GPIOB->ODR & 0x0100) ? "HIGH" : "LOW");
-        dbg_puts("\n");
-
-        /* Enable amp for all tests */
-        gpio_config_pin(GPIOB, GPIO_PIN_8, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-        gpio_set_pin(GPIOB, GPIO_PIN_8);
-
-        /* ---- Test A: DIRECT DAC write (no DMA, no TIM6) ----
-         * Write sine values directly to DAC data register in a
-         * software loop.  If this produces sound, PA4→amp→speaker works
-         * and the DMA path has a subtle problem.  If silent, the
-         * analog PCB trace from PA4 doesn't reach the amplifier. */
-        dbg_puts("[AMP] Test A: DIRECT DAC write (no DMA) 3s\n");
-        {
-            /* Stop any DMA/TIM6 that might be running */
-            *(volatile uint32_t *)0x40001000UL &= ~1UL; /* TIM6 CR1: CEN=0 */
-            *(volatile uint32_t *)0x40020430UL = 0;      /* DMA2_CH3 CCR=0 */
-
-            /* Enable DAC CH1 + CH2 (no trigger, no DMA) - software writes */
-            DAC->CR = DAC_CR_EN2 | DAC_CR_EN1 | DAC_CR_BOFF1;
-
-            /* 32-sample sine at ~1kHz: each sample held ~31µs
-             * 3 seconds ≈ 3000 cycles × 32 samples = 96000 writes */
-            static const uint16_t sw_sine[32] = {
-                2048,2448,2831,3185,3496,3750,3939,4056,
-                4095,4056,3939,3750,3496,3185,2831,2448,
-                2048,1648,1265, 911, 600, 346, 157,  40,
-                   1,  40, 157, 346, 600, 911,1265,1648
-            };
-            int cyc;
-            for (cyc = 0; cyc < 3000; cyc++) {
-                int s;
-                for (s = 0; s < 32; s++) {
-                    DAC->DHR12R1 = sw_sine[s];
-                    /* ~31µs busy wait (120MHz × 31µs ≈ 3720 cycles) */
-                    volatile int d;
-                    for (d = 0; d < 620; d++) ;
-                }
-                if ((cyc & 0xFF) == 0) IWDG_FEED();
-            }
-            dbg_reg("[AMP] DAC_DOR1=0x", DAC->DOR1);
-        }
-
-        /* ---- Test B: DMA-based tone (original test) ---- */
-        dbg_puts("[AMP] Test B: DMA tone 3s\n");
-        dac_audio_play_tone(10000);
-
-        /* Diagnostic: dump DAC/TIM6/DMA registers to verify playback */
-        dbg_reg("[AMP] DAC_CR =0x", *(volatile uint32_t *)0x40007400UL);
-        dbg_reg("[AMP] DAC_SR =0x", *(volatile uint32_t *)0x40007434UL);
-        dbg_reg("[AMP] DAC_DOR1=0x", *(volatile uint32_t *)0x4000742CUL);
-        dbg_reg("[AMP] DMA2C3_CCR=0x",
-                *(volatile uint32_t *)0x40020430UL);
-        dbg_reg("[AMP] DMA2C3_CMAR=0x",
-                *(volatile uint32_t *)0x40020438UL);
-        dbg_reg("[AMP] DMA2C3_CPAR=0x",
-                *(volatile uint32_t *)0x4002043CUL);
-
-        { int i; for (i = 0; i < 6; i++) { delay_ms(500); IWDG_FEED(); } }
-
-        /* ---- Test C: Try with BOFF1=0 (output buffer enabled) ---- */
-        dbg_puts("[AMP] Test C: DAC buffer ON + DMA 3s\n");
-        dac_audio_stop();
-        /* Re-enable with output buffer (BOFF1=0) for lower impedance */
-        DAC->CR = DAC_CR_EN2 | DAC_CR_EN1 | DAC_CR_TEN1 | DAC_CR_TSEL1_TIM6;
-        dac_audio_play_tone(10000);
-        /* Now set DMAEN1 */
-        DAC->CR |= DAC_CR_DMAEN1;
-        { int i; for (i = 0; i < 6; i++) { delay_ms(500); IWDG_FEED(); } }
-
-        dac_audio_stop();
-        gpio_clear_pin(GPIOB, GPIO_PIN_8);
-        dbg_puts("[AMP] === TEST COMPLETE ===\n");
-    }
+    /* -- Audio diagnostic SKIPPED (moved to post-init beep test) -- */
 
 
     /* Configure PTT and side-button inputs with internal pull-ups.
@@ -597,6 +874,29 @@ static void hw_init(void)
     gpio_config_pin(GPIOA, GPIO_PIN_12, GPIO_MODE_INPUT, GPIO_CNF_PULL);
     gpio_set_pin(GPIOA, GPIO_PIN_12);   /* PA12 pull-UP (BotProg, active LOW) */
     dbg_puts("[DBG] PTT+direct inputs configured\n");
+
+    /* OEM gpio_modes_init @ 0x0801391C configures additional pins that
+     * we previously omitted. These match OEM boot state per assembly. */
+    gpio_config_pin(GPIOA, GPIO_PIN_2,  GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
+                                        /* PA2: ADC RSSI input (CH2) */
+    gpio_config_pin(GPIOA, GPIO_PIN_3,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOA, GPIO_PIN_3);  /* PA3: BT UART OUT, idle LOW */
+    gpio_config_pin(GPIOA, GPIO_PIN_7,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOA, GPIO_PIN_7);  /* PA7: RF scan latch, idle LOW */
+    gpio_config_pin(GPIOA, GPIO_PIN_11, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOA, GPIO_PIN_11);   /* PA11: power-off control, idle HIGH */
+    gpio_config_pin(GPIOA, GPIO_PIN_15, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOA, GPIO_PIN_15);   /* PA15: replay control, idle HIGH */
+    gpio_config_pin(GPIOB, GPIO_PIN_2,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOB, GPIO_PIN_2);  /* PB2: BOOT1 pin, force LOW */
+    gpio_config_pin(GPIOC, GPIO_PIN_5,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOC, GPIO_PIN_5);  /* PC5: RF scan enable, idle LOW */
+    gpio_config_pin(GPIOC, GPIO_PIN_9,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOC, GPIO_PIN_9);  /* PC9: sideport control, idle LOW */
+    /* PE6 = external PTT input (OEM: input with pull-up) */
+    gpio_config_pin(GPIOE, GPIO_PIN_6,  GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_6);    /* PE6 pull-UP (EXT_PTT, active LOW) */
+    dbg_puts("[DBG] OEM-matching GPIO pins configured\n");
 
 
     /* Boot indicator: 3 backlight blinks + beep tone.
@@ -647,9 +947,8 @@ static void app_init(void)
     IWDG_FEED();
 
     /* Radio subsystems (software init only - RF hardware skipped) ------ */
-    dbg_puts("[DBG] vfo+radio_init...\n");
-    vfo_init();
-    radio_init();
+    dbg_puts("[DBG] radio_init...\n");
+    radio_init();   /* radio_init → vfo_init internally */
     IWDG_FEED();
     dbg_puts("[DBG] vox+scanner+dtmf...\n");
     vox_init();

@@ -161,6 +161,12 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "  CC    $<"
 	@$(CC) $(CFLAGS) -c -o $@ $<
 
+# Per-file overrides: disable tail-call optimization for modules with
+# flash read chains that are sensitive to GCC sibling-call transforms.
+$(BUILD_DIR)/drivers/spi.o: CFLAGS += -fno-optimize-sibling-calls
+$(BUILD_DIR)/drivers/flash_wearleveling.o: CFLAGS += -fno-optimize-sibling-calls
+$(BUILD_DIR)/app/vfo.o: CFLAGS += -fno-optimize-sibling-calls
+
 # Print size summary
 size: $(ELF)
 	@echo ""

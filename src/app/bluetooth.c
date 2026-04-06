@@ -231,12 +231,13 @@ void bt_init(void)
     uart_bt_init();
 
     /*
-     * PE9 (SW_TO_BT) - Bluetooth module power/audio switch.
-     * Low confidence pin assignment, but OEM appears to assert this
-     * during BT initialization. Drive high to enable BT module.
+     * PE9 (SW_TO_BT) - Audio routing switch: LOW = speaker, HIGH = BT.
+     * OEM gpio_modes_init configures PE9 as output LOW (speaker mode).
+     * Only set HIGH when BT audio streaming is active.
+     * DO NOT set HIGH during init - it routes audio away from speaker!
      */
-    gpio_config_pin(GPIOE, 9, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    GPIOE->SCR = (1U << 9);   /* PE9 high = BT module enabled */
+    gpio_config_pin(GPIOE, 9, GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOE, GPIO_PIN_9);  /* PE9 LOW = speaker audio path */
     delay_ms(100);             /* BT module power-up settle */
 
     state = BT_STATE_IDLE;
@@ -253,6 +254,7 @@ void bt_init(void)
         dbg_puts("[DBG]   bt: tick delta=");
         dbg_hex32(t1 - t0);
         dbg_newline();
+        (void)t0; (void)t1;
     }
 
     /* Brief AT probe - if module responds, configure defaults */

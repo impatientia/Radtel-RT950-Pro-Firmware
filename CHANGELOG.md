@@ -2,6 +2,27 @@
 
 All notable changes to the RT-950 Pro custom firmware are documented here.
 
+## [0.0.3] - 2026-04-06
+
+First working speaker output, audio architecture hardware-verified.
+
+### Audio
+- DAC tones confirmed through speaker (V12 diagnostic: 6/6 tests pass)
+- PE4 = amp power rail, PB8 = amp enable, PE1 = mute, PC12 = audio mux
+- BK4829 R47/R48 must be zeroed before DAC playback (AF bus loading)
+- Amp power-cycle sequence required for reliable cold-start audio
+- PC12 polarity discrepancy: OEM SETs HIGH for beep, custom FW needs LOW
+
+### Bootloader
+- Decryption algorithm verified correct (encrypt_btf.py confirmed)
+- UART update protocol fully decoded; bootloader assembly annotated
+
+### Bug Fixes
+- PE4 was cleared "for safety" - actually cuts amplifier power
+- gpio.h comments had swapped OEM addresses/offsets (code was correct)
+- HardFault workaround: debug builds skip SPI flash in vfo_load_state
+- Assembly fix: 0x080038EA mislabeled PC10, corrected to PC12
+
 ## [0.0.2] - 2026-04-04
 
 Hardware validation release. All keypad/encoder/PTT inputs confirmed working

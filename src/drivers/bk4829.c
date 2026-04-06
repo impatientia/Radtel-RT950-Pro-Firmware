@@ -33,13 +33,21 @@
 
 static void bb_delay(void)
 {
-    /* ~250 ns at 120 MHz - matches OEM timing @ 0x0800A962.
-     * OEM uses a tight register-load loop giving ~250-300 ns per edge.
-     * 24 NOPs × 8.33 ns = 200 ns + pipeline/branch overhead ≈ 250 ns.
-     * BK4829 minimum SPI clock half-period = 200 ns per datasheet. */
-    __asm volatile ("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
-                    "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
-                    "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+    /*
+     * OEM delay_short(5) @ 0x0800A962:
+     *   rsb r0, r0, r0, lsl #5   ; r0 = 5*31 = 155
+     *   loop: subs r0,#1 / uxth r0 / bcs loop
+     *   155 iterations × 4 cycles = 620 cycles ≈ 5.17 µs at 120 MHz.
+     *
+     * Our original 24 NOPs ≈ 200 ns was 26× too fast for the BK4829.
+     * Match OEM timing exactly to ensure reliable SPI communication.
+     */
+    __asm volatile (
+        "movw r0, #155\n"
+        "1: subs r0, r0, #1\n"
+        "   bne 1b\n"
+        ::: "r0", "cc"
+    );
 }
 
 /*
@@ -51,6 +59,10 @@ static void bb_delay(void)
  */
 static void pll_settle_delay(void)
 {
+    /*
+     * OEM: delay(0x32) = delay(50) @ 0x0800A962.
+     * Computes 50*31 = 1550 iterations, 4 cycles each = 6200 cycles ≈ 52 µs.
+     */
     __asm volatile (
         "movw r0, #1550\n"
         "1: subs r0, r0, #1\n"
@@ -142,7 +154,13 @@ static uint16_t bb_shift_in(uint8_t nbits)
 
 void bk4829_write_reg(uint8_t chip, uint8_t reg, uint16_t val)
 {
-    uint8_t cmd = 0x80 | (reg & 0x7F);   /* MSB=1 for write */
+    if (chip > BK4829_CHIP1) return;      /* bounds check */
+    /*
+     * BK4829 3-wire SPI: bit 7 = 0 for WRITE, bit 7 = 1 for READ
+     * (opposite of BK4819! confirmed by OEM ORR #0x80 in read function
+     *  and by 0xFFFF readback when we tried bit7=0 for reads)
+     */
+    uint8_t cmd = reg & 0x7F;            /* bit 7 = 0 for WRITE */
 
     bb_cs_low(chip);
     bb_shift_out((uint32_t)cmd << 16 | val, 24);
@@ -151,7 +169,8 @@ void bk4829_write_reg(uint8_t chip, uint8_t reg, uint16_t val)
 
 uint16_t bk4829_read_reg(uint8_t chip, uint8_t reg)
 {
-    uint8_t cmd = 0x80 | (reg & 0x7F);   /* MSB=1 same as write; V0.27 @ 0x0801BFD2 */
+    if (chip > BK4829_CHIP1) return 0;    /* bounds check */
+    uint8_t cmd = 0x80 | (reg & 0x7F);   /* bit 7 = 1 for READ */
     uint16_t val;
 
     bb_cs_low(chip);
@@ -256,6 +275,16 @@ void bk4829_init(uint8_t chip)
     for (i = 0; i < sizeof(init_phase5) / sizeof(init_phase5[0]); i++) {
         bk4829_write_reg(chip, init_phase5[i].reg, init_phase5[i].value);
     }
+
+    /* Phase 6: AF path configuration (OEM tail-call @ 0x0800731C with mode=0)
+     *
+     * The OEM bk4829_hal_init ends with a tail-call to 0x0801BC2C(mode=0)
+     * which writes REG 0x47 (AF source/gain) and REG 0x48 (AF output gain).
+     * Without this, the BK4829 speaker path is misconfigured.
+     *
+     * Mode 0 LUT: REG_47 = 0x6042 | 0xDB27 = 0xFB67
+     * REG_48: OEM uses calibration-based value; init table already set 0xB3FF */
+    bk4829_write_reg(chip, 0x47, 0xFB67);
 }
 
 /* ========================================================================
@@ -333,6 +362,57 @@ void bk4829_enable_tx(uint8_t chip)
 void bk4829_standby(uint8_t chip)
 {
     bk4829_write_reg(chip, 0x30, 0x0000);
+}
+
+/* ========================================================================
+ *  bk4829_audio_filter_config - Configure audio processing registers
+ *
+ *  OEM audio_route_setup @ 0x080067A4 calls bk4829_audio_filter_config
+ *  @ 0x0801B4D0 before every beep/audio playback.  These registers
+ *  configure the internal AF path (filters, IF sync, AGC) needed for
+ *  audio to pass through the chip to AF_OUT.
+ *
+ *  Without these writes, the BK4829 AF processing chain is unconfigured
+ *  and audio from the DAC (routed through BEEP_SW/PC12 to the chip's
+ *  analog input) will NOT reach AF_OUT → amplifier → speaker.
+ * ======================================================================== */
+
+void bk4829_audio_filter_config(uint8_t chip)
+{
+    bk4829_write_reg(chip, 0x58, 0x3FC3);  /* Audio filter 1 */
+    bk4829_write_reg(chip, 0x72, 0x3065);  /* Audio deviation */
+    bk4829_write_reg(chip, 0x70, 0x00EC);  /* Audio processing */
+    bk4829_write_reg(chip, 0x5D, 0x1B00);  /* AGC config */
+    bk4829_write_reg(chip, 0x59, 0x6028);  /* IF sync (request) */
+    bk4829_write_reg(chip, 0x59, 0x3028);  /* IF sync (clear) */
+    bk4829_write_reg(chip, 0x5A, 0xFB72);  /* Filter aux 1 */
+    bk4829_write_reg(chip, 0x5B, 0x4099);  /* Filter aux 2 */
+    bk4829_write_reg(chip, 0x5C, 0xA730);  /* Filter aux 3 */
+    bk4829_write_reg(chip, 0x3F, 0x3000);  /* Band/BW control */
+}
+
+/* ========================================================================
+ *  bk4829_set_af_beep / bk4829_set_af_rx - AF path switching
+ *
+ *  OEM @ 0x0801BC2C: REG_47 + REG_48 setter, mode-indexed LUT.
+ *
+ *  For BEEP mode (mode=3): REG_47=0xEB4F, REG_48=0xB0A3
+ *    Routes MCU DAC (PA4) → BK4829 speaker driver via analog input
+ *
+ *  For FM RX mode (mode=0): REG_47=0xFB67, REG_48=cal-based
+ *    Routes demodulated RF → BK4829 speaker driver
+ * ======================================================================== */
+
+void bk4829_set_af_beep(uint8_t chip)
+{
+    bk4829_write_reg(chip, 0x47, 0xEB4F);
+    bk4829_write_reg(chip, 0x48, 0xB0A3);
+}
+
+void bk4829_set_af_rx(uint8_t chip)
+{
+    bk4829_write_reg(chip, 0x47, 0xFB67);
+    bk4829_write_reg(chip, 0x48, 0xB3FF);
 }
 
 /* ========================================================================

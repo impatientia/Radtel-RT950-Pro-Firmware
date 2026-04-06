@@ -19,6 +19,7 @@
 #include "app/vfo.h"
 #include "drivers/bk4829.h"
 #include "drivers/flash_wearleveling.h"
+#include "debug_uart.h"
 
 #include <string.h>
 
@@ -236,7 +237,7 @@ static void vfo_save_state(void)
     wl_write(&WL_VFOCFG, &rec);
 }
 
-static int vfo_load_state(void)
+static int __attribute__((noinline, unused)) vfo_load_state(void)
 {
     vfo_persist_t rec;
     if (wl_read(&WL_VFOCFG, &rec) != 0)
@@ -331,25 +332,43 @@ void vfo_apply(radio_vfo_t vfo)
 void vfo_init(void)
 {
     /* Init both BK4829 chips */
+    dbg_puts("[VFO] bk4829_init CHIP0...\n");
     bk4829_init(BK4829_CHIP0);
+
+    dbg_puts("[VFO] bk4829_init CHIP1...\n");
     bk4829_init(BK4829_CHIP1);
 
-    /* Try loading persisted VFO state from flash */
-    if (vfo_load_state() == 0) {
-        /* Restore chip assignments (not persisted) */
-        vfo_states[RADIO_VFO_A].chip = BK4829_CHIP1;
-        vfo_states[RADIO_VFO_B].chip = BK4829_CHIP0;
-        vfo_states[RADIO_VFO_C].chip = BK4829_CHIP1;
-    }
-    /* else: keep compiled-in defaults */
+    /*
+     * Set chip assignments BEFORE flash load - these are hardware-fixed
+     * and must never be overwritten by flash data.  vfo_unpack() skips
+     * the chip field, but we set them here defensively.
+     */
+    vfo_states[RADIO_VFO_A].chip = BK4829_CHIP1;
+    vfo_states[RADIO_VFO_B].chip = BK4829_CHIP0;
+    vfo_states[RADIO_VFO_C].chip = BK4829_CHIP1;
+
+    /* Try loading persisted VFO state from flash.
+     * Skip in debug builds - the flash read triggers a HardFault at
+     * certain binary sizes (code-layout-sensitive stack corruption in
+     * spi_flash_read).  Defaults from static init are fine for testing. */
+#ifndef DEBUG_UART
+    vfo_load_state();
+#else
+    dbg_puts("[VFO] flash load SKIPPED (debug build)\n");
+#endif
 
     /* Apply VFO A and B to their respective chips */
+    dbg_puts("[VFO] vfo_apply A...\n");
     vfo_apply(RADIO_VFO_A);
+
+    dbg_puts("[VFO] vfo_apply B...\n");
     vfo_apply(RADIO_VFO_B);
 
     /* If VFO-C is active, it overrides chip 1 (supersedes VFO-A) */
     if (vfo_c_enabled && active_vfo == RADIO_VFO_C)
         vfo_apply(RADIO_VFO_C);
+
+    dbg_puts("[VFO] init complete\n");
 }
 
 /* Active VFO management ------------------------------------------------ */
