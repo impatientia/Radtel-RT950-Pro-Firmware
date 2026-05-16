@@ -1,6 +1,6 @@
 # RT-950 Pro Custom Firmware
 
-Open-source bare-metal firmware for the **Radtel RT-950 Pro** handheld radio.
+An experimental fork of the Open-source bare-metal firmware for the **Radtel RT-950 Pro** handheld radio.
 
 **Target**: Artery AT32F403A (ARM Cortex-M4F @ 120 MHz, 1 MB flash, 96 KB SRAM)
 
