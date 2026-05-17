@@ -18,7 +18,9 @@
 
 void dbg_init(void);
 void dbg_puts(const char *s);
+void dbg_putc(char c);
 void dbg_hex8(unsigned char v);
+void dbg_hex16(unsigned int v);
 void dbg_hex32(unsigned long v);
 void dbg_newline(void);
 

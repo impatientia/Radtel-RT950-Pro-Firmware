@@ -12,7 +12,7 @@
 #include "rt950_pinmap.h"
 
 /* Polled TX: spin until transmit buffer empty, then write */
-static void dbg_putc(char c)
+void dbg_putc(char c)
 {
     while (!(UART4->SR & USART_SR_TXE))
         ;
@@ -72,6 +72,12 @@ void dbg_hex8(unsigned char v)
     unsigned char lo = v & 0xF;
     dbg_putc(hi < 10 ? '0' + hi : 'A' - 10 + hi);
     dbg_putc(lo < 10 ? '0' + lo : 'A' - 10 + lo);
+}
+
+void dbg_hex16(unsigned int v)
+{
+    dbg_hex8((unsigned char)(v >> 8));
+    dbg_hex8((unsigned char)(v));
 }
 
 void dbg_hex32(unsigned long v)
