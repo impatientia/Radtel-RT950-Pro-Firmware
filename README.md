@@ -1,6 +1,10 @@
 # RT-950 Pro Custom Firmware
-
-An experimental fork of the Open-source bare-metal firmware for the **Radtel RT-950 Pro** handheld radio.
+## Why this fork?
+This is an experimental fork of the Open-source bare-metal firmware for the **Radtel RT-950 Pro** handheld radio.  
+- very new to this hardware and project (consider yourself warned), so this is a sandbox while I try to figure out what is wrong with my hardware that it won't run the main fork.
+- hardware tests output is optionally mirrored on the serial port (DEBUG=1)
+- working: flash, init, GPS data read, one key (literally the 1), serial port, screen
+- not correct: keypad, side keys, tuners, audio
 
 **Target**: Artery AT32F403A (ARM Cortex-M4F @ 120 MHz, 1 MB flash, 96 KB SRAM)
 
