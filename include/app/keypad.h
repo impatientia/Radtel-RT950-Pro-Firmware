@@ -46,6 +46,7 @@
  * GPIO (PE3) monitored by task_buttons(). These defines allow app code
  * to reference side button functions by their original names. */
 #define KEY_PTT         0xE3    /* PE3 PTT - standalone GPIO, not matrix */
+#define KEY_PTT2	0xE4	// also a direct read, added to have a return code
 #define KEY_SIDE2       KEY_C4R2  /* legacy alias for matrix col4 row2 */
 #define KEY_SIDE3       KEY_C4R3  /* legacy alias for matrix col4 row3 */
 
@@ -77,7 +78,15 @@ void keypad_init(void);
  * Returns KEY_* code (0-21) or KEY_NONE (0xFF) if no key pressed.
  * OEM reference: gpio_output_control @ 0x08012FF8.
  */
+
 uint8_t keypad_scan(void);
+
+
+/* perform a single scan of the ptt buttons
+ * Returns KEY_PTT, KEY_PTT2 or KEY_NONE
+ */
+uint8_t ptt_scan(void);
+
 
 /*
  * Debounced key event detector.
@@ -86,5 +95,6 @@ uint8_t keypad_scan(void);
  * Returns 1 if an event is available, 0 otherwise.
  */
 uint8_t keypad_get_event(key_event_t *evt);
+uint8_t ptt_get_event(key_event_t *evt); //same as previous, but intended for ptt keys
 
 #endif /* APP_KEYPAD_H */

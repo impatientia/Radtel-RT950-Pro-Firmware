@@ -42,6 +42,13 @@ extern uint32_t get_tick(void);
 
 /* Debug output helpers ------------------------------------------------ */
 
+static void hw_dbg_putc(char c){
+#ifdef DEBUG_UART
+    dbg_putc(c);
+#endif
+    uart_send_byte(USART1, c);
+}
+
 static void hw_dbg_puts(const char *s)
 {
 #ifdef DEBUG_UART
@@ -94,10 +101,13 @@ static void hw_dbg_dec(uint32_t v)
     char buf[12];
     int i = 0;
     if (v == 0) {
+	hw_dbg_putc('0');
+	/*
         uart_send_byte(USART1, '0');
 #ifdef DEBUG_UART
     	dbg_putc('0');
 #endif
+*/
         return;
     }
     while (v > 0) {
@@ -105,15 +115,19 @@ static void hw_dbg_dec(uint32_t v)
         v /= 10;
     }
     while (i > 0){
+	    hw_dbg_putc((uint8_t)buf[--i]);
+	    /*
         uart_send_byte(USART1, (uint8_t)buf[--i]);
 #ifdef DEBUG_UART
     	dbg_putc(buf[i]);
 #endif
+*/
     }
 }
 
 /* ==========================================================================
  *  TEST 1: Blinky - Toggle LCD backlight at 1 Hz
+ *  	    Alternate LED red and green
  *  Confirms: GPIO output, clock init, SysTick
  * ========================================================================== */
 
@@ -128,12 +142,24 @@ void test_blinky(void)
     uint32_t count = 0;
     while (1) {
         gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
+	if (count & 0x01)
+        	gpio_set_pin(LED_RED_PORT, LED_RED_PIN);
+	else
+        	gpio_set_pin(LED_GREEN_PORT, LED_GREEN_PIN);
+
         hw_dbg_puts("ON  #");
-        hw_dbg_dec(count++);
+        hw_dbg_dec(count);
+	hw_dbg_puts((count&0x01) == 1 ? " Red":" Green");
+
         hw_dbg_newline();
         delay_ms(500);
 
         gpio_clear_pin(LCD_BL_PORT, LCD_BL_PIN);
+	if (count & 0x01)
+		gpio_clear_pin(LED_RED_PORT, LED_RED_PIN);
+	else
+        	gpio_clear_pin(LED_GREEN_PORT, LED_GREEN_PIN);
+
         hw_dbg_puts("OFF #");
         hw_dbg_dec(count++);
         hw_dbg_newline();
@@ -157,18 +183,24 @@ void test_uart_echo(void)
         /* Echo BT input */
         if (uart_bt_rx_available()) {
             uint8_t c = uart_bt_rx_read();
+	    hw_dbg_putc(c);
+	    /*
             uart_send_byte(USART1, c);
 #ifdef DEBUG_UART
 	    dbg_putc((unsigned char) c);
 #endif
+*/
         }
         /* Forward GPS to BT */
         if (gps_rx_available()) {
             uint8_t c = gps_rx_read();
+	    hw_dbg_putc(c);
+	    /*
             uart_send_byte(USART1, c);
 #ifdef DEBUG_UART
 	    dbg_putc((unsigned char) c);
 #endif
+*/
         }
     }
 }
@@ -437,6 +469,7 @@ void test_dac_tone(void)
 
 void test_keypad_encoder(void)
 {
+    char cPower = !gpio_read_pin (PWR_SWITCH_PORT, PWR_SWITCH_PIN); //force initialization 
     uart_bt_init();
     hw_dbg_println("=== TEST 9: Keypad + Encoder ===");
     hw_dbg_println("Press keys or turn encoder. Output on USART1.");
@@ -444,25 +477,48 @@ void test_keypad_encoder(void)
     keypad_init();
     encoder_init();
 
+    //works with pattern 4
     static const char * const key_names[] = {
-        "1", "2", "3", "A/VFO",
-        "4", "5", "6", "B/SCAN",
-        "7", "8", "9", "C/MENU",
-        "*", "0", "#", "D/BAND",
-        "PTT", "SIDE1", "SIDE2", "SIDE3"
+        "OK", "ABC", "RET", "V/M",	//0x10-0x13 //moved side 1 and 4 out
+        "3", "6", "9", "#", 	//4-7
+        "2", "5", "8", "0",	//8-0x0B
+        "UP", "DN", "<L", "R>",	//0x0C-0x0F
+        "1", "4", "7", "*", 	//0-3
+	"SIDE1", "SIDE4"		//0x14-0x15
     };
 
     while (1) {
         /* Keypad events */
         key_event_t evt;
-        if (keypad_get_event(&evt)) {
+	uint8_t bKeyEvent = 0;
+
+	if (ptt_get_event(&evt))
+		bKeyEvent=1;
+	else 
+		bKeyEvent = keypad_get_event(&evt);
+		
+        if (bKeyEvent) {
             hw_dbg_puts("KEY: ");
-            if (evt.key < 20)
+            hw_dbg_puts("0x");
+            hw_dbg_hex8(evt.key);
+            if (evt.key < 22){
+            	hw_dbg_puts(" : ");
                 hw_dbg_puts(key_names[evt.key]);
+	    } else 
+		    switch (evt.key){
+			    case KEY_PTT: 
+            				hw_dbg_puts(" : PTT");
+					break;
+			    case KEY_PTT2: 
+            				hw_dbg_puts(" : PTT2");
+					break;
+		    }
+	    /*
             else {
                 hw_dbg_puts("0x");
                 hw_dbg_hex8(evt.key);
             }
+	    */
             switch (evt.type) {
             case KEY_EVT_PRESS:   hw_dbg_puts(" PRESS");   break;
             case KEY_EVT_REPEAT:  hw_dbg_puts(" REPEAT");  break;
@@ -479,6 +535,74 @@ void test_keypad_encoder(void)
         } else if (enc < 0) {
             hw_dbg_println("ENC: CCW (-1)");
         }
+
+	if (uart_cps_rx_available()){
+		dbg_putc(uart_cps_rx_read());
+		dbg_putc('.');
+	}
+
+
+	//working
+	/*
+	 //moved to scan as a key
+	if (gpio_read_pin (PTT_PORT,PTT_PIN )==0) //side key 1
+	       hw_dbg_putc('T'); 	 //Ptt (1)
+	if (gpio_read_pin (PTT2_PORT,PTT2_PIN )==0) //side key 2
+	       hw_dbg_putc('t'); 	 //ptt (2)
+	*/
+					 
+	//handled in keypad matrix
+	/*
+	if (gpio_read_pin (SIDE_KEY1_PORT,SIDE_KEY1_PIN )==0) //side key 3
+	       dbg_putc('U'); //TOP_PROG_PORT 	
+	if (gpio_read_pin (SIDE_KEY4_PORT,SIDE_KEY4_PIN )==0) //side key 3
+	       dbg_putc('u'); //BOT_PROG_PORT 	
+        */
+        
+
+	/* //never toggles
+	if (gpio_read_pin (POWER_OFF_PORT,POWER_OFF_PIN )==0) //???
+	       dbg_putc('+'); //BOT_PROG_PORT 	
+	if (gpio_read_pin (GPIO_PC9_PORT,GPIO_PC9_PIN )==1) //always high???
+	       dbg_putc('+'); //
+	if (gpio_read_pin (SIDEPORT_RX_PORT,SIDEPORT_RX_PIN )==0) //???
+	       dbg_putc('+'); //
+	if (gpio_read_pin (SINGLE_IN_PORT,SINGLE_IN_PIN )==1) //???
+	       dbg_putc('+'); //
+        */
+
+	if (gpio_read_pin (EXT_PTT_PORT, EXT_PTT_PIN)==0){ //external mic key
+        	gpio_set_pin(LED_RED_PORT, LED_RED_PIN);
+		gpio_clear_pin(LED_GREEN_PORT, LED_GREEN_PIN);
+	        hw_dbg_putc('M'); 
+		}
+	else {
+        	gpio_clear_pin(LED_RED_PORT, LED_RED_PIN);
+		
+		// power switch on vol knob
+		// nested so that red can dominate over green
+		if (gpio_read_pin (PWR_SWITCH_PORT, PWR_SWITCH_PIN)!=cPower) {
+			cPower = gpio_read_pin (PWR_SWITCH_PORT, PWR_SWITCH_PIN);
+			if (cPower ==0) {
+				gpio_set_pin(LED_GREEN_PORT, LED_GREEN_PIN);
+				hw_dbg_puts("Power ON\n");
+			}
+				else
+					hw_dbg_puts("Power OFF\n");
+		}
+
+	}
+
+	//not working
+	if (gpio_read_pin (POWER_OFF_PORT, POWER_OFF_PIN)==0)
+	       hw_dbg_putc('*'); 	
+	//test
+	if (gpio_read_pin (GPIO_PB9_PWREN_PORT,GPIO_PB9_PWREN_PIN)==1)
+	       hw_dbg_putc('.'); 	
+	/*
+	if (gpio_read_pin (, )==0)
+	       hw_dbg_putc('.'); 	
+	       */
 
         delay_ms(5);  /* ~200 Hz poll rate */
     }
@@ -503,7 +627,8 @@ void test_gps_display(void)
         /* Forward raw NMEA bytes to debug port */
         if (gps_rx_available()) {
             uint8_t c = gps_rx_read();
-            uart_send_byte(USART1, c);
+	    hw_dbg_putc(c);
+            //uart_send_byte(USART1, c);
         }
 
         /* Periodic parsed data dump */

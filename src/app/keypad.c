@@ -21,6 +21,10 @@
 #include "drivers/gpio.h"
 #include "rt950_pinmap.h"
 
+#ifdef DEBUG_UART
+#include "debug_uart.h" 
+#endif
+
 /* ---- Column pin lookup tables ----------------------------------------- */
 
 /* Pin to drive LOW for each column scan iteration.
@@ -30,8 +34,8 @@ static const uint16_t col_clear[] = {
     GPIO_PIN_1,                         /* col 1 */
     GPIO_PIN_2,                         /* col 2 */
     GPIO_PIN_3,                         /* col 3 */
-    GPIO_PIN_0 | GPIO_PIN_1 |           /* col 4 - all low */
-        GPIO_PIN_2 | GPIO_PIN_3
+    //GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3  /* col 4 - all low */
+    0                                        /* col 4 - none low */
 };
 
 /* Pins to drive HIGH for each column (complement within PC0-PC3).
@@ -41,7 +45,8 @@ static const uint16_t col_set[] = {
     GPIO_PIN_0 | GPIO_PIN_2 | GPIO_PIN_3,   /* col 1 */
     GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_3,   /* col 2 */
     GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2,   /* col 3 */
-    0                                        /* col 4 - none high */
+    //0                                        /* col 4 - none high */
+    GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3  /* col 4 - all high */
 };
 
 /* Row patterns read from GPIOD IDR bits 4-7 (active-low, masked 0xF0).
@@ -57,7 +62,11 @@ static const uint16_t col_set[] = {
  * OEM: delay_short(10) @ 0x08013020, 0x08013056. */
 static void scan_delay(void)
 {
-    volatile uint32_t n = 10;
+    volatile uint32_t n = 50; //was 10, (only 147* work) 
+			      //experiment 
+			      //ok: 50, 37, 
+			      //fail: 25,31, 34 (only 147*80 work, others unresponsive)  
+			      //	35 seems to be on the edge, go back to 50
     while (n--)
         ;
 }
@@ -116,6 +125,23 @@ void keypad_init(void)
     gpio_set_pin(KBD_COL_PORT, KBD_COL_MASK);
 }
 
+uint8_t ptt_scan(void)
+{
+	/*
+	 * assume these are not in the regular scan so that the other keys can be used
+	 * in conjunction with either PTT.
+	 */
+    if (!gpio_read_pin(PTT_PORT,PTT_PIN))
+        return KEY_PTT;
+
+    if (!gpio_read_pin(PTT2_PORT,PTT2_PIN))
+        return KEY_PTT2;
+
+    return KEY_NONE;
+}
+
+static uint8_t scan_pattern = 0;
+
 uint8_t keypad_scan(void)
 {
     /* --- Side button fast-path (OEM @ 0x08012FFE-0x08013012) ---
@@ -141,7 +167,21 @@ uint8_t keypad_scan(void)
     }
 
     /* Scan each of 5 columns (OEM loop: r4=0..4 @ 0x08013040-0x0801307A) */
-    for (uint8_t col = 0; col < 5; col++) {
+    for (uint8_t i = 0; i < 5; i++) {
+
+	/* In theory, scan pattern shouldn't matter.  In reality, several patterns
+	 * have one column appear as another.  Not sure why or which bitis missing.
+	 * Discovered that this pattern works through trial and error.  The retention
+	 * of the original is for amusement.  Change pattern by redefining scan_pattern,
+	 * see above.
+	 */
+	static const uint8_t scan2ord[][5]={
+				{4,0,1,2,3}, // Works
+				{0,1,2,3,4}, //Original
+				} ; 
+
+	uint8_t col=scan2ord[scan_pattern][i];
+
         /* Drive the selected column low, others high.
          * OEM: ldrh col_set[col], gpio_bits_set; ldrh col_clear[col], gpio_bits_reset */
         if (col_set[col])
@@ -235,5 +275,95 @@ uint8_t keypad_get_event(key_event_t *evt)
     }
 
     db_count = 0;
+    return 0;
+}
+
+/* ---- Debounced ptt-event state machine --------------------------------- */
+
+static uint8_t  prev_ptt_key   = KEY_NONE;  /* last accepted key */
+static uint8_t  db_ptt_count   = 0;         /* debounce counter */
+static uint16_t hold_ptt_count = 0;         /* repeat timer */
+
+uint8_t ptt_get_event(key_event_t *evt)
+{
+    uint8_t raw = ptt_scan();
+    evt->type = KEY_EVT_NONE;
+    evt->key  = KEY_NONE;
+
+    if (raw != KEY_NONE && raw == prev_ptt_key) {
+        /* Same key still held - handle repeat */
+        hold_ptt_count++;
+        if (hold_ptt_count == KEY_REPEAT_DELAY) {
+            evt->type = KEY_EVT_REPEAT;
+            evt->key  = prev_ptt_key;
+            return 1;
+        }
+        if (hold_ptt_count > KEY_REPEAT_DELAY &&
+            ((hold_ptt_count - KEY_REPEAT_DELAY) % KEY_REPEAT_RATE) == 0) {
+            evt->type = KEY_EVT_REPEAT;
+            evt->key  = prev_ptt_key;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (raw != KEY_NONE && raw != prev_ptt_key) {
+        /* New key candidate - debounce */
+        db_ptt_count++;
+        if (db_ptt_count >= KEY_DEBOUNCE_COUNT) {
+            /* Generate release for previous key if one was held */
+            if (prev_ptt_key != KEY_NONE) {
+                evt->type = KEY_EVT_RELEASE;
+                evt->key  = prev_ptt_key;
+                prev_ptt_key  = raw;
+                db_ptt_count  = 0;
+                hold_ptt_count = 0;
+                return 1;
+            }
+            /* Accept new press */
+            prev_ptt_key   = raw;
+            db_ptt_count   = 0;
+            hold_ptt_count = 0;
+            evt->type  = KEY_EVT_PRESS;
+            evt->key   = raw;
+	    /*
+	     // complete hack code.  When defining multiple key scan patterns,
+	     // allows the use of the PTT and PTT2 keys to switch scan patterns
+	     // has no limits protection.. use with extreme caution
+	     // TODO: take this out when the mystery for why the scan pattern 
+	     // matters at all is resolved. 
+		switch (evt->key){
+			case KEY_PTT: 
+				dbg_puts ("increase");
+				dbg_hex8(++scan_pattern); 
+				dbg_puts ("\n");
+				break;
+			case KEY_PTT2: 
+				dbg_puts ("decrease");
+				dbg_hex8(--scan_pattern); 
+				dbg_puts ("\n");
+				break;
+			}
+		*/
+            return 1;
+        }
+        return 0;
+    }
+
+    /* raw == KEY_NONE */
+    if (prev_ptt_key != KEY_NONE) {
+        db_ptt_count++;
+        if (db_ptt_count >= KEY_DEBOUNCE_COUNT) {
+            evt->type  = KEY_EVT_RELEASE;
+            evt->key   = prev_ptt_key;
+            prev_ptt_key   = KEY_NONE;
+            db_ptt_count   = 0;
+            hold_ptt_count = 0;
+            return 1;
+        }
+        return 0;
+    }
+
+    db_ptt_count = 0;
     return 0;
 }
