@@ -91,9 +91,11 @@ static void hw_dbg_hex16(uint16_t v)
     hw_dbg_hex8((uint8_t)(v >> 8));
     hw_dbg_hex8((uint8_t)(v & 0xFF));
 
+    /*
 #ifdef DEBUG_UART
     dbg_hex16((unsigned int) v);
 #endif
+*/
 }
 
 static void hw_dbg_dec(uint32_t v)
@@ -229,23 +231,45 @@ void test_lcd_pattern(void)
     };
     #define NUM_COLORS 8
     #define BAR_HEIGHT (LCD_HEIGHT / NUM_COLORS)
+    #define BAR_WIDTH (LCD_WIDTH / NUM_COLORS)
 
-    uint32_t pass = 0;
+    uint16_t pass = 0;
     while (1) {
         hw_dbg_puts("Drawing pattern #");
         hw_dbg_dec(pass++);
         hw_dbg_newline();
 
-        for (int bar = 0; bar < NUM_COLORS; bar++) {
-            uint16_t y_start = (uint16_t)(bar * BAR_HEIGHT);
-            lcd_fill_rect(0, y_start, LCD_WIDTH, BAR_HEIGHT, colors[bar]);
-        }
+	// alternate patterns just so it doesn't sit there
+	switch (pass){
+	case 1:
+
+		for (int bar = 0; bar < NUM_COLORS; bar++) {
+		    uint16_t y_start = (uint16_t)(bar * BAR_HEIGHT);
+		    lcd_fill_rect(0, y_start, LCD_WIDTH, BAR_HEIGHT, colors[bar]);
+        		delay_ms(200);
+			}
+		break;
+
+	case 2:
+
+		for (int bar = 0; bar < NUM_COLORS; bar++) {
+		    uint16_t x_start = (uint16_t)(bar * BAR_WIDTH);
+		    lcd_fill_rect(x_start, 0, BAR_WIDTH, LCD_HEIGHT, colors[bar]);
+        		delay_ms(200);
+			}
+
+		[[fallthrough]]; //allow with no warning	
+	default:
+			pass = 0;
+			break;
+	}
 
         hw_dbg_println("Pattern drawn. Waiting 3s...");
         delay_ms(3000);
     }
     #undef NUM_COLORS
     #undef BAR_HEIGHT
+    #undef BAR_WIDTH
 }
 
 /* ==========================================================================
@@ -272,11 +296,24 @@ void test_bk4829_id(void)
         hw_dbg_newline();
 
         /* Also read RSSI (reg 0x67) */
+	// uhm.. only RSSI readback is 0x0C in bk4829.h .. why? 
+	// and not 0x67
+	// nothing is defined in that file as 0x67
         uint16_t rssi0 = bk4829_read_reg(BK4829_CHIP0, 0x67);
         uint16_t rssi1 = bk4829_read_reg(BK4829_CHIP1, 0x67);
         hw_dbg_puts("Chip0 RSSI=0x");
         hw_dbg_hex16(rssi0);
         hw_dbg_puts("  Chip1 RSSI=0x");
+        hw_dbg_hex16(rssi1);
+        hw_dbg_newline();
+        hw_dbg_newline();
+
+
+        rssi0 = bk4829_read_reg(BK4829_CHIP0, 0x07);
+        rssi1 = bk4829_read_reg(BK4829_CHIP0, 0x08);
+        hw_dbg_puts("Chip0 Freq");
+        hw_dbg_hex16(rssi0);
+        hw_dbg_puts(".");
         hw_dbg_hex16(rssi1);
         hw_dbg_newline();
         hw_dbg_newline();
@@ -314,8 +351,8 @@ void test_si4732_rev(void)
     hw_dbg_newline();
 
     /* Tune to a known FM station as additional test */
-    hw_dbg_println("\nTuning to 100.0 MHz FM...");
-    si4732_fm_tune(10000);
+    hw_dbg_println("\nTuning to 101.1 MHz FM...");
+    si4732_fm_tune(10110);
     delay_ms(500);
 
     struct si4732_tune_status status;
@@ -328,14 +365,96 @@ void test_si4732_rev(void)
     hw_dbg_dec(status.snr);
     hw_dbg_newline();
 
+    hw_dbg_puts("[DBG] spk_unmute+beep_sw...\n");
+    /* PE7 = U3T_EN: HIGH = RX/speaker mode (relay deasserted, ACTIVE LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_7,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+
+    gpio_set_pin(GPIOE, GPIO_PIN_7);                /* RX audio mode */
+
+    hw_dbg_puts(".1.");
+    delay_ms(1000);
+
+    /* PE9 = SW_TO_BT: LOW = speaker path (not Bluetooth) */
+    gpio_config_pin(GPIOE, GPIO_PIN_9,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+
+    gpio_clear_pin(GPIOE, GPIO_PIN_9);              /* speaker mode */
+
+    hw_dbg_puts(".2.");
+    delay_ms(1000);
+
+    /* PE1 = SPK_MUTE: LOW = unmuted */
+    gpio_config_pin(SPK_MUTE_PORT, SPK_MUTE_PIN,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+
+    gpio_clear_pin(SPK_MUTE_PORT, SPK_MUTE_PIN);   /* unmute speaker */
+
+    hw_dbg_puts(".3.");
+    delay_ms(1000);
+
+    /* PE4 = AMP_PWR: powers the audio amplifier rail (V12 discovery).
+     * Must be HIGH for any audio output. */
+    gpio_config_pin(GPIOE, GPIO_PIN_4,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+
+    gpio_set_pin(GPIOE, GPIO_PIN_4);               /* amp power ON */
+
+    hw_dbg_puts(".4.");  // audio is on at this point
+    delay_ms(1000);
+
+    /* PB8 = AMP_EN: configured as PP output, LOW at boot (OEM default).
+     * audio_path_enable() sets HIGH before beep. */
+    /*
+    gpio_config_pin(AMP_EN_PORT, AMP_EN_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    */
+    //gpio_clear_pin(AMP_EN_PORT, AMP_EN_PIN);        /* amp OFF at boot */
+
+    /* PC12 = BEEP_SW: configured as PP output, HIGH at boot (radio path).
+     * audio_path_enable() sets LOW to route DAC to speaker. */
+    /*
+    gpio_config_pin(BEEP_SW_PORT, BEEP_SW_PIN,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+	 */
+    //gpio_set_pin(BEEP_SW_PORT, BEEP_SW_PIN);        /* radio path at boot */
+
+    uint16_t freq = 8810;
+    uint16_t freq_tmp;
     while (1) {
-        delay_ms(2000);
+    	hw_dbg_puts("Tuning to ");
+
+	if (freq < 10000) hw_dbg_putc(' ');
+
+	freq_tmp = (uint16_t) (freq/100); //get the Mhz
+	hw_dbg_dec(freq_tmp);
+	hw_dbg_putc('.');
+	freq_tmp = (int16_t) (freq_tmp * 100); //shift back up
+	hw_dbg_dec((uint16_t)(freq-freq_tmp)/10); // drop the trailing 0
+    	hw_dbg_puts(" FM\t");
+    	si4732_fm_tune(freq);
+
+        delay_ms(500);
         si4732_fm_tune_status(&status);
         hw_dbg_puts("RSSI=");
         hw_dbg_dec(status.rssi);
         hw_dbg_puts(" SNR=");
         hw_dbg_dec(status.snr);
+
+	if (status.rssi >= 30 && status.snr >=3){
+		gpio_set_pin(LED_GREEN_PORT, LED_GREEN_PIN);
+        	delay_ms(2000);
+	}
+	else
+		gpio_clear_pin(LED_GREEN_PORT, LED_GREEN_PIN);
+	
+
+
         hw_dbg_newline();
+	if (freq >= 10790)	//US FM broadcast is from 88.3 to 107.9
+		freq = 8830;
+	else
+		freq += 20; 	//in 200 kHz steps
     }
 }
 
@@ -365,7 +484,7 @@ void test_spi_flash_id(void)
         hw_dbg_puts(" Cap=0x");
         hw_dbg_hex8(cap);
 
-        /* Decode common manufacturers */
+        /* Decode common JEDEC manufacturers */
         hw_dbg_puts("  -> ");
         if (mfr == 0xEF) hw_dbg_puts("Winbond");
         else if (mfr == 0xC8) hw_dbg_puts("GigaDevice");
@@ -375,6 +494,7 @@ void test_spi_flash_id(void)
         else if (mfr == 0xBF) hw_dbg_puts("SST");
         else if (mfr == 0x9D) hw_dbg_puts("ISSI");
         else if (mfr == 0x0B) hw_dbg_puts("XTX");
+        else if (mfr == 0x5E) hw_dbg_puts("TENX");
         else hw_dbg_puts("Unknown");
 
         hw_dbg_puts(" ");
@@ -386,8 +506,45 @@ void test_spi_flash_id(void)
         if (mfr == 0xFF || mfr == 0x00) {
             hw_dbg_println("  !! No flash detected (check SPI2 wiring)");
         }
+	else
+    	{
+	uint32_t address = 0;
+        uint8_t sample[16];
+	hw_dbg_puts("[DBG] Read Flash \nAddress\n");
+	while (address < 0x2FF) {
+		spi_flash_read(address, sample, 16);
+		hw_dbg_hex16(address);  
+		hw_dbg_putc(' ');
+		for (int i = 0; i < 16; i++) {
+		    hw_dbg_hex8(sample[i]);
+		    hw_dbg_putc(' ');
+		    if (i == 7) dbg_puts(" ");
+		}
+		hw_dbg_puts(" | ");
+		for (int i=0; i<16; i++) {
+			if (sample[i]>=' ' && sample[i]<='~')
+				hw_dbg_putc(sample[i]);
+			else
+				hw_dbg_putc('.');
+		    if (i == 7) hw_dbg_putc(' ');
 
-        delay_ms(2000);
+		}
+
+		address += 0x10;
+        	hw_dbg_newline();
+	}
+
+        uint8_t cal_flag;
+        spi_flash_read(0x00F0E0, &cal_flag, 1);
+        dbg_reg("[DBG] Cal flag @ 0xF0E0 = 0x", cal_flag);
+        if (cal_flag == 0xFF)
+            hw_dbg_puts("[WARN] No calibration data programmed\n");
+        else
+            hw_dbg_puts("[DBG] Calibration data present\n");
+        }
+
+
+        delay_ms(10000);
     }
 }
 
@@ -477,14 +634,14 @@ void test_keypad_encoder(void)
     keypad_init();
     encoder_init();
 
-    //works with pattern 4
+    //works with the modified scan pattern 
     static const char * const key_names[] = {
-        "OK", "ABC", "RET", "V/M",	//0x10-0x13 //moved side 1 and 4 out
-        "3", "6", "9", "#", 	//4-7
-        "2", "5", "8", "0",	//8-0x0B
-        "UP", "DN", "<L", "R>",	//0x0C-0x0F
-        "1", "4", "7", "*", 	//0-3
-	"SIDE1", "SIDE4"		//0x14-0x15
+        "OK","ABC","RET","V/M",	//0x00 - 0x03
+        "3", "6", "9", "#", 	//0x04 - 0x07
+        "2", "5", "8", "0",	//0x08 - 0x0B
+        "UP", "DN", "<L", "R>",	//0x0C - 0x0F
+        "1", "4", "7", "*", 	//0x10 - 0x13
+	"SIDE1", "SIDE4"	//0x14 - 0x15
     };
 
     while (1) {

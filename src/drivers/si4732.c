@@ -22,7 +22,14 @@
 
 static void i2c_delay(void)
 {
-    for (volatile int i = 0; i < 10; i++) {
+	
+	//TEST not 10 but 50
+	//10 doesn't work
+	//20 works
+	//30 works
+	//50 works
+	//for whatever reason I get bad data when I try to operate at 10
+    for (volatile int i = 0; i < 25; i++) {
         /* ~83 ns/iter at 120 MHz ~ 830 ns total */
     }
 }

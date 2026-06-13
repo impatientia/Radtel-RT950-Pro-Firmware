@@ -129,13 +129,27 @@ static void app_init(void);
 static uint8_t keypad_diag_count = 0;
 static uint8_t encoder_diag_count = 0;
 
-static const char * const key_names[] = {
-    "1","2","3","A/VFO", "4","5","6","B/SCAN",
-    "7","8","9","C/MENU", "*","0","#","D/BAND",
+/*  //original layout, for original scan pattern
+ * static const char * const key_names[] = {
+    "1","2","3","A/VFO", 
+    "4","5","6","B/SCAN",
+    "7","8","9","C/MENU", 
+    "*","0","#","D/BAND",
     "C4R0","C4R1","C4R2","C4R3",
     "SIDE1","SIDE4"
 };
+*/
+    //works with the modified scan pattern 
+    static const char * const key_names[] = {
+        "OK","ABC","RET","V/M",	//0x00 - 0x03
+        "3", "6", "9", "#", 	//0x04 - 0x07
+        "2", "5", "8", "0",	//0x08 - 0x0B
+        "UP", "DN", "<L", "R>",	//0x0C - 0x0F
+        "1", "4", "7", "*", 	//0x10 - 0x13
+	"SIDE1", "SIDE4"	//0x14 - 0x15
+    };
 
+//TODO: These tones are now in the wrong order, yes?
 /* Unique tone per key (freq x10): each key gets a distinct pitch */
 static const uint16_t key_tones[] = {
     /* 1=700Hz  2=800Hz  3=900Hz  A=1900Hz */
